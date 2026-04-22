@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+outputs/
+*.egg-info/
+dist/
+build/
+.env
+mec_migration/
+.DS_Store
+Thumbs.db

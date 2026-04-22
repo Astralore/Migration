@@ -1,66 +1,37 @@
 """
-SA Microservice Migration — 拓扑感知模拟退火微服务 DAG 迁移基线
-作为 DQN 微服务迁移的纯 SA 对比方法
+SA Microservice Migration — topology-aware Simulated Annealing baseline.
+Supports both reactive and proactive (trajectory-prediction) modes.
 """
 
-import numpy as np
-import pandas as pd
 import math
 import copy
 import random
-import time as _time
-from collections import deque
 from tqdm import tqdm
 
-from microservice_knowledge_base import MICROSERVICE_DAGS
-from DQN_Microservice_Migration import (
-    haversine_distance,
-    find_k_nearest_servers,
-    check_migration_criteria,
-    get_entry_nodes,
-    topological_sort,
-    assign_dag_type,
-    initialize_dag_assignment,
-    build_servers_info,
-    calculate_microservice_reward,
-    load_data,
-    BANDWIDTH_MBPS,
-)
+from core.microservice_dags import MICROSERVICE_DAGS
+from core.geo import haversine_distance, find_k_nearest_servers
+from core.context import check_sla_violation, check_proactive_sla_violation
+from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment
+from core.reward import build_servers_info, calculate_microservice_reward
 
+FORECAST_HORIZON = 5
 
-# ============================================================
-# 微服务级模拟退火
-# ============================================================
 
 def microservice_simulated_annealing(
     taxi_id, dag_info, current_assignments, candidates,
     user_location, servers_info,
     previous_assignments=None,
     temp=100.0, cooling_rate=0.95, max_iter=30,
+    predicted_locations=None,
 ):
     """
-    对一个 DAG 的全部微服务节点执行模拟退火优化部署方案。
+    Simulated Annealing over all microservice node placements for one DAG.
 
-    每次迭代随机挑选 1 个节点，将其迁移到 candidates 中的随机服务器，
-    用 calculate_microservice_reward 作为目标函数评估。
+    When *predicted_locations* is provided the cost function includes the
+    future topology violation penalty so that SA also optimises for predicted
+    user movement.
 
-    Parameters
-    ----------
-    taxi_id             : 出租车 ID
-    dag_info            : MICROSERVICE_DAGS[dag_type]
-    current_assignments : {node: server_id} 当前部署方案（会被复制，不修改原始）
-    candidates          : find_k_nearest_servers 返回的候选列表
-    user_location       : (lat, lon)
-    servers_info        : {server_id: (lat, lon)}
-    previous_assignments: {node: server_id} 迁移前的基准（用于计算迁移成本）
-    temp                : 初始温度
-    cooling_rate        : 降温系数
-    max_iter            : 最大迭代次数
-
-    Returns
-    -------
-    best_assignments : dict — 最优部署方案
-    best_cost        : float — 最优方案的 cost
+    Returns (best_assignments, best_cost).
     """
     if previous_assignments is None:
         previous_assignments = current_assignments
@@ -68,11 +39,11 @@ def microservice_simulated_annealing(
     candidate_server_ids = [c[0] for c in candidates]
     all_nodes = list(dag_info['nodes'].keys())
 
-    # 初始解 & 初始 cost
     current_sol = dict(current_assignments)
     current_reward, _ = calculate_microservice_reward(
         taxi_id, dag_info, current_sol, previous_assignments,
         user_location, servers_info,
+        predicted_locations=predicted_locations,
     )
     current_cost = -current_reward
 
@@ -80,7 +51,6 @@ def microservice_simulated_annealing(
     best_cost = current_cost
 
     for _iteration in range(max_iter):
-        # ---- 邻域扰动：随机选 1 个节点，换到随机候选服务器 ----
         node = random.choice(all_nodes)
         old_server = current_sol[node]
 
@@ -96,10 +66,10 @@ def microservice_simulated_annealing(
         neighbor_reward, _ = calculate_microservice_reward(
             taxi_id, dag_info, neighbor_sol, previous_assignments,
             user_location, servers_info,
+            predicted_locations=predicted_locations,
         )
         neighbor_cost = -neighbor_reward
 
-        # ---- 接受准则 ----
         delta = neighbor_cost - current_cost
         if delta < 0:
             accept = True
@@ -113,26 +83,26 @@ def microservice_simulated_annealing(
                 best_sol = dict(current_sol)
                 best_cost = current_cost
 
-        # ---- 降温 ----
         temp *= cooling_rate
 
     return best_sol, best_cost
 
 
-# ============================================================
-# 主仿真循环
-# ============================================================
-
-def run_sa_microservice_fair(df, servers_df):
+def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     """
-    模拟退火微服务 DAG 迁移主仿真函数。
-    框架与 DQN 版本完全一致，仅决策部分替换为 SA。
+    SA microservice DAG migration main simulation.
+
+    Parameters
+    ----------
+    predictor : SimpleTrajectoryPredictor or None
+    proactive : bool
 
     Returns
     -------
     results : dict
     """
     servers_info = build_servers_info(servers_df)
+    use_proactive = proactive and predictor is not None
 
     taxi_dag_type = {}
     taxi_dag_assignments = {}
@@ -154,7 +124,6 @@ def run_sa_microservice_fair(df, servers_df):
             current_lat = row['latitude']
             current_lon = row['longitude']
 
-            # ========== 首次出现：DAG 分配 + 全节点初始部署 ==========
             if taxi_id not in taxi_dag_assignments:
                 nearest = find_k_nearest_servers(
                     current_lat, current_lon, servers_df, k=1
@@ -166,7 +135,6 @@ def run_sa_microservice_fair(df, servers_df):
                 )
                 continue
 
-            # ========== 违规检测：入口网关距离 > 15km ==========
             dag_type = taxi_dag_type[taxi_id]
             dag_info = MICROSERVICE_DAGS[dag_type]
             entry_nodes = get_entry_nodes(dag_info)
@@ -178,14 +146,39 @@ def run_sa_microservice_fair(df, servers_df):
                 current_lat, current_lon, gw_lat, gw_lon
             )
 
-            if gateway_dist <= 15.0:
+            # --- SCORING: Real violation count (independent of trigger) ---
+            if gateway_dist > 15.0:
+                total_violations += 1
+
+            current_dag_reward, _ = calculate_microservice_reward(
+                taxi_id, dag_info,
+                taxi_dag_assignments[taxi_id], taxi_dag_assignments[taxi_id],
+                (current_lat, current_lon), servers_info,
+            )
+
+            # --- Trajectory prediction ---
+            predicted_locations = None
+            if use_proactive:
+                raw = predictor.predict_future(
+                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+                )
+                predicted_locations = [(lat, lon) for lon, lat in raw]
+
+            # --- Trigger decision (may include proactive look-ahead) ---
+            if use_proactive:
+                should_migrate = check_proactive_sla_violation(
+                    current_lat, current_lon, gw_lat, gw_lon,
+                    current_dag_reward, predicted_locations,
+                )
+            else:
+                should_migrate = check_sla_violation(
+                    current_lat, current_lon, gw_lat, gw_lon,
+                    current_dag_reward,
+                )
+
+            if not should_migrate:
                 continue
 
-            total_violations += 1
-            if not check_migration_criteria(row, gateway_dist):
-                continue
-
-            # ========== SA 决策 ==========
             candidates = find_k_nearest_servers(
                 current_lat, current_lon, servers_df, k=3
             )
@@ -198,16 +191,15 @@ def run_sa_microservice_fair(df, servers_df):
                 user_location=(current_lat, current_lon),
                 servers_info=servers_info,
                 previous_assignments=old_assignments,
+                predicted_locations=predicted_locations,
             )
 
             taxi_dag_assignments[taxi_id] = best_assignments
 
-            # ========== 记录 reward ==========
             reward = -best_cost
             total_reward_sum += reward
             reward_history.append(reward)
 
-            # ========== 统计 M：逐节点比较 old vs new ==========
             nodes_migrated = sum(
                 1 for n in dag_info['nodes']
                 if old_assignments[n] != best_assignments[n]
@@ -225,48 +217,3 @@ def run_sa_microservice_fair(df, servers_df):
         'reward_history': reward_history,
         'decision_count': decision_count,
     }
-
-
-# ============================================================
-# 独立运行入口
-# ============================================================
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("  SA Microservice DAG Migration — Full Run")
-    print("=" * 60)
-
-    DATA_PATH = "Migrate-main/taxi_with_health_info.csv"
-    SERVER_PATH = "Migrate-main/edge_server_locations.csv"
-    CHUNK_SIZE = 10000
-
-    df = load_data(DATA_PATH, sample_fraction=1.0, chunk_size=CHUNK_SIZE)
-    servers_df = pd.read_csv(SERVER_PATH)
-    print(f"  Edge servers loaded: {len(servers_df)}")
-
-    print(f"\n{'=' * 60}")
-    print("  Running SA Microservice Migration ...")
-    print(f"{'=' * 60}")
-    t_start = _time.time()
-    results = run_sa_microservice_fair(df, servers_df)
-    elapsed = _time.time() - t_start
-
-    M = results['total_migrations']
-    V = results['total_violations']
-    score = M + 0.5 * V
-    R = results['total_reward']
-    n_decisions = results['decision_count']
-
-    print(f"\n{'=' * 60}")
-    print(f"  RESULTS — SA Microservice DAG Migration")
-    print(f"{'=' * 60}")
-    print(f"  Migrations (M)         : {M}")
-    print(f"  Violations (V)         : {V}")
-    print(f"  Score (M + 0.5*V)      : {score:.1f}")
-    print(f"  Total Reward           : {R:.2f}")
-    print(f"  SA Decisions           : {n_decisions}")
-    if results['reward_history']:
-        print(f"  Avg Reward (last 100)  : "
-              f"{np.mean(results['reward_history'][-100:]):.4f}")
-    print(f"  Elapsed Time           : {elapsed:.1f}s")
-    print(f"{'=' * 60}")
