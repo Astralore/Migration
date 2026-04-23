@@ -12,6 +12,7 @@ from prediction.simple_predictor import SimpleTrajectoryPredictor
 from algorithms.dqn import run_dqn_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
 from algorithms.hybrid_sa_dqn import run_hybrid_microservice_fair
+from algorithms.hybrid_sac import run_hybrid_sac_microservice
 from evaluation.metrics import print_ranking, print_proactive_analysis
 from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_performance_metrics
 
@@ -45,15 +46,15 @@ def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
-    # Hybrid
+    # Hybrid SAC (新的 Trigger-Conditioned GAT + Discrete SAC)
     print(f"\n{'=' * 60}")
-    print(f"  [{label}] Running Hybrid SA-DQN ({mode_str}) ...")
+    print(f"  [{label}] Running Hybrid SAC ({mode_str}) ...")
     print(f"{'=' * 60}")
     t0 = time.time()
-    results["Hybrid SA-DQN"] = run_hybrid_microservice_fair(
+    results["Hybrid SAC"] = run_hybrid_sac_microservice(
         df, servers_df, predictor=predictor, proactive=proactive,
     )
-    print(f"  Hybrid done in {time.time() - t0:.1f}s")
+    print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
 
     return results
 
@@ -85,7 +86,7 @@ def main():
     print_ranking(proactive_results)
 
     # Training curves for DQN-based methods (Proactive)
-    for name, key in [("DQN", "DQN"), ("Hybrid", "Hybrid SA-DQN")]:
+    for name, key in [("DQN", "DQN"), ("Hybrid_SAC", "Hybrid SAC")]:
         res = proactive_results[key]
         if res.get('loss_history'):
             plot_training_curves(
@@ -108,7 +109,7 @@ def main():
         print_ranking(reactive_results)
 
         # Training curves for DQN-based methods (Reactive)
-        for name, key in [("DQN", "DQN"), ("Hybrid", "Hybrid SA-DQN")]:
+        for name, key in [("DQN", "DQN"), ("Hybrid_SAC", "Hybrid SAC")]:
             res = reactive_results[key]
             if res.get('loss_history'):
                 plot_training_curves(
@@ -125,7 +126,7 @@ def main():
     print("  PAPER SUMMARY")
     print("=" * 80)
     if reactive_results:
-        for name in ["SA", "DQN", "Hybrid SA-DQN"]:
+        for name in ["SA", "DQN", "Hybrid SAC"]:
             pro = proactive_results[name]
             rea = reactive_results[name]
             pro_v, rea_v = pro['total_violations'], rea['total_violations']
