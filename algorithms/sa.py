@@ -15,7 +15,7 @@ from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE
 from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment
 from core.reward import build_servers_info, calculate_microservice_reward
 
-FORECAST_HORIZON = 5
+FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
 
 
 def microservice_simulated_annealing(
@@ -118,6 +118,11 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     total_reward_sum = 0.0
     reward_history = []
 
+    # Cost breakdown tracking
+    total_access_latency = 0.0
+    total_communication_cost = 0.0
+    total_migration_cost = 0.0
+
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
 
@@ -203,9 +208,20 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
 
             taxi_dag_assignments[taxi_id] = best_assignments
 
-            reward = -best_cost
+            # Recalculate to get cost breakdown details
+            reward, details = calculate_microservice_reward(
+                taxi_id, dag_info, best_assignments, old_assignments,
+                (current_lat, current_lon), servers_info,
+                predicted_locations=predicted_locations,
+                trigger_type=trigger_type,
+            )
             total_reward_sum += reward
             reward_history.append(reward)
+
+            # Accumulate cost breakdown
+            total_access_latency += details['access_latency']
+            total_communication_cost += details['communication_cost']
+            total_migration_cost += details['migration_cost']
 
             nodes_migrated = sum(
                 1 for n in dag_info['nodes']
@@ -222,5 +238,8 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
         'proactive_decisions': proactive_decisions,
         'decision_count': decision_count,
         'total_reward': total_reward_sum,
+        'total_access_latency': total_access_latency,
+        'total_communication_cost': total_communication_cost,
+        'total_migration_cost': total_migration_cost,
         'reward_history': reward_history,
     }

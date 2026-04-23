@@ -6,8 +6,13 @@ Returns explicit trigger_type for asymmetric migration cost calculation.
 
 from core.geo import haversine_distance
 
+# Reactive threshold: actual SLA violation (user perceives outage)
 DISTANCE_THRESHOLD_KM = 15.0
 SLA_REWARD_THRESHOLD = -5.0
+
+# Proactive warning threshold: early-warning buffer zone
+# Triggers preemptive migration BEFORE actual violation occurs
+PROACTIVE_WARNING_KM = 13.0
 
 # Trigger type constants
 TRIGGER_REACTIVE = 'REACTIVE'
@@ -49,7 +54,8 @@ def check_proactive_sla_violation(user_lat, user_lon,
             future_dist = haversine_distance(pred_lat, pred_lon,
                                              gateway_server_lat,
                                              gateway_server_lon)
-            if future_dist > DISTANCE_THRESHOLD_KM:
+            # Use warning threshold for proactive trigger (earlier than reactive)
+            if future_dist > PROACTIVE_WARNING_KM:
                 return True
 
     return False
@@ -85,7 +91,9 @@ def get_trigger_type(user_lat, user_lon,
                 pred_lat, pred_lon,
                 gateway_server_lat, gateway_server_lon,
             )
-            if future_dist > DISTANCE_THRESHOLD_KM:
+            # Use warning threshold for proactive trigger (13 km < 15 km)
+            # This creates a 2km buffer zone for preemptive migration
+            if future_dist > PROACTIVE_WARNING_KM:
                 return TRIGGER_PROACTIVE
 
     return None

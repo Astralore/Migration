@@ -21,7 +21,7 @@ from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, i
 from core.reward import build_servers_info, calculate_microservice_reward
 from core.state_builder import build_node_state
 
-FORECAST_HORIZON = 5
+FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
 
 
 class MicroserviceDQN(nn.Module):
@@ -92,6 +92,11 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
     total_violations = 0
     proactive_decisions = 0
     total_reward_sum = 0.0
+
+    # Cost breakdown tracking
+    total_access_latency = 0.0
+    total_communication_cost = 0.0
+    total_migration_cost = 0.0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}  |  Proactive: {use_proactive}")
@@ -219,7 +224,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 node_transitions.append((state, action))
 
             # Reward with asymmetric migration cost
-            reward, _details = calculate_microservice_reward(
+            reward, details = calculate_microservice_reward(
                 taxi_id, dag_info,
                 taxi_dag_assignments[taxi_id], old_assignments,
                 (current_lat, current_lon), servers_info,
@@ -228,6 +233,11 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             )
             total_reward_sum += reward
             reward_history.append(reward)
+
+            # Accumulate cost breakdown
+            total_access_latency += details['access_latency']
+            total_communication_cost += details['communication_cost']
+            total_migration_cost += details['migration_cost']
 
             nodes_migrated = sum(
                 1 for n in sorted_nodes
@@ -270,6 +280,9 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
         'proactive_decisions': proactive_decisions,
         'decision_count': decision_count,
         'total_reward': total_reward_sum,
+        'total_access_latency': total_access_latency,
+        'total_communication_cost': total_communication_cost,
+        'total_migration_cost': total_migration_cost,
         'loss_history': loss_history,
         'reward_history': reward_history,
         'epsilon_history': epsilon_history,

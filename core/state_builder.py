@@ -13,11 +13,18 @@ All features are purely physical, temporal, or microservice-topology related.
   [0-15] base (same as above)
   [16]   SA prior   : sa_proposed_server_dist
   [17]   SA prior   : sa_stay_flag
+
+Graph-based layout (TriggerAwareGraphDQN):
+  node_features : (N, 3) - [image_mb, state_mb, is_stateful] per node
+  adj_matrix    : (N, N) - normalized traffic weights
+  trigger_context: (2,)  - one-hot encoding of trigger type
+  sa_priors     : (N, 2) - [sa_dist, sa_stay] per node
 """
 
 import numpy as np
 
 from core.geo import haversine_distance
+from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
 
 MOBILITY_NORM = 0.01  # ~1.1 km in degrees; keeps feature in [-1, 1] range
 
@@ -118,3 +125,123 @@ def build_hybrid_node_state(
     feat_sa_stay = 1.0 if sa_proposed_server == current_server else 0.0
 
     return np.append(base, [feat_sa_dist, feat_sa_stay]).astype(np.float32)
+
+
+def build_graph_state(
+    taxi_id,
+    dag_info,
+    current_assignments,
+    servers_info,
+    trigger_type,
+    sa_proposal,
+    candidates,
+    current_lat,
+    current_lon,
+):
+    """
+    Build graph-structured state for Trigger-Aware Graph Attention DQN.
+
+    This function constructs a complete graph representation of the microservice
+    DAG, incorporating trigger-type awareness for differentiated decision-making.
+
+    Parameters
+    ----------
+    taxi_id : str
+        Taxi identifier (for logging/debugging).
+    dag_info : dict
+        DAG definition with 'nodes' and 'edges'.
+    current_assignments : dict
+        Current server assignment for each node.
+    servers_info : dict
+        Server ID -> (lat, lon) mapping.
+    trigger_type : str
+        Either TRIGGER_PROACTIVE or TRIGGER_REACTIVE.
+    sa_proposal : dict
+        SA-proposed server assignment for each node.
+    candidates : list
+        List of (server_id, distance) tuples for candidate servers.
+    current_lat, current_lon : float
+        User's current location.
+
+    Returns
+    -------
+    dict with keys:
+        node_features : np.ndarray, shape (N, 3)
+            Per-node features: [image_mb/200, state_mb/256, is_stateful]
+        adj_matrix : np.ndarray, shape (N, N)
+            Normalized adjacency matrix with traffic weights.
+        trigger_context : np.ndarray, shape (2,)
+            One-hot: PROACTIVE=[1,0], REACTIVE=[0,1]
+        sa_priors : np.ndarray, shape (N, 2)
+            Per-node SA prior: [sa_server_dist/50, sa_stay_flag]
+        node_names : list
+            Ordered list of node names (for index mapping).
+    """
+    # Build ordered node list (consistent indexing)
+    node_names = sorted(dag_info['nodes'].keys())
+    n_nodes = len(node_names)
+    node_to_idx = {name: i for i, name in enumerate(node_names)}
+
+    # === Node Features (N, 3) ===
+    # Physical intuition: image_mb affects cold-start latency,
+    # state_mb affects migration cost (especially for stateful nodes),
+    # is_stateful is critical for asymmetric proactive/reactive cost.
+    node_features = np.zeros((n_nodes, 3), dtype=np.float32)
+    for i, node_name in enumerate(node_names):
+        node_props = dag_info['nodes'][node_name]
+        node_features[i, 0] = node_props['image_mb'] / 200.0
+        node_features[i, 1] = node_props['state_mb'] / 256.0
+        node_features[i, 2] = float(node_props['is_stateful'])
+
+    # === Adjacency Matrix (N, N) ===
+    # Traffic-weighted edges: higher traffic = stronger dependency.
+    # Normalized to [0, 1] for stable training.
+    adj_matrix = np.zeros((n_nodes, n_nodes), dtype=np.float32)
+    max_traffic = max(dag_info['edges'].values()) if dag_info['edges'] else 1.0
+    max_traffic = max(max_traffic, 1e-6)  # Avoid division by zero
+
+    for (src, dst), traffic in dag_info['edges'].items():
+        if src in node_to_idx and dst in node_to_idx:
+            i, j = node_to_idx[src], node_to_idx[dst]
+            norm_traffic = traffic / max_traffic
+            adj_matrix[i, j] = norm_traffic
+            adj_matrix[j, i] = norm_traffic  # Undirected for message passing
+
+    # Add self-loops for graph convolution stability
+    np.fill_diagonal(adj_matrix, 1.0)
+
+    # === Trigger Context (2,) ===
+    # Physical intuition:
+    # - PROACTIVE: system has time for background state sync → lower migration cost
+    # - REACTIVE: urgent migration needed → higher cost, prioritize speed
+    # This one-hot vector allows the network to learn different attention patterns
+    # based on the urgency of the migration decision.
+    if trigger_type == TRIGGER_PROACTIVE:
+        trigger_context = np.array([1.0, 0.0], dtype=np.float32)
+    else:  # REACTIVE or fallback
+        trigger_context = np.array([0.0, 1.0], dtype=np.float32)
+
+    # === SA Priors (N, 2) ===
+    # Per-node guidance from Simulated Annealing:
+    # - sa_dist: distance from SA-proposed server to user (quality indicator)
+    # - sa_stay: whether SA suggests keeping current placement (stability)
+    sa_priors = np.zeros((n_nodes, 2), dtype=np.float32)
+    for i, node_name in enumerate(node_names):
+        sa_server = sa_proposal[node_name]
+        current_server = current_assignments[node_name]
+
+        # SA proposed server distance to user
+        sa_lat, sa_lon = servers_info[sa_server]
+        sa_dist = haversine_distance(current_lat, current_lon, sa_lat, sa_lon)
+        sa_priors[i, 0] = min(sa_dist / 50.0, 1.0)
+
+        # SA stay flag: 1 if SA suggests no migration for this node
+        sa_priors[i, 1] = 1.0 if sa_server == current_server else 0.0
+
+    return {
+        'node_features': node_features,
+        'adj_matrix': adj_matrix,
+        'trigger_context': trigger_context,
+        'sa_priors': sa_priors,
+        'node_names': node_names,
+    }

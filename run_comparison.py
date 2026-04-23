@@ -13,11 +13,11 @@ from algorithms.dqn import run_dqn_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
 from algorithms.hybrid_sa_dqn import run_hybrid_microservice_fair
 from evaluation.metrics import print_ranking, print_proactive_analysis
-from evaluation.plot import plot_training_curves
+from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_performance_metrics
 
 CHUNK_SIZE = 10000
 PROACTIVE = True
-FORECAST_HORIZON = 5
+FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
 
 
 def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
@@ -142,6 +142,20 @@ def main():
             print(f"    - Real Violations: {rea_v} -> {pro_v} ({v_reduction:+.1f}%)")
             print(f"    - Migrations: {rea_m} -> {pro_m}")
     print("\n" + "=" * 80)
+
+    # Generate visualization charts
+    print("\n" + "#" * 80)
+    print("  GENERATING VISUALIZATIONS")
+    print("#" * 80)
+
+    # Cost breakdown chart (Proactive mode)
+    plot_cost_breakdown(proactive_results, save_path="outputs/cost_breakdown.png")
+
+    # Violation comparison chart (Proactive vs Reactive)
+    if reactive_results:
+        plot_performance_metrics(proactive_results, reactive_results, save_path="outputs/violation_comparison.png")
+
+    print("\n  All visualizations generated successfully!")
 
 
 if __name__ == "__main__":
