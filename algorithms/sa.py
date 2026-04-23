@@ -1,6 +1,7 @@
 """
 SA Microservice Migration — topology-aware Simulated Annealing baseline.
 Supports both reactive and proactive (trajectory-prediction) modes.
+Implements asymmetric migration cost based on trigger type.
 """
 
 import math
@@ -10,7 +11,7 @@ from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
-from core.context import check_sla_violation, check_proactive_sla_violation
+from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE
 from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment
 from core.reward import build_servers_info, calculate_microservice_reward
 
@@ -23,6 +24,7 @@ def microservice_simulated_annealing(
     previous_assignments=None,
     temp=100.0, cooling_rate=0.95, max_iter=30,
     predicted_locations=None,
+    trigger_type=TRIGGER_REACTIVE,
 ):
     """
     Simulated Annealing over all microservice node placements for one DAG.
@@ -44,6 +46,7 @@ def microservice_simulated_annealing(
         taxi_id, dag_info, current_sol, previous_assignments,
         user_location, servers_info,
         predicted_locations=predicted_locations,
+        trigger_type=trigger_type,
     )
     current_cost = -current_reward
 
@@ -67,6 +70,7 @@ def microservice_simulated_annealing(
             taxi_id, dag_info, neighbor_sol, previous_assignments,
             user_location, servers_info,
             predicted_locations=predicted_locations,
+            trigger_type=trigger_type,
         )
         neighbor_cost = -neighbor_reward
 
@@ -100,6 +104,8 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     Returns
     -------
     results : dict
+        Contains: total_migrations, total_violations, proactive_decisions,
+                  decision_count, total_reward, reward_history.
     """
     servers_info = build_servers_info(servers_df)
     use_proactive = proactive and predictor is not None
@@ -108,6 +114,7 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     taxi_dag_assignments = {}
     total_migrations = 0
     total_violations = 0
+    proactive_decisions = 0
     total_reward_sum = 0.0
     reward_history = []
 
@@ -164,20 +171,19 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 )
                 predicted_locations = [(lat, lon) for lon, lat in raw]
 
-            # --- Trigger decision (may include proactive look-ahead) ---
-            if use_proactive:
-                should_migrate = check_proactive_sla_violation(
-                    current_lat, current_lon, gw_lat, gw_lon,
-                    current_dag_reward, predicted_locations,
-                )
-            else:
-                should_migrate = check_sla_violation(
-                    current_lat, current_lon, gw_lat, gw_lon,
-                    current_dag_reward,
-                )
+            # --- Get trigger type (REACTIVE / PROACTIVE / None) ---
+            trigger_type = get_trigger_type(
+                current_lat, current_lon, gw_lat, gw_lon,
+                current_dag_reward, predicted_locations,
+                proactive_enabled=use_proactive,
+            )
 
-            if not should_migrate:
+            if trigger_type is None:
                 continue
+
+            decision_count += 1
+            if trigger_type == TRIGGER_PROACTIVE:
+                proactive_decisions += 1
 
             candidates = find_k_nearest_servers(
                 current_lat, current_lon, servers_df, k=3
@@ -192,6 +198,7 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 servers_info=servers_info,
                 previous_assignments=old_assignments,
                 predicted_locations=predicted_locations,
+                trigger_type=trigger_type,
             )
 
             taxi_dag_assignments[taxi_id] = best_assignments
@@ -205,7 +212,6 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 if old_assignments[n] != best_assignments[n]
             )
             total_migrations += nodes_migrated
-            decision_count += 1
 
         pbar.update(1)
     pbar.close()
@@ -213,7 +219,8 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     return {
         'total_migrations': total_migrations,
         'total_violations': total_violations,
+        'proactive_decisions': proactive_decisions,
+        'decision_count': decision_count,
         'total_reward': total_reward_sum,
         'reward_history': reward_history,
-        'decision_count': decision_count,
     }

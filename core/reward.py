@@ -1,9 +1,21 @@
+"""
+Reward calculation for microservice DAG placement.
+Implements asymmetric migration cost based on trigger_type:
+  - PROACTIVE: background silent sync (low state penalty)
+  - REACTIVE:  foreground blocking transfer (high state penalty)
+"""
+
 from core.geo import haversine_distance
 from core.dag_utils import get_entry_nodes
+from core.context import TRIGGER_REACTIVE, TRIGGER_PROACTIVE
 
 BANDWIDTH_MBPS = 100.0
 FUTURE_DECAY = 0.9
 FUTURE_DIST_THRESHOLD = 15.0
+
+# Asymmetric state migration cost multipliers
+STATE_COST_PROACTIVE = 1000.0  # background sync: state_mb / 1000
+STATE_COST_REACTIVE = 10.0     # foreground block: state_mb / 10
 
 
 def build_servers_info(servers_df):
@@ -19,6 +31,7 @@ def calculate_microservice_reward(
     user_location, servers_info,
     alpha=1.0, beta=0.01, gamma=1.0,
     predicted_locations=None, delta=0.5,
+    trigger_type=TRIGGER_REACTIVE,
 ):
     """
     Four-component weighted reward for a microservice DAG placement.
@@ -27,21 +40,20 @@ def calculate_microservice_reward(
     ----------
     C_access   : access latency  (user -> entry-node servers)
     C_comm     : inter-service communication cost
-    C_migrate  : state migration cost
-    C_future   : predicted future topology violation penalty (proactive)
-                 Only computed when *predicted_locations* is provided.
+    C_migrate  : state migration cost (ASYMMETRIC based on trigger_type)
+    C_future   : predicted future topology violation penalty
 
-    total_cost = alpha*C_access + beta*C_comm + gamma*C_migrate + delta*C_future
-    reward     = -total_cost
+    Asymmetric Migration Cost
+    -------------------------
+    For stateless nodes: cost = image_mb / 100
+    For stateful nodes:
+      - PROACTIVE trigger: cost = image_mb/100 + state_mb/1000 (background sync)
+      - REACTIVE trigger:  cost = image_mb/100 + state_mb/10   (foreground block)
 
     Parameters
     ----------
-    predicted_locations : list of (lat, lon) or None
-        H-step predicted user positions.  Each step h incurs a penalty
-        weighted by FUTURE_DECAY^h if the distance to any entry-node server
-        exceeds FUTURE_DIST_THRESHOLD.
-    delta : float
-        Weight for the future violation penalty (default 0.5).
+    trigger_type : str
+        'REACTIVE' or 'PROACTIVE', affects stateful node migration cost.
 
     Returns (reward, details_dict).
     """
@@ -68,11 +80,19 @@ def calculate_microservice_reward(
             norm_traffic = traffic / max_traffic if max_traffic > 0 else 0.0
             communication_cost += norm_traffic * dist
 
-    # 3. State migration cost
+    # 3. State migration cost (ASYMMETRIC)
     migration_cost = 0.0
+    state_divisor = (STATE_COST_PROACTIVE if trigger_type == TRIGGER_PROACTIVE
+                     else STATE_COST_REACTIVE)
+
     for node, node_props in dag_info['nodes'].items():
         if current_assignments[node] != previous_assignments[node]:
-            migration_cost += (node_props['image_mb'] + node_props['state_mb']) / BANDWIDTH_MBPS
+            image_cost = node_props['image_mb'] / BANDWIDTH_MBPS
+            if node_props['is_stateful']:
+                state_cost = node_props['state_mb'] / state_divisor
+            else:
+                state_cost = 0.0
+            migration_cost += image_cost + state_cost
 
     # 4. Future topology violation penalty (proactive)
     future_penalty = 0.0
@@ -99,5 +119,6 @@ def calculate_microservice_reward(
         'future_penalty': future_penalty,
         'total_cost': total_cost,
         'reward': reward,
+        'trigger_type': trigger_type,
     }
     return reward, details

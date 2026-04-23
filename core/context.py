@@ -1,12 +1,17 @@
 """
 SLA-based migration trigger for edge microservice migration.
 Supports both reactive and proactive (trajectory-prediction) modes.
+Returns explicit trigger_type for asymmetric migration cost calculation.
 """
 
 from core.geo import haversine_distance
 
 DISTANCE_THRESHOLD_KM = 15.0
 SLA_REWARD_THRESHOLD = -5.0
+
+# Trigger type constants
+TRIGGER_REACTIVE = 'REACTIVE'
+TRIGGER_PROACTIVE = 'PROACTIVE'
 
 
 def check_sla_violation(user_lat, user_lon,
@@ -32,17 +37,7 @@ def check_proactive_sla_violation(user_lat, user_lon,
                                   predicted_locations=None):
     """
     Proactive trigger: reactive check PLUS look-ahead over predicted trajectory.
-
-    Parameters
-    ----------
-    predicted_locations : list of (lat, lon) or None
-        Future H-step predicted positions.  When provided the function also
-        fires if *any* future position would breach the distance threshold
-        against the current gateway server.
-
-    Returns
-    -------
-    bool — True if migration should be attempted
+    Returns True if migration should be attempted.
     """
     if check_sla_violation(user_lat, user_lon,
                            gateway_server_lat, gateway_server_lon,
@@ -58,3 +53,39 @@ def check_proactive_sla_violation(user_lat, user_lon,
                 return True
 
     return False
+
+
+def get_trigger_type(user_lat, user_lon,
+                     gateway_server_lat, gateway_server_lon,
+                     current_dag_reward,
+                     predicted_locations=None,
+                     proactive_enabled=False):
+    """
+    Determine the trigger type for migration decision.
+
+    Returns
+    -------
+    str or None
+        'REACTIVE'  — current state already violates SLA (user perceives outage)
+        'PROACTIVE' — predicted future violation (preemptive, user unaware)
+        None        — no trigger needed
+    """
+    reactive_violation = check_sla_violation(
+        user_lat, user_lon,
+        gateway_server_lat, gateway_server_lon,
+        current_dag_reward,
+    )
+
+    if reactive_violation:
+        return TRIGGER_REACTIVE
+
+    if proactive_enabled and predicted_locations:
+        for pred_lat, pred_lon in predicted_locations:
+            future_dist = haversine_distance(
+                pred_lat, pred_lon,
+                gateway_server_lat, gateway_server_lon,
+            )
+            if future_dist > DISTANCE_THRESHOLD_KM:
+                return TRIGGER_PROACTIVE
+
+    return None
