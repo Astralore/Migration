@@ -56,6 +56,44 @@ def print_ranking(results_dict, weight=0.5):
     return rows
 
 
+def print_ranking_with_latency(results):
+    """
+    打印排行榜，含决策时延。
+    
+    Parameters
+    ----------
+    results : dict
+        算法名 -> 结果字典
+    """
+    # 计算 Score 并排序
+    scored_results = []
+    for name, res in results.items():
+        # Score = Migrations + 0.5 * Violations（越低越好）
+        score = res['total_migrations'] + 0.5 * res['total_violations']
+        scored_results.append((name, res, score))
+    
+    # 按 Score 升序排序
+    sorted_results = sorted(scored_results, key=lambda x: x[2])
+    
+    # 打印表头
+    header = f"{'Rank':<6}{'Algorithm':<15}{'M':>8}{'V(real)':>10}{'D(proac)':>10}{'D(total)':>10}{'Latency(ms)':>14}{'Score':>10}"
+    print("-" * len(header))
+    print(header)
+    print("-" * len(header))
+    
+    # 打印每行
+    for rank, (name, res, score) in enumerate(sorted_results, 1):
+        latency_ms = res.get('avg_decision_time_ms', 0)
+        proactive_decisions = res.get('proactive_decisions', 0)
+        decision_count = res.get('decision_count', 0)
+        
+        print(f"{rank:<6}{name:<15}{res['total_migrations']:>8}{res['total_violations']:>10}"
+              f"{proactive_decisions:>10}{decision_count:>10}"
+              f"{latency_ms:>14.2f}{score:>10.1f}")
+    
+    print("-" * len(header))
+
+
 def print_proactive_analysis(proactive_results, reactive_results=None):
     """
     Print analysis comparing Proactive vs Reactive modes.

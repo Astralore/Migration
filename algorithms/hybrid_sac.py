@@ -31,6 +31,7 @@ from tqdm import tqdm
 import random
 import copy
 import math
+import time
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
@@ -1007,7 +1008,12 @@ def soft_update(target_net, source_net, tau):
 # Module 5: Main Simulation Loop (run_hybrid_sac_microservice)
 # =============================================================================
 
-def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False, num_epochs=6):
+def run_hybrid_sac_microservice(
+    df, servers_df, predictor=None, proactive=False, num_epochs=6,
+    inference_mode=False,           # 新增：是否为推理模式
+    checkpoint_path=None,           # 新增：权重文件路径（推理时加载）
+    save_checkpoint_path=None,      # 新增：训练后保存路径
+):
     """
     Hybrid SAC-Refined SA Microservice Migration with Trigger-Aware Graph Attention.
     
@@ -1051,6 +1057,13 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
         Total passes over the timeline. The **last** epoch is a pure evaluation
         phase (no BC, deterministic actor, no replay / no optimize_sac / no soft
         update). Earlier epochs are training. Default 6 = 5 train + 1 eval.
+    inference_mode : bool
+        True: 跳过训练，只运行 1 个推理 epoch
+        False: 正常训练 + 评估
+    checkpoint_path : str
+        推理模式下，从此路径加载权重
+    save_checkpoint_path : str
+        训练模式下，训练完成后保存权重到此路径
     
     Returns
     -------
@@ -1066,6 +1079,9 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
         loss_history : list
         reward_history : list
         entropy_history : list
+        total_decision_time : float (推理/评估时延总和)
+        decision_count_for_latency : int (时延计数)
+        avg_decision_time_ms : float (平均决策时延，毫秒)
     """
     servers_info = build_servers_info(servers_df)
     use_proactive = proactive and predictor is not None
@@ -1198,6 +1214,22 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
     reward_history = []
     entropy_history = []
     alpha_history = []
+    
+    # 时延探针初始化
+    total_decision_time = 0.0
+    decision_count_for_latency = 0
+    
+    # === 推理模式：加载权重，跳过训练 ===
+    if inference_mode:
+        if checkpoint_path is None:
+            raise ValueError("inference_mode=True 但未提供 checkpoint_path")
+        log_alpha = load_sac_weights(checkpoint_path, gat_network, actor, critic, target_critic, device)
+        num_epochs = 1  # 只运行 1 个推理 epoch
+        print(f"  [INFERENCE MODE] Loaded weights, running 1 eval epoch only")
+        
+        # ⚠️ 关键：推理模式下强制关闭 BC（行为克隆）
+        # 覆盖 bc_prob_schedule，确保不会执行 SA 模仿
+        bc_prob_schedule = [0.0]  # 只有 1 个 epoch，BC 概率为 0
     
     # =========================================================================
     # Main Simulation Loop (Multi-Epoch)
@@ -1368,57 +1400,83 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
                 node_transitions = []
                 nearest_server_id = candidates[0][0]
                 
-                # BC probability: training uses schedule; eval forces 0 (no imitation)
-                if is_eval_epoch:
+                # BC probability: training uses schedule; eval/inference forces 0 (no imitation)
+                if is_eval_epoch or inference_mode:
                     current_bc_prob = 0.0
                 else:
                     current_bc_prob = (
                         bc_prob_schedule[epoch] if epoch < len(bc_prob_schedule) else 0.0
                     )
                 
-                for ms_node in sorted_nodes:
-                    node_idx = node_to_idx[ms_node]
-                    sa_proposed_server = sa_proposal[ms_node]
+                # ⚠️ 评估/推理模式：使用时延探针包裹整个决策过程
+                if is_eval_epoch or inference_mode:
+                    t_start = time.perf_counter()
                     
-                    # Get node embedding and SA prior
-                    node_emb = embeddings[node_idx]
-                    node_sa_prior = sa_prior_t[node_idx]
-                    
-                    # ---------------------------------------------------------
-                    # v3.3: Soft BC with Probability Decay
-                    # ---------------------------------------------------------
-                    # Instead of hard cutoff, use probabilistic action selection:
-                    # - With prob = current_bc_prob: Follow SA (imitation)
-                    # - With prob = 1 - current_bc_prob: Sample from actor (explore)
-                    #
-                    # This ensures ALL actions receive Q-value updates throughout
-                    # training, preventing the Q-value starvation seen in v3.2.
-                    # ---------------------------------------------------------
+                    # === 纯决策时间开始（包含 GAT + 所有节点的 Actor 推理）===
                     with torch.no_grad():
-                        if is_eval_epoch:
-                            # Deterministic greedy action (fair comparison vs SA)
+                        # 1. GAT 前向传播（已在上面完成，这里重新计算以确保计时准确）
+                        embeddings = gat_network(node_feat_t, adj_t, trigger_t)
+                        
+                        # 2. 所有节点的 Actor 决策
+                        for ms_node in sorted_nodes:
+                            node_idx = node_to_idx[ms_node]
+                            node_emb = embeddings[node_idx]
+                            node_sa_prior = sa_prior_t[node_idx]
+                            sa_proposed_server = sa_proposal[ms_node]
+                            
+                            # 使用 deterministic 动作（argmax）
                             action = actor.get_action_deterministic(node_emb, node_sa_prior)
-                        elif random.random() < current_bc_prob:
-                            # Imitation: Follow SA recommendation
-                            action = 1
-                            bc_actions_taken += 1
-                        else:
-                            # Exploration: Sample from learned policy
-                            action, _ = actor.sample_action(node_emb, node_sa_prior)
-                            explore_actions_taken += 1
+                            
+                            # 执行动作（更新 taxi_dag_assignments）
+                            current_node_server = taxi_dag_assignments[taxi_id][ms_node]
+                            if action == 0:  # STAY
+                                target_server = current_node_server
+                            elif action == 1:  # FOLLOW SA
+                                target_server = sa_proposed_server
+                            else:  # NEAREST
+                                target_server = nearest_server_id
+                            
+                            taxi_dag_assignments[taxi_id][ms_node] = target_server
+                            node_transitions.append((node_idx, action))
+                    # === 纯决策时间结束 ===
                     
-                    # Execute action
-                    current_node_server = taxi_dag_assignments[taxi_id][ms_node]
-                    if action == 0:  # STAY
-                        target_server = current_node_server
-                    elif action == 1:  # FOLLOW SA
-                        target_server = sa_proposed_server
-                    else:  # NEAREST
-                        target_server = nearest_server_id
-                    
-                    taxi_dag_assignments[taxi_id][ms_node] = target_server
-                    node_transitions.append((node_idx, action))
-                    if not is_eval_epoch:
+                    t_end = time.perf_counter()
+                    total_decision_time += (t_end - t_start)
+                    decision_count_for_latency += 1
+                else:
+                    # 训练模式：原有逻辑
+                    for ms_node in sorted_nodes:
+                        node_idx = node_to_idx[ms_node]
+                        sa_proposed_server = sa_proposal[ms_node]
+                        
+                        # Get node embedding and SA prior
+                        node_emb = embeddings[node_idx]
+                        node_sa_prior = sa_prior_t[node_idx]
+                        
+                        # ---------------------------------------------------------
+                        # v3.3: Soft BC with Probability Decay
+                        # ---------------------------------------------------------
+                        with torch.no_grad():
+                            if random.random() < current_bc_prob:
+                                # Imitation: Follow SA recommendation
+                                action = 1
+                                bc_actions_taken += 1
+                            else:
+                                # Exploration: Sample from learned policy
+                                action, _ = actor.sample_action(node_emb, node_sa_prior)
+                                explore_actions_taken += 1
+                        
+                        # Execute action
+                        current_node_server = taxi_dag_assignments[taxi_id][ms_node]
+                        if action == 0:  # STAY
+                            target_server = current_node_server
+                        elif action == 1:  # FOLLOW SA
+                            target_server = sa_proposed_server
+                        else:  # NEAREST
+                            target_server = nearest_server_id
+                        
+                        taxi_dag_assignments[taxi_id][ms_node] = target_server
+                        node_transitions.append((node_idx, action))
                         global_step += 1
                 
                 # -------------------------------------------------------------
@@ -1540,6 +1598,10 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
     # v3.0: Print final GAT attention weights to verify physics-aware learning
     gat_network.debug_print_attention(prefix="  ")
     
+    # === 训练模式：保存权重 ===
+    if not inference_mode and save_checkpoint_path:
+        save_sac_weights(save_checkpoint_path, gat_network, actor, critic, target_critic, log_alpha)
+    
     # =========================================================================
     # Return Results
     # =========================================================================
@@ -1550,7 +1612,7 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
         'total_violations': total_violations,
         'proactive_decisions': proactive_decisions,
         'decision_count': decision_count,
-        'train_epochs': num_epochs - 1,
+        'train_epochs': num_epochs - 1 if not inference_mode else 0,
         'eval_epochs': 1,
         'eval_deterministic_argmax': True,
         'total_reward': total_reward_sum,
@@ -1561,12 +1623,65 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False,
         'reward_history': reward_history,
         'entropy_history': entropy_history,
         'alpha_history': alpha_history,
+        # 时延信息
+        'total_decision_time': total_decision_time,
+        'decision_count_for_latency': decision_count_for_latency,
+        'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,
     }
 
 
 # =============================================================================
 # Evaluation Function (Optional)
 # =============================================================================
+
+def save_sac_weights(filepath, gat_network, actor, critic, target_critic, log_alpha):
+    """
+    保存 SAC 所有网络权重到单个 .pth 文件。
+    
+    Parameters
+    ----------
+    filepath : str
+        保存路径，如 "checkpoints/sac_proactive.pth"
+    gat_network : TriggerAwareGAT
+    actor : SACDiscreteActor
+    critic : SACDiscreteCritic
+    target_critic : SACDiscreteCritic
+    log_alpha : torch.Tensor
+    """
+    import os
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    
+    checkpoint = {
+        'gat_network': gat_network.state_dict(),
+        'actor': actor.state_dict(),
+        'critic': critic.state_dict(),
+        'target_critic': target_critic.state_dict(),
+        'log_alpha': log_alpha.detach().cpu(),
+    }
+    torch.save(checkpoint, filepath)
+    print(f"  [SAVE] Weights saved to {filepath}")
+
+
+def load_sac_weights(filepath, gat_network, actor, critic, target_critic, device):
+    """
+    从 .pth 文件加载 SAC 网络权重。
+    
+    Returns
+    -------
+    log_alpha : torch.Tensor
+        加载的 alpha 参数
+    """
+    checkpoint = torch.load(filepath, map_location=device)
+    
+    gat_network.load_state_dict(checkpoint['gat_network'])
+    actor.load_state_dict(checkpoint['actor'])
+    critic.load_state_dict(checkpoint['critic'])
+    target_critic.load_state_dict(checkpoint['target_critic'])
+    log_alpha = checkpoint['log_alpha'].to(device)
+    
+    print(f"  [LOAD] Weights loaded from {filepath}")
+    return log_alpha
+
 
 def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proactive=False):
     """

@@ -41,7 +41,7 @@ MIGRATION_BASE_MULTIPLIER = 1.5  # 1.5x penalty for all migrations
 
 # v3.5: SLA Violation "Death Penalty" - Non-linear punishment
 SLA_DISTANCE_THRESHOLD = 15.0  # km - same as DISTANCE_THRESHOLD_KM in context.py
-SLA_VIOLATION_MULTIPLIER = 5.0  # 5x penalty when latency exceeds SLA threshold
+SLA_VIOLATION_MULTIPLIER = 15.0  # v3.8: 15x "Death Penalty" for SLA violations (was 5.0)
 
 # v3.6: Cross-edge extreme distance — significant multiplier on comm cost (topology)
 EDGE_TEAR_DISTANCE_KM = 20.0

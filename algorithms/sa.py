@@ -7,6 +7,7 @@ Implements asymmetric migration cost based on trigger type.
 import math
 import copy
 import random
+import time
 from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
@@ -122,6 +123,10 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     total_access_latency = 0.0
     total_communication_cost = 0.0
     total_migration_cost = 0.0
+    
+    # 时延探针初始化
+    total_decision_time = 0.0
+    decision_count_for_latency = 0
 
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
@@ -195,6 +200,8 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
             )
             old_assignments = copy.copy(taxi_dag_assignments[taxi_id])
 
+            # 时延探针：计时 SA 决策过程
+            t_start = time.perf_counter()
             best_assignments, best_cost = microservice_simulated_annealing(
                 taxi_id, dag_info,
                 taxi_dag_assignments[taxi_id],
@@ -205,6 +212,10 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 predicted_locations=predicted_locations,
                 trigger_type=trigger_type,
             )
+            t_end = time.perf_counter()
+            
+            total_decision_time += (t_end - t_start)
+            decision_count_for_latency += 1
 
             taxi_dag_assignments[taxi_id] = best_assignments
 
@@ -242,4 +253,8 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
         'total_communication_cost': total_communication_cost,
         'total_migration_cost': total_migration_cost,
         'reward_history': reward_history,
+        # 时延信息
+        'total_decision_time': total_decision_time,
+        'decision_count_for_latency': decision_count_for_latency,
+        'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,
     }

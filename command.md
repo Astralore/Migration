@@ -1,307 +1,622 @@
-角色设定：
-你是一位顶尖的边缘计算与微服务架构专家。我们正在将现有的“单体服务迁移”仿真环境升级为“微服务 DAG 协同迁移”环境。
+# Hybrid SAC 工程化改造指令
 
-前置上下文：
-请阅读项目中处理环境搭建、用户请求生成和状态记录的代码文件（如引擎初始化部分），以及 @microservice_knowledge_base.py 中的 MICROSERVICE_DAGS 字典。
+## 角色设定
 
-Phase 1 核心任务：底层数据结构与感知环境重构
-请帮我完成以下两步底层改造：
+你是一位顶级 AI 系统工程专家。目前我们的 Hybrid SAC 算法在准确性上已经完美收敛（v3.7 JIT 机制）。现在我们需要将其工程化，重点证明其在"在线推理阶段（Online Inference）"的计算时延（Latency）优于传统的启发式 SA 算法，并且具备强大的未知数据泛化能力。
 
-任务 1：动态分配 DAG 请求类型
-在读取用户（出租车）轨迹并发起请求的初始化逻辑处，新增一个机制：当一个用户首次出现并发出请求时，使用 `np.random.choice` 根据 MICROSERVICE_DAGS 中各个 DAG 的 `probability`，为其随机分配一个真实的业务调用链类型（如 'Data_Heavy_DAG'），并将其持久化记录在该用户的属性中。
+## 核心任务
 
-任务 2：重构分配状态字典 (State Tracking)
-将原来记录设备分配位置的字典（例如原有的 `taxi_assignments[taxi_id] = server_id`）彻底重构为**嵌套字典**结构。
-新的结构必须是：`taxi_dag_assignments[taxi_id][microservice_node_name] = server_id`。
-初始化逻辑：当车辆首次被分配边缘服务器时，遍历该用户对应的 DAG 中的所有 `nodes`，将它们默认**全部部署在距离用户当前位置最近的同一个边缘服务器上**。
+请对 `run_comparison.py`, `algorithms/hybrid_sac.py` 及 `core/data_loader.py` 进行综合重构，引入数据切分、模型持久化、推理模式以及高精度时延探针，并将完整的实验结果输出到 `result.md` 文件中。
 
-输出要求：
-1. 请给出具体的代码修改方案和代码片段。
-2. 现阶段**绝对不要**修改深度强化学习（DQN）的网络结构、Reward计算和动作决策逻辑（留到后续阶段）。
-3. 请在修改完后，提供一段简短的 print 调试代码，用于在控制台打印出一辆车的 `taxi_dag_assignments` 结构，以验证嵌套字典是否生成成功。
-Phase 1 的底层结构已经完美跑通。现在我们严格按照计划书，进入 Phase 2。
+---
 
-请参考 @dqn_microservice_migration_55cdc05c.plan.md 中的 `[id: reward-fn]` 模块要求，在 `DQN_Microservice_Migration.py` 中帮我实现全新的奖励计算核心函数：
-`calculate_microservice_reward(taxi_id, dag_info, current_assignments, previous_assignments, user_location, servers_info, alpha=1.0, beta=0.01, gamma=1.0)`
+## 当前代码结构说明
 
-核心实现要求（请严格遵守计划书逻辑）：
-1. 外部延迟惩罚 (access_latency)：利用之前写好的 `get_entry_nodes` 找到入口节点，计算真实物理用户（user_location）到这些入口节点所在服务器的距离之和。
-2. 图内通信惩罚 (communication_cost)：遍历该 DAG 的所有 `edges`。若某条边的两个微服务被分配在不同的服务器，计算这两个服务器之间的物理距离 `dist`。惩罚值 = `(traffic / max_traffic) * dist`（注意：必须对 traffic 进行内部归一化，除以该 DAG 中的最大 traffic，以防数值爆炸）。若同服则距离惩罚为 0。
-3. 状态迁移惩罚 (migration_cost)：遍历所有微服务，若 `current_assignments[node]` != `previous_assignments[node]`，说明发生了迁移。惩罚值 = `(image_mb + state_mb) / 100.0`（假设带宽 BANDWIDTH 为 100.0）。
-4. 汇总返回：返回总的 Reward（这三项加权和的负数），以及一个包含这三项明细的字典（方便后续我们打 log 分析）。
+**重要**：当前 `hybrid_sac.py` 采用**函数式实现**，不存在 `HybridSAC` 类：
 
-请给出这个函数的完整 Python 实现代码，并保持清晰的代码注释。注意处理可能存在的边界情况（如 max_traffic 为 0 的除零防御）。依然不要在这一步编写 DQN 网络和决策循环。
-Phase 2 的核心奖励函数已经完美通过验证！现在我们严格按照计划书 @dqn_microservice_migration_55cdc05c.plan.md 进入最具挑战的 Phase 3。
+```python
+# 当前结构
+def run_hybrid_sac_microservice(df, servers_df, predictor, proactive, num_epochs=6):
+    # 网络在函数内部创建
+    gat_network = TriggerAwareGAT(...)
+    actor = SACDiscreteActor(...)
+    critic = SACDiscreteCritic(...)      # 内含 q1_net, q2_net
+    target_critic = SACDiscreteCritic(...)
+    log_alpha = torch.tensor(...)
+    
+    # 训练循环
+    for epoch in range(num_epochs):
+        ...
+    
+    return results_dict  # 当前只返回指标，不返回网络
+```
 
-请帮我在 `DQN_Microservice_Migration.py` 中实现 `[id: dqn-network]` 和 `[id: decision-loop]` 模块。具体包含以下三大任务：
+---
 
-**任务 1：重构 DQN 神经网络**
-定义 `class MicroserviceDQN(nn.Module)`：
-- `input_size = 14` (由于增加了微服务节点和拓扑特征)
-- `hidden_size = 128` (增加容量以处理更复杂的特征)
-- `action_size = 4` (0:保持, 1:候选1, 2:候选2, 3:候选3)
-- 网络结构：Input -> Linear -> ReLU -> Linear -> ReLU -> Linear -> Q-values。
+## 核心修改指令
 
-**任务 2：实现状态构建函数 `build_node_state`**
-编写一个辅助函数 `build_node_state(taxi, ms_node, dag_info, current_assignments, candidates)`，严格按照计划书组装并返回 14 维的归一化状态向量（list 或 tensor 均可）。
-特征顺序如下：
-1-6 (全局): 纬度/90, 经度/180, 距离/50, 小时/24, 星期/7, 候选数/10。
-7-10 (节点): image_mb/200, state_mb/256, is_stateful(float), 节点关联总流量/最大流量(注意防除零)。
-11-14 (拓扑): 邻居同服比例(注意防除零), 当前节点服务器距出租车距离/50, 是否为入口节点(float), DAG节点总数/10。
+### 任务 1：修改数据加载模块，支持索引范围切分
 
-**任务 3：重构决策主循环 (Sequential Decision Loop)**
-在主仿真函数 `run_dqn_microservice_fair()` 的核心逻辑中（当出租车发生违规并触发迁移时），实现微服务逐层安置逻辑：
-1. 获取该车的 `dag_info`，备份 `old_assignments`。
-2. 使用 `topological_sort(dag_info)` 获取节点遍历顺序。
-3. **内循环**：遍历 sorted_nodes。针对每个 `ms_node`：
-   - 调用 `build_node_state`
-   - epsilon-greedy 选择 action
-   - 将该微服务部署到选定的 new_server，**立即更新** `taxi_dag_assignments`
-   - 将 `(state, action)` 暂存到 `node_transitions` 列表
-4. **DAG 级评估**：内循环结束后，调用 `calculate_microservice_reward` 计算全局 reward。
-5. **稀疏奖励与经验回放 (Sparse Reward & Replay Buffer)**：
-   - 遍历 `node_transitions`，构造马尔可夫链。
-   - 只有最后一个节点 `is_last = True` 时，`step_reward = 全局 reward`，`next_state = 当前 state`，`done = True`。
-   - 中间节点 `step_reward = 0.0`，`next_state = 下一个节点的 state`，`done = False`。
-   - 压入 `memory.append`。
-6. **统计 M 和 V**：
-   - 按照计划书，M 累加实际发生跨服变更的**微服务节点数**（逐一对比 old vs new）。
-   - V 依然统计入口网关节点是否距离 > 15km。
+**文件**：`core/data_loader.py`
 
-请一步步思考，给出包含这三个任务的核心代码。保持代码结构清晰，注释详尽。
-Phase 3 的神经网络和决策主循环验证完美！这套稀疏奖励的马尔可夫链非常标准。现在我们进入计划书的最后一步：Phase 4 [id: main-sim]。
+修改 `load_data()` 函数签名，新增 `start_index` 和 `end_index` 参数：
 
-请帮我完成 `DQN_Microservice_Migration.py` 的全流程组装、网络训练逻辑以及独立运行入口。包含以下三大任务：
+```python
+def load_data(file_path=None, sample_fraction=1.0, start_index=None, end_index=None):
+    """
+    Load taxi trajectory CSV.
+    
+    Parameters
+    ----------
+    start_index : int, optional
+        起始索引（包含）
+    end_index : int, optional
+        结束索引（不包含）
+    
+    如果同时指定 start_index 和 end_index，则截取 df[start_index:end_index]
+    """
+    ...
+    # 原有逻辑保持不变（读取、清洗、排序）
+    
+    # 新增：按索引范围截取（在 chunk_size 逻辑之前）
+    if start_index is not None and end_index is not None:
+        df = df.iloc[start_index:end_index].reset_index(drop=True)
+        print(f"  Sliced data: [{start_index}:{end_index}], {len(df):,} records")
+    
+    # 原有的 chunk_size 逻辑可以删除或保留作为备用
+    
+    return df
+```
 
-**任务 1：实现 DQN 的经验回放与训练函数 (Experience Replay & Optimization)**
-请在类外或类内实现标准的 DQN `optimize_model(memory, policy_net, target_net, optimizer, batch_size, gamma)` 函数。
-- 从 memory 中随机采样一个 batch_size (如 32) 的 (state, action, reward, next_state, done)。
-- 计算当前 Q 值: `Q(s, a)`。
-- 计算目标 Q 值: 对于 done=True 的，`target = reward`；对于 done=False 的，`target = reward + gamma * max(Q(next_s))`。
-- 计算 MSE Loss，执行 `optimizer.zero_grad()`, `loss.backward()`, `optimizer.step()`。
-- 请在 run_dqn_microservice_fair 的每一帧循环末尾调用此函数，并定期（如每 50 步）将 policy_net 的权重视配给 target_net。记录平均 loss 以备画图。
+---
 
-**任务 2：完善真实时序主循环 (Time-step Loop)**
-确保 `run_dqn_microservice_fair` 能够接收真实的 DataFrame (`df` 和 `servers_df`)，并像旧代码一样按时间步推进：
-`for current_time, group in df.groupby('date_time'):`
-在循环中：
-- 为首次出现的出租车分配 DAG 和初始服务器。
-- 判断违规（网关节点距离 > 15km）及 check_migration_criteria 健康门控。
-- 触发迁移时，执行我们 Phase 3 写好的 DAG 逐节点决策循环。
-- 统计总指标：`total_migrations` (M) 累加实际发生跨服变更的微服务节点数；`total_violations` (V) 累加网关节点超距的次数。
+### 任务 2：定义全局模式开关与数据切分配置
 
-**任务 3：独立运行入口与可视化**
-编写 `if __name__ == '__main__':` 块：
-- 调用 `load_data` (复用原有或写个简易加载) 读取真实数据集。
-- 实例化网络并调用 `run_dqn_microservice_fair`。
-- 运行结束后，在控制台打印格式化结果：`Migrations (M): xxx, Violations (V): xxx, Score (M+0.5V): xxx`。
-- （可选）使用 matplotlib 绘制一条随着 Episode/TimeStep 变化的 Loss 曲线或 Total Reward 曲线，保存为 `dqn_microservice_training.png`。
+**文件**：`run_comparison.py`
 
-请给出这部分完整的组装代码。确保它可以作为一个独立脚本直接运行（Python DQN_Microservice_Migration.py）。太棒了！Phase 4 的 DQN 微服务仿真已经完美跑通，指标和曲线都符合预期。
-现在我们进入 Phase 5：重构混合算法的前置模块 —— 拓扑感知模拟退火算法 (Topology-Aware SA)。
+在文件顶部添加配置：
 
-请帮我创建一个新文件 `SA_Microservice_Migration.py`。
-我们的目标是实现一个纯 SA 的微服务迁移对比基线。请包含以下核心任务：
+```python
+# =============================================================================
+# 工程化配置
+# =============================================================================
+INFERENCE_MODE = False  # False=训练模式, True=推理模式
 
-**任务 1：复用底层生态**
-- 导入 `microservice_knowledge_base.py` 中的 `MICROSERVICE_DAGS`。
-- 从 `DQN_Microservice_Migration.py` 中引入我们写好的 `calculate_microservice_reward`，以及 `check_migration_criteria`, `topological_sort`, `get_entry_nodes` 等基础辅助函数。
+# 数据切分配置
+TRAIN_START_INDEX = 0
+TRAIN_END_INDEX = 10000      # 训练数据: [0, 10000)
+TEST_START_INDEX = 10000
+TEST_END_INDEX = 15000       # 测试数据: [10000, 15000)
 
-**任务 2：实现微服务级别的模拟退火 (Simulated Annealing)**
-编写核心函数 `microservice_simulated_annealing(taxi_id, dag_info, current_assignments, candidates, user_location, servers_info, temp=100.0, cooling_rate=0.95, max_iter=30)`。
-- 目标函数 (Cost)：`cost = -calculate_microservice_reward(...)的返回值`（因为 Reward 是负数惩罚，我们要最小化 Cost）。
-- 邻域扰动逻辑 (Neighbor Generation)：每次迭代，不要改变所有节点！**随机从 DAG 中挑选 1 个微服务节点**，将其在 `current_assignments` 中的位置随机更改为 `candidates` 中的另一个服务器，生成 `neighbor_assignments`。
-- 接受准则：计算 `neighbor_cost`。如果 `delta = neighbor_cost - current_cost < 0`，则接受；否则以 `exp(-delta/temp)` 的概率接受。
-- 返回跑完迭代后的 `best_assignments`。
+# 权重保存路径
+CHECKPOINT_DIR = "checkpoints"
+SAC_CHECKPOINT_PROACTIVE = "checkpoints/sac_proactive.pth"
+SAC_CHECKPOINT_REACTIVE = "checkpoints/sac_reactive.pth"
+```
 
-**任务 3：主仿真循环与独立运行**
-编写 `run_sa_microservice_fair()`：
-- 整体时间步、DataFrame 读取、DAG 类型首次分配、违规触发逻辑与 DQN 完全保持一致。
-- 唯一区别：当触发迁移时，不再调用 DQN 网络，而是直接调用 `microservice_simulated_annealing` 获取新的部署方案，并更新字典。
-- 同样统计并返回 `Migrations (M)` 和 `Violations (V)`，以及 `Score (M + 0.5V)`。
+---
 
-请给出完整的代码实现，并提供 `if __name__ == '__main__':` 运行入口。
-太棒了！Phase 4 的 DQN 微服务仿真已经完美跑通。现在我们保持当前的扁平目录结构不变，直接进入 Phase 5：重构混合算法的前置模块 —— 拓扑感知模拟退火算法 (Topology-Aware SA)。
+### 任务 3：增加模型权重持久化函数
 
-请帮我创建一个新文件 `SA_Microservice_Migration.py`。
-我们的目标是实现一个纯 SA 的微服务迁移对比基线。请包含以下核心任务：
+**文件**：`algorithms/hybrid_sac.py`
 
-**任务 1：复用底层生态**
-- 导入 `microservice_knowledge_base.py` 中的 `MICROSERVICE_DAGS`。
-- 从 `DQN_Microservice_Migration.py` 中引入我们写好的 `calculate_microservice_reward`，以及 `check_migration_criteria`, `topological_sort`, `get_entry_nodes` 等基础辅助函数。
+在文件末尾新增两个独立函数（不是类方法）：
 
-**任务 2：实现微服务级别的模拟退火 (Microservice SA)**
-编写核心函数 `microservice_simulated_annealing(taxi_id, dag_info, current_assignments, candidates, user_location, servers_info, temp=100.0, cooling_rate=0.95, max_iter=30)`。
-- 目标函数 (Cost)：`cost = -calculate_microservice_reward(...)` 的总 Reward 返回值（因为 Reward 是负数惩罚，我们要最小化 Cost）。
-- 邻域扰动逻辑 (Neighbor Generation)：每次迭代，**不要改变所有节点！** 随机从 DAG 中挑选 **1 个**微服务节点，将其在 `current_assignments` 中的位置随机更改为 `candidates` 中的另一个服务器，生成 `neighbor_assignments`。
-- 接受准则 (Acceptance Criteria)：计算 `neighbor_cost`。如果 `delta = neighbor_cost - current_cost < 0`，则接受新解；否则以 `math.exp(-delta/temp)` 的概率接受。
-- 降温：`temp *= cooling_rate`。
-- 返回跑完所有迭代后的 `best_assignments`。
+```python
+def save_sac_weights(filepath, gat_network, actor, critic, target_critic, log_alpha):
+    """
+    保存 SAC 所有网络权重到单个 .pth 文件。
+    
+    Parameters
+    ----------
+    filepath : str
+        保存路径，如 "checkpoints/sac_proactive.pth"
+    gat_network : TriggerAwareGAT
+    actor : SACDiscreteActor
+    critic : SACDiscreteCritic
+    target_critic : SACDiscreteCritic
+    log_alpha : torch.Tensor
+    """
+    import os
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    
+    checkpoint = {
+        'gat_network': gat_network.state_dict(),
+        'actor': actor.state_dict(),
+        'critic': critic.state_dict(),
+        'target_critic': target_critic.state_dict(),
+        'log_alpha': log_alpha.detach().cpu(),
+    }
+    torch.save(checkpoint, filepath)
+    print(f"  [SAVE] Weights saved to {filepath}")
 
-**任务 3：主仿真循环与独立运行**
-编写 `run_sa_microservice_fair()`：
-- 整体时间步 `for current_time, group in df.groupby('date_time'):` 的读取、DAG 类型首次分配、违规触发逻辑，与 DQN 文件中完全保持一致。
-- **唯一区别**：当触发迁移时，不再调用 DQN 网络，而是直接调用 `microservice_simulated_annealing` 获取新的部署方案，并更新字典 `taxi_dag_assignments`。
-- 同样统计并返回 `Migrations (M)` 和 `Violations (V)`，以及 `Score (M + 0.5V)`。
 
-请给出完整的代码实现，并提供 `if __name__ == '__main__':` 运行入口（打印出最终的 M, V, 和 Score）。保持代码结构清晰。
-Phase 5 的纯 SA 基线已经完美跑通并给出了符合预期的对比结果！现在我们正式进入整个研究的核心创新点 —— Phase 6：微服务混合决策算法 (Hybrid RL-Refined SA)。
+def load_sac_weights(filepath, gat_network, actor, critic, target_critic, device):
+    """
+    从 .pth 文件加载 SAC 网络权重。
+    
+    Returns
+    -------
+    log_alpha : torch.Tensor
+        加载的 alpha 参数
+    """
+    checkpoint = torch.load(filepath, map_location=device)
+    
+    gat_network.load_state_dict(checkpoint['gat_network'])
+    actor.load_state_dict(checkpoint['actor'])
+    critic.load_state_dict(checkpoint['critic'])
+    target_critic.load_state_dict(checkpoint['target_critic'])
+    log_alpha = checkpoint['log_alpha'].to(device)
+    
+    print(f"  [LOAD] Weights loaded from {filepath}")
+    return log_alpha
+```
 
-请帮我创建一个新文件 `Hybrid_Microservice_Migration.py`。
-我们将把 SA 的全局启发式搜索能力和 DQN 的序列化价值评估能力结合起来。具体任务如下：
+---
 
-**任务 1：复用基础设施与函数**
-- 导入 `microservice_knowledge_base.py`。
-- 从 `DQN_Microservice_Migration.py` 或 `SA_Microservice_Migration.py` 中引入所需的所有底层通用函数（Reward计算、拓扑排序、SA核心逻辑等）。
+### 任务 4：修改 SAC 主函数，支持训练/推理模式
 
-**任务 2：重构 HybridDQN 神经网络与状态空间**
-定义 `class HybridMicroserviceDQN(nn.Module)`：
-- **Input Size 增加到 16 维**：在原来 14 维的基础上，追加 2 维“SA 先验建议特征”：
-  1. `sa_server_dist / 50.0` (SA 为该节点建议的服务器到出租车的距离)
-  2. `1.0 if sa_proposed_server == current_server else 0.0` (SA 是否建议该节点保持原地)
-- **Action Size 缩减为 3 维**：
-  - `action = 0`：保持当前服务器 (Stay)
-  - `action = 1`：接受 SA 为该节点推荐的服务器 (Follow SA)
-  - `action = 2`：强制移动到绝对距离最近的候选服务器 (Nearest)
-- 网络结构保持 `Linear(128) -> ReLU -> Linear(128) -> ReLU`。
+**文件**：`algorithms/hybrid_sac.py`
 
-**任务 3：实现 Hybrid 决策主循环**
-重写迁移触发时的决策逻辑 `run_hybrid_microservice_fair()`：
-1. **获取先验草案**：当违规触发迁移时，首先调用 `microservice_simulated_annealing(...)`。获取 SA 给出的全局建议字典，命名为 `sa_proposal_assignments`。
-2. **DQN 逐节点审查**：按照拓扑排序遍历 DAG 的每个节点。
-3. **构建状态**：调用修改后的 `build_hybrid_node_state`，将 `sa_proposal_assignments[ms_node]` 的相关特征拼接入 16 维状态向量。
-4. **动作映射**：DQN 输出 action (0, 1, 或 2)，根据上述映射规则转化为具体的 `target_server_id`，并立即更新到 `taxi_dag_assignments` 环境中。
-5. **稀疏奖励与训练**：同 DQN 版本，等所有节点决策完毕后计算全局 Reward，分配给马尔可夫链的最后一步并存入 Replay Buffer，进行 `optimize_model`。
+修改 `run_hybrid_sac_microservice()` 函数签名和逻辑：
 
-**任务 4：独立运行入口**
-- 同样包含数据加载和主循环，并在控制台输出最终的 M、V 和 Score。
-- 绘制 Loss 曲线保存为 `hybrid_microservice_training.png`。
+```python
+def run_hybrid_sac_microservice(
+    df, servers_df, predictor=None, proactive=False, num_epochs=6,
+    inference_mode=False,           # 新增：是否为推理模式
+    checkpoint_path=None,           # 新增：权重文件路径（推理时加载）
+    save_checkpoint_path=None,      # 新增：训练后保存路径
+):
+    """
+    Hybrid SAC Microservice Migration.
+    
+    Parameters
+    ----------
+    inference_mode : bool
+        True: 跳过训练，只运行 1 个推理 epoch
+        False: 正常训练 + 评估
+    checkpoint_path : str
+        推理模式下，从此路径加载权重
+    save_checkpoint_path : str
+        训练模式下，训练完成后保存权重到此路径
+    """
+    ...
+    
+    # 网络初始化（保持不变）
+    gat_network = TriggerAwareGAT(...).to(device)
+    actor = SACDiscreteActor(...).to(device)
+    critic = SACDiscreteCritic(...).to(device)
+    target_critic = SACDiscreteCritic(...).to(device)
+    
+    # === 推理模式：加载权重，跳过训练 ===
+    if inference_mode:
+        if checkpoint_path is None:
+            raise ValueError("inference_mode=True 但未提供 checkpoint_path")
+        log_alpha = load_sac_weights(checkpoint_path, gat_network, actor, critic, target_critic, device)
+        num_epochs = 1  # 只运行 1 个推理 epoch
+        print(f"  [INFERENCE MODE] Loaded weights, running 1 eval epoch only")
+        
+        # ⚠️ 关键：推理模式下强制关闭 BC（行为克隆）
+        # 覆盖 bc_prob_schedule，确保不会执行 SA 模仿
+        bc_prob_schedule = [0.0]  # 只有 1 个 epoch，BC 概率为 0
+    
+    # === 训练循环 ===
+    for epoch in range(num_epochs):
+        # 推理模式：始终是评估 epoch
+        if inference_mode:
+            is_eval_epoch = True
+            current_bc_prob = 0.0  # ⚠️ 强制关闭 BC
+        else:
+            is_eval_epoch = (epoch == num_epochs - 1)
+            current_bc_prob = bc_prob_schedule[epoch] if epoch < len(bc_prob_schedule) else 0.0
+        
+        # ... 现有逻辑 ...
+        
+        # 在动作选择部分，使用 current_bc_prob 替代原来的 bc_prob_schedule[epoch]
+        # if random.random() < current_bc_prob:
+        #     action = 1  # BC: Follow SA
+        # else:
+        #     action = actor.get_action_deterministic(...)  # 推理用 deterministic
+    
+    # === 训练模式：保存权重 ===
+    if not inference_mode and save_checkpoint_path:
+        save_sac_weights(save_checkpoint_path, gat_network, actor, critic, target_critic, log_alpha)
+    
+    return results
+```
 
-请给出完整的代码实现，重点确保 DQN 的 Action 映射和 State 构建逻辑清晰无误。
-我的项目已经重构为标准的模块化目录。现在我们需要进行关键的“去背景化”改造。我们的研究聚焦于“边缘微服务协同迁移”，因此必须彻底剥离原有代码中与“医疗/健康/心血管风险”相关的所有逻辑。
+**⚠️ 关键点**：推理模式下必须确保：
+1. `num_epochs = 1`
+2. `is_eval_epoch = True`
+3. `current_bc_prob = 0.0`（完全关闭 SA 模仿）
+4. 使用 `actor.get_action_deterministic()` 而非 `sample_action()`
 
-请帮我修改 `core` 目录和 `algorithms/hybrid_sa_dqn.py` 中的代码，完成以下三大任务：
+---
 
-**任务 1：清洗数据源 (`core/data_loader.py`)**
-- 修改 `load_data` 函数。在读取 `taxi_with_health_info.csv`（或任何 DataFrame）时，忽略或删除所有健康特征列（如 `age`, `heart_rate`, `risk_level`, `CVD_risk` 等）。
-- 确保返回的 `df` 只包含物理移动相关的核心字段：`taxi_id`, `date_time`, `latitude`, `longitude`。
+### 任务 5：埋入高精度决策时延探针
 
-**任务 2：重构触发门控 (`core/context.py`)**
-- 删除原有的 `check_migration_criteria` 函数（它依赖健康数据）。
-- 新增函数 `check_sla_violation(user_lat, user_lon, gateway_server_lat, gateway_server_lon, current_dag_reward)`。
-- **触发逻辑**：当满足以下任一条件时，返回 True（触发迁移）：
-  1. **空间违规**：`haversine_distance` 计算的用户与网关节点服务器距离 > 15.0 (km)。
-  2. **性能违规 (QoS/SLA)**：`current_dag_reward` < -5.0（意味着当前微服务拓扑的通信/延迟开销过大，-5.0 作为一个可调的 SLA_THRESHOLD）。
+**文件**：`algorithms/hybrid_sac.py` 和 `algorithms/sa.py`
 
-**任务 3：净化状态空间 (`core/state_builder.py`)**
-- 检查 `build_node_state` 和 `build_hybrid_node_state` 函数。
-- 确保最终生成的 14/16 维状态向量中，没有任何占位或遗留的健康特征。
-- 如果之前有空缺的维度，请替换为更符合微服务研究的“系统上下文特征”：例如添加一维 `server_load`（目前可以用 `random.uniform(0.1, 0.9)` 模拟目标服务器的 CPU 负载，后续我们再接入真实统计算法）。
+#### 5.1 SAC 时延探针
 
-**任务 4：更新主循环 (`algorithms/hybrid_sa_dqn.py`)**
-- 在 `run_hybrid_microservice_fair` 的时间步循环中，移除所有获取 `health_info` 的代码。
-- 将触发判断替换为调用新的 `check_sla_violation` 函数（你需要先计算当前状态的 reward 传入，或者简化为先判断距离，如果距离没超，再单独测算通信开销）。
-- 清理所有 `print` 日志，将 "Health Risk / High Risk" 等字眼替换为 "SLA Violation / QoS Degradation"。
+在 `run_hybrid_sac_microservice()` 的评估/推理循环中：
 
-请一步步思考，并给出上述文件的具体修改代码。保持代码的模块化调用关系不被破坏。
-Phase 7 的 SLA 去背景化重构完美成功！现在我们进入 Phase 8：接入轨迹预测模块，实现“主动式微服务迁移（Proactive Migration）”。
+```python
+import time
 
-请帮我修改相关模块，严格参考我们在论文中关于 Predictive Performance Reward 和 Proactive Trigger 的数学定义。具体任务如下：
+# 在函数开头初始化
+total_decision_time = 0.0
+decision_count_for_latency = 0
 
-**任务 1：在主循环中接入预测器 (`algorithms/hybrid_sa_dqn.py` 等主入口)**
-- 引入 `prediction/simple_predictor.py` 中的轨迹预测器（或者当前项目中现成的预测类）。
-- 在时间步循环 `for current_time, group in df.groupby('date_time'):` 中，对当前出租车调用预测器，获取其未来 $H$ 步的预测坐标列表 `predicted_locations = [(lat1, lon1), ..., (lat_H, lon_H)]`（设 $H=5$）。
+# 在评估/推理循环内
+if is_eval_epoch:
+    # ⚠️ 关键：将整个决策过程包裹在 torch.no_grad() 和计时器中
+    t_start = time.perf_counter()
+    
+    # === 纯决策时间开始（包含 GAT + 所有节点的 Actor 推理）===
+    with torch.no_grad():
+        # 1. GAT 前向传播
+        embeddings = gat_network(node_feat_t, adj_t, trigger_t)
+        
+        # 2. 所有节点的 Actor 决策
+        for ms_node in sorted_nodes:
+            node_idx = node_to_idx[ms_node]
+            node_emb = embeddings[node_idx]
+            node_sa_prior = sa_prior_t[node_idx]
+            
+            # 使用 deterministic 动作（argmax）
+            action = actor.get_action_deterministic(node_emb, node_sa_prior)
+            
+            # 执行动作（更新 taxi_dag_assignments）
+            if action == 0:
+                target_server = current_node_server
+            elif action == 1:
+                target_server = sa_proposed_server
+            else:
+                target_server = nearest_server_id
+            taxi_dag_assignments[taxi_id][ms_node] = target_server
+    # === 纯决策时间结束 ===
+    
+    t_end = time.perf_counter()
+    total_decision_time += (t_end - t_start)
+    decision_count_for_latency += 1
 
-**任务 2：重构触发门控 —— 增加主动触发 (`core/context.py`)**
-- 修改 `check_sla_violation`（或新增 `check_proactive_sla_violation`）。
-- **新逻辑**：不仅检查当前距离是否 > 15km 和当前 QoS 是否 < -5.0，还要遍历 `predicted_locations`。
-- 如果预测在未来 $H$ 步内，当前网关节点距离将 > 15km，则**提前触发**迁移（返回 True）。
+# 返回结果中添加时延信息
+return {
+    ...
+    'total_decision_time': total_decision_time,
+    'decision_count_for_latency': decision_count_for_latency,
+    'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,
+}
+```
 
-**任务 3：升级 Reward 函数 —— 引入未来违规惩罚 (`core/reward.py`)**
-- 修改 `calculate_microservice_reward` 的签名，增加参数 `predicted_locations`（默认为 None）。
-- 如果传入了预测轨迹，请增加一项 **$C_{future}$ (未来拓扑违规惩罚)**：
-  遍历 `predicted_locations`，计算每个预测点到候选网关节点服务器的距离。如果距离 > 15km，则施加惩罚（可以随时间步增加而衰减权重，例如 $w_h = 0.9^h$）。
-- 最终的 `total_reward` 变为：`alpha * access_latency + beta * communication + gamma * migration + delta * future_violation_penalty`。
+**⚠️ 关键点**：`torch.no_grad()` 必须包裹**整个决策过程**（GAT + 所有节点的 Actor），而不仅仅是 GAT。这样才能消除计算图开销，得到真实的推理时延。
 
-**任务 4：(可选) 状态空间升级 (`core/state_builder.py`)**
-- 如果状态空间 16 维还有余量，或者可以扩充到 18 维，请将预测轨迹的“移动趋势”（如经纬度的平均变化率 $\Delta lat, \Delta lon$）加入 DQN 的输入特征中，让 DQN 能“看到”车辆的运动方向。
+#### 5.2 SA 时延探针
 
-请一步步思考，修改这四个模块的逻辑，确保我们可以通过简单的开关控制是否开启“主动预测 (Proactive)”功能，以便后续做对比实验。
-我们需要修复主循环中的评价指标统计逻辑。当前代码在 Proactive 模式下，错误地将“主动预测触发的迁移”计入了“实际违规次数 (V)”，导致指标失真。
+在 `algorithms/sa.py` 的 `run_sa_microservice_fair()` 中：
 
-请帮我修改 `algorithms/hybrid_sa_dqn.py` (以及对比脚本) 中的主时间步循环（`for current_time, group in df.groupby('date_time'):`），将“记分逻辑”与“触发逻辑”彻底分离：
+```python
+import time
 
-**任务 1：剥离实际违规统计 (V) 的计算**
-在遍历每个出租车，且在进行任何迁移判定（`check_proactive_sla_violation`）**之前**，先进行纯粹的“记分”：
-- 获取该出租车当前分配的入口网关服务器（Gateway Server）的坐标。
-- 计算 `actual_distance = haversine_distance(user_lat, user_lon, gateway_lat, gateway_lon)`。
-- 如果 `actual_distance > 15.0`，则 `total_violations += 1`。
-- *(注意：这是唯一的 V 累加入口！无论后续是否触发迁移，V 的统计只看这一个客观事实。)*
+# 在函数开头初始化
+total_decision_time = 0.0
+decision_count_for_latency = 0
 
-**任务 2：独立记录触发次数 (Decisions) - 可选但建议**
-- 新增一个统计变量 `total_decisions = 0`。
-- 当 `check_proactive_sla_violation` 返回 True 并启动 Hybrid 算法进行重部署时，执行 `total_decisions += 1`。
+# 在每次调用 SA 时计时
+t_start = time.perf_counter()
+sa_proposal, sa_cost = microservice_simulated_annealing(
+    taxi_id, dag_info,
+    taxi_dag_assignments[taxi_id],
+    candidates,
+    user_location=(current_lat, current_lon),
+    servers_info=servers_info,
+    previous_assignments=old_assignments,
+    predicted_locations=predicted_locations,
+    trigger_type=trigger_type,
+)
+t_end = time.perf_counter()
 
-**任务 3：修正控制台打印和绘图输出**
-- 运行结束后的打印格式改为：`Migrations (M): xxx, Real Violations (V): xxx, Proactive Decisions (D): xxx, Score (M+0.5V): xxx`。
-- 确保所有的对比算法（Reactive DQN, SA, Hybrid）都采用这套分离的统计逻辑。
+total_decision_time += (t_end - t_start)
+decision_count_for_latency += 1
 
-请严格执行，确保 `V` 的物理意义恢复为“用户真实感知到的 SLA 断连次数”。
-指标分离已经完美验证了 Proactive 的威力！现在我们要在此基础上实现论文的核心创新点：“计算与状态解耦的非对称主动迁移（Asymmetric Proactive Migration）”。
+# 返回结果中添加时延信息
+return {
+    ...
+    'total_decision_time': total_decision_time,
+    'decision_count_for_latency': decision_count_for_latency,
+    'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,
+}
+```
 
-请帮我修改 `core/reward.py` 和 `algorithms/hybrid_sa_dqn.py`（及其他相关算法脚本），将底层物理传输的“后台静默同步”与“前台阻塞迁移”的区别体现在 Reward 数学模型中。
+---
 
-**任务 1：修改奖励函数 (`core/reward.py`)**
-- 修改 `calculate_microservice_reward`，新增一个布尔参数 `is_proactive_trigger=False`。
-- **重构 Migration Cost 的计算逻辑**：
-  遍历需要迁移的微服务节点，判断其是否为“有状态” (`node_info.get('is_stateful', False)`)。
-  - **如果是 Proactive 触发 (`is_proactive_trigger == True`)**：说明我们在未来违规前有充足的时间。有状态节点的 `state_mb` 可以在后台慢速同步，不阻塞当前业务。
-    `cost = (image_mb / 100.0) + (state_mb / 1000.0)`  # 极低的后台网络带宽惩罚
-  - **如果是 Reactive 触发 (`is_proactive_trigger == False`)**：说明用户已经断连（距离>15km 或 QoS<-5.0），此时必须强行阻塞业务进行全量拷贝，代价极其高昂。
-    `cost = (image_mb / 100.0) + (state_mb / 10.0)`   # 极其高昂的前台阻塞惩罚（权重放大100倍）
-  - 无状态节点（`is_stateful == False`）不受影响，依然是 `(image_mb + 0) / 100.0`。
+### 任务 6：修改主入口，整合训练/推理流程
 
-**任务 2：更新触发侧的传参 (`algorithms/hybrid_sa_dqn.py` 等)**
-- 在时间步循环中，我们需要知道当前触发到底是哪种类型：
-  ```python
-  # 优先判断是否发生真实 SLA 崩溃 (Reactive)
-  is_reactive = check_sla_violation(...) 
-  # 其次判断是否未来会崩溃 (Proactive)
-  is_proactive = False
-  if not is_reactive and PROACTIVE_MODE:
-      is_proactive = check_proactive_sla_violation(..., predicted_locations)
+**文件**：`run_comparison.py`
 
-  if is_reactive or is_proactive:
-      # 触发迁移
-      ...
-      # 在计算 Reward 时传入触发类型
-      reward = calculate_microservice_reward(..., is_proactive_trigger=is_proactive)
-      我们现在的项目处于 Phase 8（主动式预测接入阶段）。为了生成最终的顶会论文实验数据，我需要你在现有的模块化架构下，实现论文的两个核心亮点：“评估指标的双轨解耦”与“计算/状态非对称主动迁移”。
+```python
+def main():
+    import os
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    
+    # 加载服务器数据和预测器（两种模式都需要）
+    servers_df = pd.read_csv(DEFAULT_SERVER_PATH)
+    
+    if not INFERENCE_MODE:
+        # =====================================================================
+        # 训练模式：使用训练数据，训练后保存权重
+        # =====================================================================
+        print(f"[MODE] Training Mode - Data: [{TRAIN_START_INDEX}:{TRAIN_END_INDEX}]")
+        df = load_data(DEFAULT_TAXI_PATH, start_index=TRAIN_START_INDEX, end_index=TRAIN_END_INDEX)
+        
+        # 训练预测器
+        predictor = SimpleTrajectoryPredictor(forecast_horizon=FORECAST_HORIZON)
+        predictor.fit(df)
+        
+        # --- Proactive 模式 ---
+        proactive_results = {}
+        
+        # SA (无需训练)
+        proactive_results["SA"] = run_sa_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=True
+        )
+        
+        # DQN (需要训练)
+        proactive_results["DQN"] = run_dqn_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=True
+        )
+        
+        # Hybrid SAC (训练 + 保存权重)
+        proactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
+            df, servers_df, predictor=predictor, proactive=True, num_epochs=6,
+            inference_mode=False,
+            save_checkpoint_path=SAC_CHECKPOINT_PROACTIVE,
+        )
+        
+        # --- Reactive 模式 ---
+        reactive_results = {}
+        
+        reactive_results["SA"] = run_sa_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=False
+        )
+        
+        reactive_results["DQN"] = run_dqn_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=False
+        )
+        
+        reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
+            df, servers_df, predictor=predictor, proactive=False, num_epochs=6,
+            inference_mode=False,
+            save_checkpoint_path=SAC_CHECKPOINT_REACTIVE,
+        )
+        
+    else:
+        # =====================================================================
+        # 推理模式：使用测试数据，加载权重，纯推理对比
+        # =====================================================================
+        print(f"[MODE] Inference Mode - Data: [{TEST_START_INDEX}:{TEST_END_INDEX}]")
+        
+        # ⚠️ 关键：用训练数据拟合预测器（保持历史学习到的移动模式）
+        # 这样才是真正的"在线推理"场景：预测器基于历史数据，面对全新轨迹
+        train_df = load_data(DEFAULT_TAXI_PATH, start_index=TRAIN_START_INDEX, end_index=TRAIN_END_INDEX)
+        predictor = SimpleTrajectoryPredictor(forecast_horizon=FORECAST_HORIZON)
+        predictor.fit(train_df)
+        print(f"  Predictor fitted on TRAINING data [{TRAIN_START_INDEX}:{TRAIN_END_INDEX}]")
+        
+        # 加载测试数据进行评测（预测器从未见过这些数据）
+        df = load_data(DEFAULT_TAXI_PATH, start_index=TEST_START_INDEX, end_index=TEST_END_INDEX)
+        
+        # --- Proactive 模式 ---
+        proactive_results = {}
+        
+        # SA (启发式，每次都重新计算)
+        proactive_results["SA"] = run_sa_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=True
+        )
+        
+        # DQN (也需要在测试集上运行，但不训练)
+        # 注意：DQN 如果没有 save/load 机制，这里会重新训练
+        # 如果要公平对比，DQN 也应该添加 save/load 逻辑
+        proactive_results["DQN"] = run_dqn_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=True
+        )
+        
+        # Hybrid SAC (加载权重，纯推理)
+        proactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
+            df, servers_df, predictor=predictor, proactive=True,
+            inference_mode=True,
+            checkpoint_path=SAC_CHECKPOINT_PROACTIVE,
+        )
+        
+        # --- Reactive 模式 ---
+        reactive_results = {}
+        
+        reactive_results["SA"] = run_sa_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=False
+        )
+        
+        reactive_results["DQN"] = run_dqn_microservice_fair(
+            df, servers_df, predictor=predictor, proactive=False
+        )
+        
+        reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
+            df, servers_df, predictor=predictor, proactive=False,
+            inference_mode=True,
+            checkpoint_path=SAC_CHECKPOINT_REACTIVE,
+        )
+    
+    # 打印结果（含时延对比）
+    print("\n" + "#" * 80)
+    print("  Proactive Mode Results (with Latency)")
+    print("#" * 80)
+    print_ranking_with_latency(proactive_results)
+    
+    print("\n" + "#" * 80)
+    print("  Reactive Mode Results (with Latency)")
+    print("#" * 80)
+    print_ranking_with_latency(reactive_results)
+    
+    # 自动生成实验报告
+    generate_experiment_report(proactive_results, reactive_results, INFERENCE_MODE)
+```
 
-请严格遵循现有目录结构修改以下文件：
+---
 
-**任务 1：实现“非对称主动迁移”底层逻辑 (`core/reward.py` & `core/context.py`)**
-1. 修改 `core/context.py` 中的门控判断逻辑。需要明确区分触发类型，建议让检查函数返回具体的 trigger_type，如 `'REACTIVE'`（已违规）、`'PROACTIVE'`（预测将违规）或 `None`。
-2. 修改 `core/reward.py` 中的 `calculate_microservice_reward`，增加参数 `trigger_type='REACTIVE'`。
-3. **核心公式修改**：在计算 `migration_cost` 时，遍历微服务节点：
-   - 对于无状态节点（`is_stateful == False`）：代价保持不变，即 `image_mb / 100.0`。
-   - 对于有状态节点（`is_stateful == True`）：
-     - 如果 `trigger_type == 'PROACTIVE'`：采用后台静默同步极低惩罚：`cost = (image_mb / 100.0) + (state_mb / 1000.0)`
-     - 如果 `trigger_type == 'REACTIVE'`：采用前台阻塞断网极高惩罚：`cost = (image_mb / 100.0) + (state_mb / 10.0)`
-   - 累加作为最终的迁移惩罚。
+### 任务 7：修改排行榜打印，新增时延列
 
-**任务 2：统计算法的决策传参 (`algorithms/hybrid_sa_dqn.py` 及其他算法)**
-1. 在主时间步循环中，调用 `core/context.py` 获取确切的 `trigger_type`。
-2. 将该 `trigger_type` 传入 Hybrid 算法（以及 SA 草案评估）的 `calculate_microservice_reward` 中，确保环境反馈真实的非对称 Reward。
-3. **指标统计剥离**：
-   - **Real_V (真实违规)**：在每个时间步判定前，单独计算当前实际网关距离，若 >15km 则 `Real_V += 1`。这代表用户真实感知的断连。
-   - **Decisions_D (主动决策)**：若 `trigger_type == 'PROACTIVE'`，则 `Decisions_D += 1`。代表系统底层进行的隐性预判。
-   - **Migrations_M (迁移数)**：依然统计实际发生了跨服调度的微服务节点数。
+**文件**：`evaluation/metrics.py`
 
-**任务 3：完善对比实验报告输出 (`evaluation/metrics.py` & `run_comparison.py`)**
-1. 升级最终结果打印格式。对于每一种算法，必须打印出以下完整信息：
-   `[{Algorithm Name}] M (Nodes Moved): xxx | D (Proactive Decisions): xxx | Real_V (SLA Drops): xxx | Score (M + 0.5*Real_V): xxx`
-2. 在 `run_comparison.py` 的总结处，利用 logging 或 print 打印一段“实验分析说明”（用于辅助写论文）：
-   - 如果运行了 Reactive 算法和 Proactive 算法，自动计算并打印：“相比被动模式，Proactive 模式在底层多执行了 {Delta_D} 次预判，成功将真实服务中断 (Real_V) 从 {Old_V} 压降至 {New_V}，下降率 {Drop_Rate}%！”
+新增 `print_ranking_with_latency()` 函数：
 
-请一步步思考并执行上述修改，保证代码的整洁性和逻辑的严密性。完成后提供一个简短的总结说明修改了哪些核心行。
+```python
+def print_ranking_with_latency(results):
+    """
+    打印排行榜，含决策时延。
+    
+    Parameters
+    ----------
+    results : dict
+        算法名 -> 结果字典
+    """
+    # 计算 Score 并排序
+    scored_results = []
+    for name, res in results.items():
+        # Score = Migrations + 0.5 * Violations（越低越好）
+        score = res['total_migrations'] + 0.5 * res['total_violations']
+        scored_results.append((name, res, score))
+    
+    # 按 Score 升序排序
+    sorted_results = sorted(scored_results, key=lambda x: x[2])
+    
+    # 打印表头
+    header = f"{'Rank':<6}{'Algorithm':<15}{'M':>8}{'V(real)':>10}{'D(proac)':>10}{'D(total)':>10}{'Latency(ms)':>14}{'Score':>10}"
+    print("-" * len(header))
+    print(header)
+    print("-" * len(header))
+    
+    # 打印每行
+    for rank, (name, res, score) in enumerate(sorted_results, 1):
+        latency_ms = res.get('avg_decision_time_ms', 0)
+        proactive_decisions = res.get('proactive_decisions', 0)
+        decision_count = res.get('decision_count', 0)
+        
+        print(f"{rank:<6}{name:<15}{res['total_migrations']:>8}{res['total_violations']:>10}"
+              f"{proactive_decisions:>10}{decision_count:>10}"
+              f"{latency_ms:>14.2f}{score:>10.1f}")
+    
+    print("-" * len(header))
+```
+
+---
+
+### 任务 8：自动生成实验报告
+
+**文件**：`run_comparison.py`
+
+```python
+from datetime import datetime
+
+def generate_experiment_report(proactive_results, reactive_results, is_inference_mode):
+    """自动生成 result.md 实验报告。"""
+    mode_str = "推理模式 (Inference)" if is_inference_mode else "训练模式 (Training)"
+    data_range = f"[{TEST_START_INDEX}:{TEST_END_INDEX}]" if is_inference_mode else f"[{TRAIN_START_INDEX}:{TRAIN_END_INDEX}]"
+    
+    report = f"""# 微服务迁移算法对比实验报告
+
+**运行模式**：{mode_str}  
+**数据范围**：{data_range}  
+**生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+## 一、Proactive 模式结果
+
+| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Score |
+|-----------|------------|------------|---------------------|------------------|-------|
+"""
+    
+    for name, res in proactive_results.items():
+        latency = res.get('avg_decision_time_ms', 0)
+        score = res['total_migrations'] + 0.5 * res['total_violations']
+        report += f"| {name} | {res['total_migrations']} | {res['total_violations']} | {res.get('proactive_decisions', 0)} | {latency:.2f} | {score:.1f} |\n"
+    
+    report += """
+---
+
+## 二、Reactive 模式结果
+
+| Algorithm | Migrations | Violations | Avg Latency (ms) | Score |
+|-----------|------------|------------|------------------|-------|
+"""
+    
+    for name, res in reactive_results.items():
+        latency = res.get('avg_decision_time_ms', 0)
+        score = res['total_migrations'] + 0.5 * res['total_violations']
+        report += f"| {name} | {res['total_migrations']} | {res['total_violations']} | {latency:.2f} | {score:.1f} |\n"
+    
+    report += """
+---
+
+## 三、时延对比分析
+
+"""
+    
+    # 提取时延数据进行对比
+    if 'Hybrid SAC' in proactive_results and 'SA' in proactive_results:
+        sac_latency = proactive_results['Hybrid SAC'].get('avg_decision_time_ms', 0)
+        sa_latency = proactive_results['SA'].get('avg_decision_time_ms', 0)
+        
+        if sa_latency > 0:
+            speedup = sa_latency / sac_latency if sac_latency > 0 else float('inf')
+            report += f"- **Hybrid SAC 平均决策时延**: {sac_latency:.2f} ms\n"
+            report += f"- **SA 平均决策时延**: {sa_latency:.2f} ms\n"
+            report += f"- **加速比**: SAC 比 SA 快 **{speedup:.1f}x**\n"
+    
+    report += "\n---\n\n*报告自动生成*\n"
+    
+    with open("result.md", "w", encoding="utf-8") as f:
+        f.write(report)
+    
+    print(f"\n  [REPORT] Experiment report saved to result.md")
+```
+
+---
+
+## 验收要求
+
+1. **第一步**：设置 `INFERENCE_MODE = False`，运行 `python run_comparison.py`
+   - 训练 SAC（Proactive + Reactive）
+   - 生成权重文件 `checkpoints/sac_proactive.pth` 和 `sac_reactive.pth`
+   - 记录训练模式下的指标（含 SA、DQN、SAC 三者对比）
+
+2. **第二步**：设置 `INFERENCE_MODE = True`，再次运行 `python run_comparison.py`
+   - 加载权重，在全新的 [10000:15000] 测试数据上纯推理
+   - 对比 SA、DQN、Hybrid SAC 三者的决策时延
+   - 验证 SAC 在未见数据上的泛化能力
+
+3. **最终输出**：将所有修改说明、训练/推理实验数据、时延对比分析覆盖写入 `result.md`
+
+---
+
+## 文件修改清单
+
+| 文件 | 修改内容 |
+|------|----------|
+| `core/data_loader.py` | 新增 `start_index`, `end_index` 参数 |
+| `algorithms/hybrid_sac.py` | 新增 `save_sac_weights()`, `load_sac_weights()` 函数；修改 `run_hybrid_sac_microservice()` 支持推理模式 + 强制关闭 BC；添加时延探针（`torch.no_grad()` 包裹完整决策） |
+| `algorithms/sa.py` | 添加时延探针 |
+| `run_comparison.py` | 添加模式开关、数据切分配置、训练/推理流程分支（含 SA + DQN + SAC 三者）、报告生成 |
+| `evaluation/metrics.py` | 新增 `print_ranking_with_latency()` 函数（含 score 计算和排序） |
+
+---
+
+## 修复记录
+
+| 问题 | 修复内容 |
+|------|----------|
+| 任务 7 `score` 未定义 | 在循环前计算 `score = migrations + 0.5 * violations` 并排序 |
+| 任务 5.1 `torch.no_grad()` 作用域太小 | 扩大作用域，包裹 GAT + 所有节点的 Actor 决策 |
+| 任务 6 推理模式遗漏 DQN | 补充 DQN 的推理调用，确保三者对比完整 |
+| 任务 4 未强制关闭 BC | 推理模式下 `current_bc_prob = 0.0`，覆盖 `bc_prob_schedule` |
+| 任务 6 预测器用测试数据拟合（数据泄露） | 改为用**训练数据**拟合预测器，测试数据仅用于评测 |
