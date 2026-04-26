@@ -12,9 +12,10 @@ SLA_REWARD_THRESHOLD = -5.0
 
 # Proactive warning threshold: early-warning buffer zone
 # Triggers preemptive migration BEFORE actual violation occurs
-# NOTE: Reduced from 13.0 to 10.0 to increase buffer zone (5km instead of 2km)
-# This allows PROACTIVE to trigger more often given typical prediction distances (~1-2km)
-PROACTIVE_WARNING_KM = 10.0
+# v3.0: AGGRESSIVE PROACTIVE - set to 5.0km to force PROACTIVE triggers
+# This creates a 10km buffer zone (5-15km) to generate abundant PROACTIVE samples
+# Critical for GAT to learn asymmetric physical features between PROACTIVE/REACTIVE
+PROACTIVE_WARNING_KM = 5.0
 
 # Trigger type constants
 TRIGGER_REACTIVE = 'REACTIVE'

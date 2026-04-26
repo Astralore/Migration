@@ -25,8 +25,13 @@ import numpy as np
 
 from core.geo import haversine_distance
 from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
+from core.dag_utils import get_entry_nodes
 
 MOBILITY_NORM = 0.01  # ~1.1 km in degrees; keeps feature in [-1, 1] range
+
+# v3.7: SLA threshold for continuous risk feature calculation
+# This should match the value in core/reward.py
+SLA_DISTANCE_THRESHOLD_KM = 15.0
 
 
 def _mobility_features(user_lat, user_lon, predicted_locations):
@@ -170,8 +175,11 @@ def build_graph_state(
             Per-node features: [image_mb/200, state_mb/256, is_stateful]
         adj_matrix : np.ndarray, shape (N, N)
             Normalized adjacency matrix with traffic weights.
-        trigger_context : np.ndarray, shape (2,)
-            One-hot: PROACTIVE=[1,0], REACTIVE=[0,1]
+        trigger_context : np.ndarray, shape (3,)
+            v3.7: [proactive_flag, reactive_flag, risk_ratio]
+            - PROACTIVE: [1.0, 0.0, risk_ratio] where risk_ratio ∈ [0,1]
+            - REACTIVE:  [0.0, 1.0, 1.0] (always max risk)
+            risk_ratio = min(max_entry_dist / SLA_THRESHOLD, 1.0)
         sa_priors : np.ndarray, shape (N, 2)
             Per-node SA prior: [sa_server_dist/50, sa_stay_flag]
         node_names : list
@@ -210,16 +218,45 @@ def build_graph_state(
     # Add self-loops for graph convolution stability
     np.fill_diagonal(adj_matrix, 1.0)
 
-    # === Trigger Context (2,) ===
+    # === Trigger Context (3,) - v3.7: With Continuous Risk Feature ===
     # Physical intuition:
     # - PROACTIVE: system has time for background state sync → lower migration cost
     # - REACTIVE: urgent migration needed → higher cost, prioritize speed
-    # This one-hot vector allows the network to learn different attention patterns
-    # based on the urgency of the migration decision.
+    # 
+    # v3.7 JIT Enhancement: Add continuous "risk_ratio" feature
+    # =========================================================
+    # Problem: Fixed binary trigger caused "Premature Handover" trap
+    # - Proactive trigger fired at 5km → agent immediately migrated
+    # - But migration at 5km is premature (too early, causes DAG tear)
+    # 
+    # Solution: Inject risk_ratio = max_entry_dist / SLA_THRESHOLD
+    # - At 5km: risk_ratio = 5/15 = 0.33 → "not urgent, don't migrate yet"
+    # - At 12km: risk_ratio = 12/15 = 0.80 → "getting urgent, prepare to migrate"
+    # - At 15km: risk_ratio = 15/15 = 1.0 → "critical, must migrate now"
+    # 
+    # This allows GAT to learn distance-aware attention patterns:
+    # - Low risk_ratio → focus on stability, avoid premature migration
+    # - High risk_ratio → focus on latency, prioritize migration
+    # =========================================================
+    
+    # Calculate max distance from entry nodes to user (risk indicator)
+    entry_nodes = get_entry_nodes(dag_info)
+    max_entry_dist = 0.0
+    for node in entry_nodes:
+        srv_id = current_assignments[node]
+        srv_lat, srv_lon = servers_info[srv_id]
+        node_dist = haversine_distance(current_lat, current_lon, srv_lat, srv_lon)
+        max_entry_dist = max(max_entry_dist, node_dist)
+    
+    # risk_ratio: continuous risk signal, clamped to [0, 1]
+    risk_ratio = min(max_entry_dist / SLA_DISTANCE_THRESHOLD_KM, 1.0)
+    
     if trigger_type == TRIGGER_PROACTIVE:
-        trigger_context = np.array([1.0, 0.0], dtype=np.float32)
+        # PROACTIVE: include continuous risk_ratio for JIT decision
+        trigger_context = np.array([1.0, 0.0, risk_ratio], dtype=np.float32)
     else:  # REACTIVE or fallback
-        trigger_context = np.array([0.0, 1.0], dtype=np.float32)
+        # REACTIVE: always max risk (violation already occurring)
+        trigger_context = np.array([0.0, 1.0, 1.0], dtype=np.float32)
 
     # === SA Priors (N, 2) ===
     # Per-node guidance from Simulated Annealing:

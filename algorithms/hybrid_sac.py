@@ -100,7 +100,9 @@ class TriggerAwareGAT(nn.Module):
     node_feat_dim : int
         Dimension of per-node features (default: 3 for [image_mb, state_mb, is_stateful])
     trigger_dim : int
-        Dimension of trigger context (default: 2 for one-hot [PROACTIVE, REACTIVE])
+        Dimension of trigger context.
+        - v3.6 and earlier: 2 for one-hot [PROACTIVE, REACTIVE]
+        - v3.7+: 3 for [PROACTIVE, REACTIVE, risk_ratio] with continuous risk feature
     hidden_dim : int
         Hidden layer dimension for attention computation
     num_heads : int
@@ -111,7 +113,7 @@ class TriggerAwareGAT(nn.Module):
         Dropout rate for regularization
     """
     
-    def __init__(self, node_feat_dim=3, trigger_dim=2, hidden_dim=64,
+    def __init__(self, node_feat_dim=3, trigger_dim=3, hidden_dim=64,
                  num_heads=2, output_dim=64, dropout=0.1):
         super().__init__()
         
@@ -208,34 +210,42 @@ class TriggerAwareGAT(nn.Module):
             Per-node features: [image_mb/200, state_mb/256, is_stateful]
         adj_matrix : torch.Tensor, shape (N, N)
             Normalized adjacency matrix with traffic weights
-        trigger_context : torch.Tensor, shape (2,)
-            One-hot trigger encoding: PROACTIVE=[1,0], REACTIVE=[0,1]
+        trigger_context : torch.Tensor, shape (3,)
+            v3.7: [proactive_flag, reactive_flag, risk_ratio]
+            - PROACTIVE: [1.0, 0.0, risk_ratio] where risk_ratio ∈ [0,1]
+            - REACTIVE:  [0.0, 1.0, 1.0] (always max risk)
+            
+            risk_ratio captures continuous distance-to-SLA information:
+            - Low risk (e.g., 0.3): plenty of time, no rush to migrate
+            - High risk (e.g., 0.9): urgent, should consider migration
         
         Returns
         -------
         node_embeddings : torch.Tensor, shape (N, output_dim)
             Trigger-conditioned node embeddings
         
-        Physical Interpretation of Forward Pass:
-        ========================================
+        Physical Interpretation of Forward Pass (v3.7 Enhanced):
+        ========================================================
         
         The forward pass implements the following physics-aware computation:
         
         1. ENRICHMENT: Each node receives the global trigger context
-           → Node features become trigger-aware
+           → Node features become trigger-aware AND risk-aware
+           → v3.7: risk_ratio allows gradual JIT decision making
         
         2. PROJECTION: Features are projected to a shared latent space
            → Enables comparison across heterogeneous node types
         
         3. ATTENTION: Multi-head attention with trigger modulation
-           → PROACTIVE: Broader attention, considers global optimization
-           → REACTIVE: Focused attention on critical nodes
+           → PROACTIVE + low risk: Very broad attention, favor stability
+           → PROACTIVE + high risk: Focus shifting to migration readiness
+           → REACTIVE: Always focused attention on critical nodes
         
         4. AGGREGATION: Weighted message passing along edges
            → Information flows according to traffic-weighted topology
         
         5. OUTPUT: Final embeddings encode both local features and
-           trigger-conditioned global context
+           trigger-conditioned global context with risk awareness
         """
         n_nodes = node_features.shape[0]
         device = node_features.device
@@ -355,7 +365,36 @@ class TriggerAwareGAT(nn.Module):
         # Store for downstream retrieval
         self._node_embeddings = output
         
+        # v3.0: Store attention weights and trigger for debug inspection
+        self._last_attention_weights = attention_weights.detach()
+        self._last_trigger_context = trigger_context.detach()
+        self._last_temperature = temperature.detach()
+        self._last_stateful_bias = self.stateful_trigger_bias.detach()
+        
         return output
+    
+    def debug_print_attention(self, prefix=""):
+        """Print last computed attention weights for debugging (v3.7)."""
+        if not hasattr(self, '_last_attention_weights'):
+            print(f"{prefix}[GAT DEBUG] No attention weights computed yet.")
+            return
+        
+        attn = self._last_attention_weights
+        trigger = self._last_trigger_context
+        temp = self._last_temperature
+        bias = self._last_stateful_bias
+        
+        trigger_type = "PROACTIVE" if trigger[0] > 0.5 else "REACTIVE"
+        # v3.7: Extract risk_ratio from trigger_context[2]
+        risk_ratio = trigger[2].item() if len(trigger) > 2 else "N/A"
+        
+        print(f"\n{prefix}[GAT v3.7 Attention Debug]")
+        print(f"  Trigger: {trigger_type} ({trigger.cpu().numpy()})")
+        print(f"  Risk Ratio: {risk_ratio:.4f}" if isinstance(risk_ratio, float) else f"  Risk Ratio: {risk_ratio}")
+        print(f"  Temperature per head: {temp.cpu().numpy()}")
+        print(f"  Stateful-Trigger Bias: {bias.cpu().numpy()}")
+        print(f"  Attention shape: {attn.shape}")
+        print(f"  Attention mean: {attn.mean().item():.4f}, max: {attn.max().item():.4f}")
     
     def get_node_embedding(self, node_idx):
         """Retrieve embedding for a specific node."""
@@ -492,6 +531,62 @@ class SACDiscreteActor(nn.Module):
         """Get deterministic action (argmax) for evaluation."""
         action_probs, _ = self.forward(node_embedding, sa_prior)
         return action_probs.argmax().item()
+    
+    def sample_action_with_mask(self, node_embedding, sa_prior, action_mask=None):
+        """
+        Sample action with optional action masking for DAG coherence (v3.1).
+        
+        Parameters
+        ----------
+        node_embedding : torch.Tensor
+        sa_prior : torch.Tensor
+        action_mask : torch.Tensor, shape (action_dim,), optional
+            Mask where 1.0 = valid action, 0.0 = invalid action.
+            Invalid actions get large negative logits before softmax.
+        
+        Returns
+        -------
+        action : int
+            Sampled action index
+        log_prob : torch.Tensor
+            Log probability of sampled action
+        """
+        # Handle both single node and batch inputs
+        if node_embedding.dim() == 1:
+            node_embedding = node_embedding.unsqueeze(0)
+            sa_prior = sa_prior.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        # Concatenate embedding with SA prior
+        state = torch.cat([node_embedding, sa_prior], dim=-1)
+        
+        # Compute action logits
+        logits = self.policy_net(state)
+        
+        # v3.1: Apply action masking BEFORE softmax
+        # This prevents DAG tearing by penalizing actions that
+        # would place nodes far from their DAG neighbors
+        if action_mask is not None:
+            # action_mask: 1.0 = valid, 0.0 = invalid
+            # We add -1e9 to invalid action logits
+            invalid_mask = (1.0 - action_mask) * (-1e9)
+            logits = logits + invalid_mask.unsqueeze(0) if logits.dim() == 2 else logits + invalid_mask
+        
+        # Convert to probabilities via softmax
+        action_probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        if squeeze_output:
+            action_probs = action_probs.squeeze(0)
+            log_probs = log_probs.squeeze(0)
+        
+        # Create categorical distribution and sample
+        dist = Categorical(probs=action_probs)
+        action = dist.sample()
+        
+        return action.item(), log_probs[action]
 
 
 # =============================================================================
@@ -821,7 +916,9 @@ def optimize_sac(
         # Step 4: Actor Loss
         # =================================================================
         # Get action probabilities (need gradients here)
-        action_probs, log_probs = actor(node_emb.detach(), node_sa_prior.detach())
+        # v3.1 FIX: Removed .detach() to allow gradients to flow back to GAT
+        # This enables stateful_trigger_bias to be updated through actor loss
+        action_probs, log_probs = actor(node_emb, node_sa_prior)
         
         # Get Q-values (detached to not affect actor gradient)
         with torch.no_grad():
@@ -910,7 +1007,7 @@ def soft_update(target_net, source_net, tau):
 # Module 5: Main Simulation Loop (run_hybrid_sac_microservice)
 # =============================================================================
 
-def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False):
+def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False, num_epochs=6):
     """
     Hybrid SAC-Refined SA Microservice Migration with Trigger-Aware Graph Attention.
     
@@ -933,24 +1030,12 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False)
        f. Optimize SAC networks
        g. Soft-update target critic
     
-    Key Differences from DQN Version:
-    =================================
+    Key Improvements (v2.0 - Ultimate Tuning):
+    ==========================================
     
-    1. ACTION SELECTION:
-       - DQN: ε-greedy with decaying ε
-       - SAC: Categorical sampling from learned policy (built-in exploration via entropy)
-    
-    2. NETWORK ARCHITECTURE:
-       - DQN: Single Q-network with target network
-       - SAC: Actor (policy) + Twin Critics + Target Critics
-    
-    3. OPTIMIZATION:
-       - DQN: Simple TD error minimization
-       - SAC: Maximum entropy objective with separate actor/critic updates
-    
-    4. TARGET UPDATE:
-       - DQN: Hard update every N steps
-       - SAC: Soft update (Polyak averaging) every step
+    1. DENSE REWARD: All nodes in a DAG share the same total reward (credit assignment fix)
+    2. BEHAVIOR CLONING WARMUP: First N steps force FOLLOW SA to learn baseline
+    3. MULTI-EPOCH TRAINING: Dataset is iterated multiple times for better convergence
     
     Parameters
     ----------
@@ -962,6 +1047,10 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False)
         Trajectory prediction model for proactive migration
     proactive : bool
         Whether to enable proactive (trajectory-based) migration triggers
+    num_epochs : int
+        Total passes over the timeline. The **last** epoch is a pure evaluation
+        phase (no BC, deterministic actor, no replay / no optimize_sac / no soft
+        update). Earlier epochs are training. Default 6 = 5 train + 1 eval.
     
     Returns
     -------
@@ -995,6 +1084,36 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: TriggerAwareGAT + Discrete SAC")
+    print(f"  Multi-Epoch: {num_epochs} epochs (= {num_epochs - 1} train + 1 eval)")
+    
+    # =========================================================================
+    # v3.4: Conservative Curriculum Learning with SA Anchor
+    # =========================================================================
+    # Key insight: v3.3's decay was too aggressive, causing migration explosion.
+    # 
+    # v3.4 improvements:
+    # 1. Slower decay: Keep high SA guidance longer
+    # 2. SA Anchor: Even in final epoch, retain 10% SA guidance as "safety net"
+    # 3. Combined with enhanced migration penalty in reward function
+    #
+    # Schedule: [0.95, 0.85, 0.65, 0.35, 0.10]
+    # - Epoch 0: 95% SA → near-pure imitation
+    # - Epoch 1: 85% SA → slight exploration for Q-value diversity
+    # - Epoch 2: 65% SA → balanced learning
+    # - Epoch 3: 35% SA → more exploration, but SA still guides
+    # - Epoch 4: 10% SA → SA anchor prevents total drift
+    # =========================================================================
+    bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]
+    
+    print(f"  [v3.7] JIT Migration + 3D Trigger Context (risk_ratio):")
+    print(f"    - Train epochs: {num_epochs - 1}  |  Eval epoch: 1 (last)")
+    print(f"    - BC probability schedule (training): {bc_prob_schedule}")
+    print(f"    - Eval: BC=0, argmax policy, no memory / no optimize_sac / no soft-update")
+    print(f"    - v3.7 NEW: trigger_context now 3D [proactive, reactive, risk_ratio]")
+    print(f"    - v3.7 NEW: Dynamic migration discount based on risk_ratio")
+    
+    bc_actions_taken = 0       # Counter for BC (SA imitation) actions
+    explore_actions_taken = 0  # Counter for exploration actions
     
     # Debug counters for proactive trigger analysis
     _debug_reactive_triggers = 0
@@ -1011,7 +1130,10 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False)
     embedding_dim = 64
     action_dim = 3
     learning_rate = 3e-4
-    alpha_init = 0.2
+    # v3.3: Moderate exploration temperature for Soft BC
+    # With gradual probability decay, we can use a balanced alpha
+    # that allows entropy-driven exploration when BC probability is low
+    alpha_init = 0.05
     gamma = 0.95
     tau = 0.005
     batch_size = 32
@@ -1019,12 +1141,16 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False)
     
     # Target entropy for automatic alpha tuning
     # For discrete actions: -log(1/|A|) * ratio = log(|A|) * ratio
-    target_entropy = -np.log(1.0 / action_dim) * 0.98  # ~0.98 * log(3) ≈ 1.08
+    # v3.4: Reduced from 0.98 to 0.90 for more deterministic policy
+    # Lower target = less exploration = fewer unnecessary migrations
+    target_entropy = -np.log(1.0 / action_dim) * 0.90  # ~0.90 * log(3) ≈ 0.99
     
     # Initialize networks
+    # v3.7: trigger_dim upgraded from 2 to 3 for continuous risk feature
+    # trigger_context now contains [proactive_flag, reactive_flag, risk_ratio]
     gat_network = TriggerAwareGAT(
         node_feat_dim=3,
-        trigger_dim=2,
+        trigger_dim=3,  # v3.7: 3D trigger context with risk_ratio
         hidden_dim=hidden_dim,
         num_heads=2,
         output_dim=embedding_dim,
@@ -1074,262 +1200,359 @@ def run_hybrid_sac_microservice(df, servers_df, predictor=None, proactive=False)
     alpha_history = []
     
     # =========================================================================
-    # Main Simulation Loop
+    # Main Simulation Loop (Multi-Epoch)
     # =========================================================================
     
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
     
     decision_count = 0
-    pbar = tqdm(total=len(timestamps), desc="Hybrid SAC Migration")
+    global_step = 0  # Tracks total steps across all epochs
     
-    for timestamp in timestamps:
-        current_rows = df_grouped.get_group(timestamp)
+    for epoch in range(num_epochs):
+        print(f"\n  === Epoch {epoch + 1}/{num_epochs} ===")
         
-        for _, row in current_rows.iterrows():
-            taxi_id = row['taxi_id']
-            current_lat = row['latitude']
-            current_lon = row['longitude']
+        is_eval_epoch = (epoch == num_epochs - 1)
+        
+        if is_eval_epoch:
+            print("  [EVAL] Pure evaluation epoch — reset reported metrics; "
+                  "BC off; argmax actions; no replay / no optimize / no soft-update")
+            total_violations = 0
+            total_migrations = 0
+            decision_count = 0
+            proactive_decisions = 0
+            total_reward_sum = 0.0
+            total_access_latency = 0.0
+            total_communication_cost = 0.0
+            total_migration_cost = 0.0
+            gat_network.eval()
+            actor.eval()
+            critic.eval()
+            target_critic.eval()
+        else:
+            gat_network.train()
+            actor.train()
+            critic.train()
+            target_critic.train()
+        
+        epoch_start_decisions = decision_count
+        epoch_start_migrations = total_migrations
+        epoch_start_violations = total_violations
+        epoch_start_reward = total_reward_sum
+        
+        # Reset per-epoch tracking (but keep networks and replay buffer!)
+        epoch_migrations = 0
+        epoch_violations = 0
+        epoch_reward = 0.0
+        
+        pbar = tqdm(
+            total=len(timestamps),
+            desc=f"Epoch {epoch+1}/{num_epochs}{' [EVAL]' if is_eval_epoch else ''}",
+        )
+        
+        for timestamp in timestamps:
+            current_rows = df_grouped.get_group(timestamp)
             
-            # -------------------------------------------------------------
-            # Initialize new taxi with nearest server assignment
-            # -------------------------------------------------------------
-            if taxi_id not in taxi_dag_assignments:
-                nearest = find_k_nearest_servers(current_lat, current_lon, servers_df, k=1)[0]
-                chosen_dag = assign_dag_type()
-                taxi_dag_type[taxi_id] = chosen_dag
-                taxi_dag_assignments[taxi_id] = initialize_dag_assignment(chosen_dag, nearest[0])
-                continue
-            
-            dag_type = taxi_dag_type[taxi_id]
-            dag_info = MICROSERVICE_DAGS[dag_type]
-            entry_nodes = get_entry_nodes(dag_info)
-            gateway_node = entry_nodes[0]
-            
-            # -------------------------------------------------------------
-            # Check current gateway distance and violation
-            # -------------------------------------------------------------
-            gateway_server_id = taxi_dag_assignments[taxi_id][gateway_node]
-            gw_lat, gw_lon = servers_info[gateway_server_id]
-            gateway_dist = haversine_distance(current_lat, current_lon, gw_lat, gw_lon)
-            
-            if gateway_dist > 15.0:
-                total_violations += 1
-            
-            # Compute current DAG reward
-            current_dag_reward, _ = calculate_microservice_reward(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id], taxi_dag_assignments[taxi_id],
-                (current_lat, current_lon), servers_info,
-            )
-            
-            # -------------------------------------------------------------
-            # Trajectory prediction (if proactive mode)
-            # -------------------------------------------------------------
-            predicted_locations = None
-            if use_proactive:
-                raw = predictor.predict_future(
-                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+            for _, row in current_rows.iterrows():
+                taxi_id = row['taxi_id']
+                current_lat = row['latitude']
+                current_lon = row['longitude']
+                
+                # -------------------------------------------------------------
+                # Initialize new taxi with nearest server assignment
+                # -------------------------------------------------------------
+                if taxi_id not in taxi_dag_assignments:
+                    nearest = find_k_nearest_servers(current_lat, current_lon, servers_df, k=1)[0]
+                    chosen_dag = assign_dag_type()
+                    taxi_dag_type[taxi_id] = chosen_dag
+                    taxi_dag_assignments[taxi_id] = initialize_dag_assignment(chosen_dag, nearest[0])
+                    continue
+                
+                dag_type = taxi_dag_type[taxi_id]
+                dag_info = MICROSERVICE_DAGS[dag_type]
+                entry_nodes = get_entry_nodes(dag_info)
+                gateway_node = entry_nodes[0]
+                
+                # -------------------------------------------------------------
+                # Check current gateway distance and violation
+                # -------------------------------------------------------------
+                gateway_server_id = taxi_dag_assignments[taxi_id][gateway_node]
+                gw_lat, gw_lon = servers_info[gateway_server_id]
+                gateway_dist = haversine_distance(current_lat, current_lon, gw_lat, gw_lon)
+                
+                if gateway_dist > 15.0:
+                    total_violations += 1
+                
+                # Compute current DAG reward
+                current_dag_reward, _ = calculate_microservice_reward(
+                    taxi_id, dag_info,
+                    taxi_dag_assignments[taxi_id], taxi_dag_assignments[taxi_id],
+                    (current_lat, current_lon), servers_info,
                 )
-                predicted_locations = [(lat, lon) for lon, lat in raw]
-                _debug_predictions_made += 1
-            
-            # -------------------------------------------------------------
-            # Get trigger type
-            # -------------------------------------------------------------
-            trigger_type = get_trigger_type(
-                current_lat, current_lon, gw_lat, gw_lon,
-                current_dag_reward, predicted_locations,
-                proactive_enabled=use_proactive,
-            )
-            
-            if trigger_type is None:
-                _debug_no_triggers += 1
-                continue
-            
-            decision_count += 1
-            if trigger_type == TRIGGER_PROACTIVE:
-                proactive_decisions += 1
-                _debug_proactive_triggers += 1
-            elif trigger_type == TRIGGER_REACTIVE:
-                _debug_reactive_triggers += 1
-            
-            # -------------------------------------------------------------
-            # Phase A: Simulated Annealing Global Draft
-            # -------------------------------------------------------------
-            candidates = find_k_nearest_servers(current_lat, current_lon, servers_df, k=3)
-            old_assignments = copy.copy(taxi_dag_assignments[taxi_id])
-            
-            sa_proposal, _sa_cost = microservice_simulated_annealing(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id],
-                candidates,
-                user_location=(current_lat, current_lon),
-                servers_info=servers_info,
-                previous_assignments=old_assignments,
-                predicted_locations=predicted_locations,
-                trigger_type=trigger_type,
-            )
-            
-            # -------------------------------------------------------------
-            # Phase B: Build Graph State and Compute Embeddings
-            # -------------------------------------------------------------
-            graph_state = build_graph_state(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id],
-                servers_info, trigger_type,
-                sa_proposal, candidates,
-                current_lat, current_lon,
-            )
-            
-            # Convert to tensors
-            node_feat_t = torch.FloatTensor(graph_state['node_features']).to(device)
-            adj_t = torch.FloatTensor(graph_state['adj_matrix']).to(device)
-            trigger_t = torch.FloatTensor(graph_state['trigger_context']).to(device)
-            sa_prior_t = torch.FloatTensor(graph_state['sa_priors']).to(device)
-            
-            # Compute graph embeddings
-            with torch.no_grad():
-                embeddings = gat_network(node_feat_t, adj_t, trigger_t)
-            
-            # -------------------------------------------------------------
-            # Phase C: Per-Node Decisions (Topological Order)
-            # -------------------------------------------------------------
-            sorted_nodes = topological_sort(dag_info)
-            node_to_idx = {name: i for i, name in enumerate(graph_state['node_names'])}
-            node_transitions = []
-            nearest_server_id = candidates[0][0]
-            
-            for ms_node in sorted_nodes:
-                node_idx = node_to_idx[ms_node]
-                sa_proposed_server = sa_proposal[ms_node]
                 
-                # Get node embedding and SA prior
-                node_emb = embeddings[node_idx]
-                node_sa_prior = sa_prior_t[node_idx]
+                # -------------------------------------------------------------
+                # Trajectory prediction (if proactive mode)
+                # -------------------------------------------------------------
+                predicted_locations = None
+                if use_proactive:
+                    raw = predictor.predict_future(
+                        current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+                    )
+                    predicted_locations = [(lat, lon) for lon, lat in raw]
+                    _debug_predictions_made += 1
                 
-                # ---------------------------------------------------------
-                # ACTION SELECTION via Categorical Sampling (SAC style)
-                # No epsilon-greedy! Exploration comes from entropy bonus
-                # ---------------------------------------------------------
+                # -------------------------------------------------------------
+                # Get trigger type
+                # -------------------------------------------------------------
+                trigger_type = get_trigger_type(
+                    current_lat, current_lon, gw_lat, gw_lon,
+                    current_dag_reward, predicted_locations,
+                    proactive_enabled=use_proactive,
+                )
+                
+                if trigger_type is None:
+                    _debug_no_triggers += 1
+                    continue
+                
+                decision_count += 1
+                if trigger_type == TRIGGER_PROACTIVE:
+                    proactive_decisions += 1
+                    _debug_proactive_triggers += 1
+                elif trigger_type == TRIGGER_REACTIVE:
+                    _debug_reactive_triggers += 1
+                
+                # -------------------------------------------------------------
+                # Phase A: Simulated Annealing Global Draft
+                # -------------------------------------------------------------
+                candidates = find_k_nearest_servers(current_lat, current_lon, servers_df, k=3)
+                old_assignments = copy.copy(taxi_dag_assignments[taxi_id])
+                
+                sa_proposal, _sa_cost = microservice_simulated_annealing(
+                    taxi_id, dag_info,
+                    taxi_dag_assignments[taxi_id],
+                    candidates,
+                    user_location=(current_lat, current_lon),
+                    servers_info=servers_info,
+                    previous_assignments=old_assignments,
+                    predicted_locations=predicted_locations,
+                    trigger_type=trigger_type,
+                )
+                
+                # -------------------------------------------------------------
+                # Phase B: Build Graph State and Compute Embeddings
+                # -------------------------------------------------------------
+                graph_state = build_graph_state(
+                    taxi_id, dag_info,
+                    taxi_dag_assignments[taxi_id],
+                    servers_info, trigger_type,
+                    sa_proposal, candidates,
+                    current_lat, current_lon,
+                )
+                
+                # Convert to tensors
+                node_feat_t = torch.FloatTensor(graph_state['node_features']).to(device)
+                adj_t = torch.FloatTensor(graph_state['adj_matrix']).to(device)
+                trigger_t = torch.FloatTensor(graph_state['trigger_context']).to(device)
+                sa_prior_t = torch.FloatTensor(graph_state['sa_priors']).to(device)
+                
+                # Compute graph embeddings
                 with torch.no_grad():
-                    action, _ = actor.sample_action(node_emb, node_sa_prior)
+                    embeddings = gat_network(node_feat_t, adj_t, trigger_t)
                 
-                # Execute action
-                current_node_server = taxi_dag_assignments[taxi_id][ms_node]
-                if action == 0:  # STAY
-                    target_server = current_node_server
-                elif action == 1:  # FOLLOW SA
-                    target_server = sa_proposed_server
-                else:  # NEAREST
-                    target_server = nearest_server_id
+                # -------------------------------------------------------------
+                # Phase C: Per-Node Decisions (Topological Order)
+                # v3.3: Soft BC with probability decay (curriculum learning)
+                # -------------------------------------------------------------
+                sorted_nodes = topological_sort(dag_info)
+                node_to_idx = {name: i for i, name in enumerate(graph_state['node_names'])}
+                node_transitions = []
+                nearest_server_id = candidates[0][0]
                 
-                taxi_dag_assignments[taxi_id][ms_node] = target_server
-                node_transitions.append((node_idx, action))
-            
-            # -------------------------------------------------------------
-            # Phase D: Compute Reward
-            # -------------------------------------------------------------
-            reward, details = calculate_microservice_reward(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id], old_assignments,
-                (current_lat, current_lon), servers_info,
-                predicted_locations=predicted_locations,
-                trigger_type=trigger_type,
-            )
-            total_reward_sum += reward
-            reward_history.append(reward)
-            
-            total_access_latency += details['access_latency']
-            total_communication_cost += details['communication_cost']
-            total_migration_cost += details['migration_cost']
-            
-            nodes_migrated = sum(
-                1 for n in sorted_nodes
-                if old_assignments[n] != taxi_dag_assignments[taxi_id][n]
-            )
-            total_migrations += nodes_migrated
-            
-            # -------------------------------------------------------------
-            # Phase E: Build Next State and Store Transitions
-            # -------------------------------------------------------------
-            next_graph_state = build_graph_state(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id],
-                servers_info, trigger_type,
-                sa_proposal, candidates,
-                current_lat, current_lon,
-            )
-            
-            # Store transitions in replay buffer
-            for i, (node_idx, action) in enumerate(node_transitions):
-                is_last = (i == len(node_transitions) - 1)
-                if is_last:
-                    step_reward = reward
-                    done = True
+                # BC probability: training uses schedule; eval forces 0 (no imitation)
+                if is_eval_epoch:
+                    current_bc_prob = 0.0
                 else:
-                    step_reward = 0.0
-                    done = False
+                    current_bc_prob = (
+                        bc_prob_schedule[epoch] if epoch < len(bc_prob_schedule) else 0.0
+                    )
                 
-                memory.append((
-                    graph_state,
-                    node_idx,
-                    action,
-                    step_reward,
-                    next_graph_state,
-                    done,
-                ))
+                for ms_node in sorted_nodes:
+                    node_idx = node_to_idx[ms_node]
+                    sa_proposed_server = sa_proposal[ms_node]
+                    
+                    # Get node embedding and SA prior
+                    node_emb = embeddings[node_idx]
+                    node_sa_prior = sa_prior_t[node_idx]
+                    
+                    # ---------------------------------------------------------
+                    # v3.3: Soft BC with Probability Decay
+                    # ---------------------------------------------------------
+                    # Instead of hard cutoff, use probabilistic action selection:
+                    # - With prob = current_bc_prob: Follow SA (imitation)
+                    # - With prob = 1 - current_bc_prob: Sample from actor (explore)
+                    #
+                    # This ensures ALL actions receive Q-value updates throughout
+                    # training, preventing the Q-value starvation seen in v3.2.
+                    # ---------------------------------------------------------
+                    with torch.no_grad():
+                        if is_eval_epoch:
+                            # Deterministic greedy action (fair comparison vs SA)
+                            action = actor.get_action_deterministic(node_emb, node_sa_prior)
+                        elif random.random() < current_bc_prob:
+                            # Imitation: Follow SA recommendation
+                            action = 1
+                            bc_actions_taken += 1
+                        else:
+                            # Exploration: Sample from learned policy
+                            action, _ = actor.sample_action(node_emb, node_sa_prior)
+                            explore_actions_taken += 1
+                    
+                    # Execute action
+                    current_node_server = taxi_dag_assignments[taxi_id][ms_node]
+                    if action == 0:  # STAY
+                        target_server = current_node_server
+                    elif action == 1:  # FOLLOW SA
+                        target_server = sa_proposed_server
+                    else:  # NEAREST
+                        target_server = nearest_server_id
+                    
+                    taxi_dag_assignments[taxi_id][ms_node] = target_server
+                    node_transitions.append((node_idx, action))
+                    if not is_eval_epoch:
+                        global_step += 1
+                
+                # -------------------------------------------------------------
+                # Phase D: Compute Reward
+                # -------------------------------------------------------------
+                reward, details = calculate_microservice_reward(
+                    taxi_id, dag_info,
+                    taxi_dag_assignments[taxi_id], old_assignments,
+                    (current_lat, current_lon), servers_info,
+                    predicted_locations=predicted_locations,
+                    trigger_type=trigger_type,
+                )
+                total_reward_sum += reward
+                reward_history.append(reward)
+                
+                total_access_latency += details['access_latency']
+                total_communication_cost += details['communication_cost']
+                total_migration_cost += details['migration_cost']
+                
+                nodes_migrated = sum(
+                    1 for n in sorted_nodes
+                    if old_assignments[n] != taxi_dag_assignments[taxi_id][n]
+                )
+                total_migrations += nodes_migrated
+                
+                # -------------------------------------------------------------
+                # Phase E: Build Next State and Store Transitions
+                # -------------------------------------------------------------
+                next_graph_state = build_graph_state(
+                    taxi_id, dag_info,
+                    taxi_dag_assignments[taxi_id],
+                    servers_info, trigger_type,
+                    sa_proposal, candidates,
+                    current_lat, current_lon,
+                )
+                
+                # Store transitions in replay buffer
+                # =====================================================
+                # DENSE REWARD FIX (v2.0):
+                # All nodes in the DAG share the same total reward.
+                # This solves the credit assignment problem where only
+                # the last node received reward while others got 0.
+                # "一荣俱荣，一损俱损" - shared fate for all nodes
+                # =====================================================
+                num_nodes = len(node_transitions)
+                per_node_reward = reward / num_nodes  # Fair share of total reward
+                
+                if not is_eval_epoch:
+                    for i, (node_idx, action) in enumerate(node_transitions):
+                        is_last = (i == len(node_transitions) - 1)
+                        
+                        memory.append((
+                            graph_state,
+                            node_idx,
+                            action,
+                            per_node_reward,  # Dense reward: each node gets fair share
+                            next_graph_state,
+                            is_last,  # Only mark last node as done
+                        ))
+                    
+                    # -------------------------------------------------------------
+                    # Phase F: Optimize SAC Networks
+                    # -------------------------------------------------------------
+                    train_info = optimize_sac(
+                        memory,
+                        gat_network,
+                        actor,
+                        critic,
+                        target_critic,
+                        gat_optimizer,
+                        actor_optimizer,
+                        critic_optimizer,
+                        device,
+                        alpha=log_alpha.exp().item(),
+                        gamma=gamma,
+                        batch_size=batch_size,
+                        target_entropy=target_entropy,
+                        log_alpha=log_alpha,
+                        alpha_optimizer=alpha_optimizer,
+                    )
+                    
+                    if train_info is not None:
+                        loss_history.append(train_info['critic_loss'] + train_info['actor_loss'])
+                        entropy_history.append(train_info['entropy'])
+                        alpha_history.append(train_info['alpha'])
+                    
+                    # -------------------------------------------------------------
+                    # Phase G: Soft Update Target Critic (Every Step)
+                    # -------------------------------------------------------------
+                    soft_update(target_critic, critic, tau)
             
-            # -------------------------------------------------------------
-            # Phase F: Optimize SAC Networks
-            # -------------------------------------------------------------
-            train_info = optimize_sac(
-                memory,
-                gat_network,
-                actor,
-                critic,
-                target_critic,
-                gat_optimizer,
-                actor_optimizer,
-                critic_optimizer,
-                device,
-                alpha=log_alpha.exp().item(),
-                gamma=gamma,
-                batch_size=batch_size,
-                target_entropy=target_entropy,
-                log_alpha=log_alpha,
-                alpha_optimizer=alpha_optimizer,
-            )
-            
-            if train_info is not None:
-                loss_history.append(train_info['critic_loss'] + train_info['actor_loss'])
-                entropy_history.append(train_info['entropy'])
-                alpha_history.append(train_info['alpha'])
-            
-            # -------------------------------------------------------------
-            # Phase G: Soft Update Target Critic (Every Step)
-            # -------------------------------------------------------------
-            soft_update(target_critic, critic, tau)
+            pbar.update(1)
+        pbar.close()
         
-        pbar.update(1)
-    pbar.close()
+        # Epoch summary (deltas; eval epoch totals == reported final metrics)
+        ed = decision_count - epoch_start_decisions
+        em = total_migrations - epoch_start_migrations
+        ev = total_violations - epoch_start_violations
+        er = total_reward_sum - epoch_start_reward
+        tag = " [EVAL — reported to leaderboard]" if is_eval_epoch else ""
+        print(
+            f"  Epoch {epoch+1} completed: decisions={ed}, migrations={em}, "
+            f"violations={ev}, reward={er:.2f}{tag}"
+        )
     
-    # Debug output for proactive trigger analysis
-    print(f"\n  [DEBUG] Trigger Analysis:")
+    # Debug output for proactive trigger analysis (after all epochs)
+    print(f"\n  [DEBUG] Summary (after {num_epochs} epochs = {num_epochs - 1} train + 1 eval):")
+    print(f"    - Total epochs: {num_epochs} (last epoch = deterministic eval only)")
+    print(f"    - BC prob schedule (training only): {bc_prob_schedule}")
+    print(f"    - BC actions (SA imitation): {bc_actions_taken}")
+    print(f"    - Explore actions (Actor sampling): {explore_actions_taken}")
+    print(f"    - Total global steps: {global_step}")
     print(f"    - Predictions made: {_debug_predictions_made}")
     print(f"    - REACTIVE triggers: {_debug_reactive_triggers}")
     print(f"    - PROACTIVE triggers: {_debug_proactive_triggers}")
     print(f"    - No triggers (skipped): {_debug_no_triggers}")
     print(f"    - Total decisions: {decision_count}")
     
+    # v3.0: Print final GAT attention weights to verify physics-aware learning
+    gat_network.debug_print_attention(prefix="  ")
+    
     # =========================================================================
     # Return Results
     # =========================================================================
     return {
+        # v3.6: These headline metrics reflect **only** the final eval epoch
+        # (deterministic argmax, no BC, no training updates).
         'total_migrations': total_migrations,
         'total_violations': total_violations,
         'proactive_decisions': proactive_decisions,
         'decision_count': decision_count,
+        'train_epochs': num_epochs - 1,
+        'eval_epochs': 1,
+        'eval_deterministic_argmax': True,
         'total_reward': total_reward_sum,
         'total_access_latency': total_access_latency,
         'total_communication_cost': total_communication_cost,

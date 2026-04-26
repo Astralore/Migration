@@ -47,12 +47,14 @@ def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     # Hybrid SAC (新的 Trigger-Conditioned GAT + Discrete SAC)
+    # v3.6: Train/Eval split — last epoch deterministic eval (fair vs SA)
     print(f"\n{'=' * 60}")
-    print(f"  [{label}] Running Hybrid SAC ({mode_str}) ...")
+    print(f"  [{label}] Running Hybrid SAC v3.6 ({mode_str}) ...")
+    print(f"  [v3.6: 5 train + 1 eval, argmax eval, no replay/optimize on eval]")
     print(f"{'=' * 60}")
     t0 = time.time()
     results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        df, servers_df, predictor=predictor, proactive=proactive,
+        df, servers_df, predictor=predictor, proactive=proactive, num_epochs=6,
     )
     print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
 
