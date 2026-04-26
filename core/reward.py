@@ -34,14 +34,14 @@ FUTURE_DIST_THRESHOLD = 15.0
 # - risk=1.00 (15km): divisor = 500 (full proactive discount)
 # =============================================================================
 STATE_COST_PROACTIVE = 500.0   # background sync: state_mb / 500 (low cost at high risk)
-STATE_COST_REACTIVE = 5.0      # foreground block: state_mb / 5 (high cost at low risk)
+STATE_COST_REACTIVE = 50.0     # v3.9: 从 5.0 改为 50.0，降低 Reactive 迁移成本
 
 # v3.5: Reduced base migration multiplier (from 2.0 to 1.5)
 MIGRATION_BASE_MULTIPLIER = 1.5  # 1.5x penalty for all migrations
 
 # v3.5: SLA Violation "Death Penalty" - Non-linear punishment
 SLA_DISTANCE_THRESHOLD = 15.0  # km - same as DISTANCE_THRESHOLD_KM in context.py
-SLA_VIOLATION_MULTIPLIER = 15.0  # v3.8: 15x "Death Penalty" for SLA violations (was 5.0)
+SLA_VIOLATION_MULTIPLIER = 8.0   # v3.9: 从 15.0 降为 8.0，避免过度惩罚导致策略瘫痪
 
 # v3.6: Cross-edge extreme distance — significant multiplier on comm cost (topology)
 EDGE_TEAR_DISTANCE_KM = 20.0
@@ -206,6 +206,9 @@ def calculate_microservice_reward(
                   + delta * future_penalty
                   + tearing_penalty)  # v3.4: Anti-tearing reward
     reward = -total_cost
+    
+    # v3.9: Reward Clipping - 防止极端负值导致梯度爆炸
+    reward = max(reward, -2000.0)
 
     details = {
         'access_latency': access_latency,

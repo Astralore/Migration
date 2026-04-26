@@ -908,8 +908,8 @@ def optimize_sac(
         q1_action = q1[action]
         q2_action = q2[action]
         
-        # MSE loss for both Q-networks
-        critic_loss = F.mse_loss(q1_action, target_value) + F.mse_loss(q2_action, target_value)
+        # v3.9: 使用 Huber Loss (Smooth L1) 抑制极端误差的梯度爆炸
+        critic_loss = F.smooth_l1_loss(q1_action, target_value) + F.smooth_l1_loss(q2_action, target_value)
         total_critic_loss = total_critic_loss + critic_loss
         critic_losses.append(critic_loss.item())
         
@@ -1103,23 +1103,21 @@ def run_hybrid_sac_microservice(
     print(f"  Multi-Epoch: {num_epochs} epochs (= {num_epochs - 1} train + 1 eval)")
     
     # =========================================================================
-    # v3.4: Conservative Curriculum Learning with SA Anchor
+    # v3.9: Mode-Specific Curriculum Learning
     # =========================================================================
-    # Key insight: v3.3's decay was too aggressive, causing migration explosion.
+    # v3.8 Problem: Reactive 模式在 15x 死亡惩罚下完全瘫痪（0 迁移）
     # 
-    # v3.4 improvements:
-    # 1. Slower decay: Keep high SA guidance longer
-    # 2. SA Anchor: Even in final epoch, retain 10% SA guidance as "safety net"
-    # 3. Combined with enhanced migration penalty in reward function
+    # v3.9 Solution: 为 Reactive 模式设置更慢的 BC 衰减
+    # - Proactive: 原有 schedule，快速过渡到自主决策
+    # - Reactive: 更慢衰减，给模型更多时间学习 SA 的"带伤迁移"策略
     #
-    # Schedule: [0.95, 0.85, 0.65, 0.35, 0.10]
-    # - Epoch 0: 95% SA → near-pure imitation
-    # - Epoch 1: 85% SA → slight exploration for Q-value diversity
-    # - Epoch 2: 65% SA → balanced learning
-    # - Epoch 3: 35% SA → more exploration, but SA still guides
-    # - Epoch 4: 10% SA → SA anchor prevents total drift
+    # Proactive Schedule: [0.95, 0.85, 0.65, 0.35, 0.10]
+    # Reactive Schedule:  [0.98, 0.90, 0.75, 0.55, 0.30] (更保守)
     # =========================================================================
-    bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]
+    if proactive:
+        bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]  # Proactive: 原有 schedule
+    else:
+        bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # Reactive: 更慢衰减
     
     print(f"  [v3.7] JIT Migration + 3D Trigger Context (risk_ratio):")
     print(f"    - Train epochs: {num_epochs - 1}  |  Eval epoch: 1 (last)")
