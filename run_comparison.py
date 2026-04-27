@@ -21,7 +21,7 @@ from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_perf
 # =============================================================================
 # 工程化配置
 # =============================================================================
-INFERENCE_MODE = True  # False=训练模式, True=推理模式
+INFERENCE_MODE = False  # False=训练模式, True=推理模式
 
 # 数据切分配置
 TRAIN_START_INDEX = 0

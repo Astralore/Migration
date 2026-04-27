@@ -1,124 +1,148 @@
-# v3.9 系统优化方案（基于实验分析）
+# v3.10 修复方案：解决 Proactive SAC 失效问题
 
-## 背景问题分析
+## 问题诊断
 
-根据 2026/4/26 实验结果，发现以下问题：
-1. **Hybrid SAC Reactive 模式完全失效**：0 迁移、1987 违规（SA 仅 1017）
-2. **Loss 曲线存在 1e7 量级尖峰**：Critic 训练不稳定
-3. **Reward 存在 -40000 极端负值**：导致梯度爆炸
+### v3.9 实验结果
+| 模式 | SAC Migrations | SAC Violations | SA Violations | 状态 |
+|------|----------------|----------------|---------------|------|
+| **Reactive** | 291 | 1013 | 1014 | ✅ 已修复 |
+| **Proactive** | 0 | 1987 | 1020 | ⚠️ 仍失效 |
 
-**根因**：`SLA_VIOLATION_MULTIPLIER=15.0` 惩罚过重 + MSE Loss 对极端值敏感
+### 根因分析
+Proactive SAC 失效的原因**不是奖励函数**，而是：
+
+1. **BC Schedule 衰减太快**：
+   - Proactive: `[0.95, 0.85, 0.65, 0.35, 0.10]` → 快速衰减
+   - Reactive:  `[0.98, 0.90, 0.75, 0.55, 0.30]` → 慢速衰减 ✅ 有效
+   
+2. **Eval Epoch 完全依赖 Q 值**：
+   - BC=0 时模型用 argmax(Q) 决策
+   - Q 值没有正确学习"迁移优于不迁移"
+   - 模型选择 Action 0 (STAY) 避免迁移成本
+
+3. **训练时表现正常，Eval 时崩溃**：
+   - 训练 Epoch 1-5：migrations > 900，正常
+   - Eval Epoch 6：migrations = 0，崩溃
 
 ---
 
 ## 核心修改指令
 
-### 任务 1：修复 Reactive 模式的"策略瘫痪"
+### 任务 1：统一 BC Schedule（最关键）
+
+**文件**：`algorithms/hybrid_sac.py`，约第 1117-1120 行
+
+**原代码**：
+```python
+if proactive:
+    bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]  # Proactive: 快速衰减
+else:
+    bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # Reactive: 慢速衰减
+```
+
+**修改为**：
+```python
+# v3.10: 统一使用慢衰减 schedule，确保模型充分学习 SA 策略
+# Reactive 的成功证明慢衰减有效
+bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # 统一使用慢衰减
+```
+
+**原理**：Reactive 用慢衰减成功了，Proactive 也应使用相同策略
+
+---
+
+### 任务 2：降低 Target Network 更新速率
+
+**文件**：`algorithms/hybrid_sac.py`，约第 1152 行
+
+**原代码**：
+```python
+tau = 0.005
+```
+
+**修改为**：
+```python
+tau = 0.001  # v3.10: 从 0.005 降为 0.001，提高 Q 值稳定性
+```
+
+**原理**：更慢的 soft update 让 target Q 更稳定，减少 Q 值震荡
+
+---
+
+### 任务 3：增加 Eval 时的安全保底（可选）
+
+**文件**：`algorithms/hybrid_sac.py`，约第 1404 行
+
+**原代码**：
+```python
+if is_eval_epoch or inference_mode:
+    current_bc_prob = 0.0  # Eval: 完全依赖 Q 值
+```
+
+**修改为**：
+```python
+if is_eval_epoch or inference_mode:
+    current_bc_prob = 0.05  # v3.10: 保留 5% SA 保底，防止完全崩溃
+```
+
+**原理**：即使在评估时，保留少量 SA 模仿作为安全网
+
+---
+
+### 任务 4：物理化奖励函数（学术优化，非必需）
+
+如果需要让论文的数学模型更严谨，可以进行以下优化：
 
 **文件**：`core/reward.py`
 
-**修改 1**：降低 Reactive 状态迁移成本（鼓励迁移）
+**修改 1**：将抽象除数改为带宽概念
 ```python
-# 第 37 行：STATE_COST_REACTIVE 从 5.0 改为 50.0
-# 原理：除数变大 → state_mb/50 < state_mb/5 → 迁移成本降低 10 倍
-STATE_COST_REACTIVE = 50.0  # v3.9: 从 5.0 改为 50.0，降低 Reactive 迁移成本
+# 物理化常量（可选）
+BACKGROUND_SYNC_RATE_MBPS = 500.0   # 背景同步带宽 (Proactive)
+FOREGROUND_SYNC_RATE_MBPS = 50.0    # 前台传输带宽 (Reactive)
+
+# JIT 公式（保持当前逻辑，只改名）
+# 高 risk_ratio → 更高带宽 → 更低成本（鼓励迁移）
+effective_bandwidth = FOREGROUND_SYNC_RATE_MBPS + \
+    (BACKGROUND_SYNC_RATE_MBPS - FOREGROUND_SYNC_RATE_MBPS) * (risk_ratio ** 2)
+state_transfer_time_ms = (state_mb / effective_bandwidth) * 1000
 ```
 
-**修改 2**：降低 SLA 死亡惩罚（避免过度惩罚）
-```python
-# 第 44 行：SLA_VIOLATION_MULTIPLIER 从 15.0 改为 8.0
-# 原理：15x 太高导致模型"躺平"，8x 仍能惩罚违规但允许探索
-SLA_VIOLATION_MULTIPLIER = 8.0  # v3.9: 从 15.0 降为 8.0
-```
-
-**修改 3**：添加 Reward Clipping（防止极端负值）
-```python
-# 在 calculate_microservice_reward 函数返回前（约第 208 行后）添加：
-reward = max(reward, -2000.0)  # v3.9: 截断极端负奖励
-```
-
-⚠️ **不要修改** `gamma`（迁移权重 1.5）：增大会加剧"不迁移"问题
+⚠️ **注意**：JIT 公式必须是 `risk_ratio ** 2`（不是 `1 - risk_ratio ** 2`），确保高风险时成本降低！
 
 ---
 
-### 任务 2：引入 Huber Loss 稳定 Critic 训练
+## 修改优先级
 
-**文件**：`algorithms/hybrid_sac.py`
-
-**修改位置**：`optimize_sac` 函数，第 912 行
-
-**原代码**：
-```python
-critic_loss = F.mse_loss(q1_action, target_value) + F.mse_loss(q2_action, target_value)
-```
-
-**修改为**：
-```python
-# v3.9: 使用 Huber Loss (Smooth L1) 抑制极端误差的梯度爆炸
-critic_loss = F.smooth_l1_loss(q1_action, target_value) + F.smooth_l1_loss(q2_action, target_value)
-```
-
-**原理**：Smooth L1 Loss 在误差 > 1 时为线性，消除 MSE 的二次放大效应
-
----
-
-### 任务 3：保持 GAT 架构不变
-
-**分析**：当前 `TriggerAwareGAT` 是精心设计的自定义实现，具有：
-- Trigger-Conditioned Attention（触发类型感知）
-- Stateful-Trigger Interaction Bias（状态节点交互偏置）
-- Multi-Head Attention（2 头，已覆盖不同拓扑视角）
-
-**结论**：对于 3-6 节点的 DAG，当前架构已足够。增加层数会：
-- 增加过拟合风险
-- 增加训练时间
-- 破坏已有的 trigger-aware 机制
-
-✅ **不修改 GAT 架构**
-
----
-
-### 任务 4：为 Reactive 模式设置专用 BC Schedule
-
-**文件**：`algorithms/hybrid_sac.py`
-
-**修改位置**：约第 1122 行
-
-**原代码**：
-```python
-bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]
-```
-
-**修改为**：
-```python
-# v3.9: 根据模式设置不同的 BC 衰减速度
-if proactive:
-    bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]  # Proactive: 原有 schedule
-else:
-    bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # Reactive: 更慢衰减，更多模仿
-```
-
-**原理**：Reactive 模式面对已违规的紧急情况，需要更长时间学习 SA 的"带伤迁移"策略
-
----
-
-## 修改汇总表
-
-| 文件 | 行号 | 参数 | 原值 | 新值 | 目的 |
-|------|------|------|------|------|------|
-| `reward.py` | 37 | `STATE_COST_REACTIVE` | 5.0 | **50.0** | 降低 Reactive 迁移成本 |
-| `reward.py` | 44 | `SLA_VIOLATION_MULTIPLIER` | 15.0 | **8.0** | 降低死亡惩罚 |
-| `reward.py` | ~208 | Reward Clipping | 无 | **-2000** | 防止极端负值 |
-| `hybrid_sac.py` | 912 | Critic Loss | `mse_loss` | **`smooth_l1_loss`** | 稳定训练 |
-| `hybrid_sac.py` | 1122 | `bc_prob_schedule` | 单一 | **分 Proactive/Reactive** | 模式专用 |
+| 优先级 | 任务 | 预期效果 |
+|--------|------|----------|
+| **P0** | 统一 BC Schedule | 解决 Proactive 失效 |
+| **P1** | 降低 τ | 稳定 Q 值学习 |
+| **P2** | Eval 保底 5% BC | 防止极端崩溃 |
+| **P3** | 物理化奖励 | 学术严谨性 |
 
 ---
 
 ## 验收要求
 
-1. 完成代码修改后，**删除** `checkpoints/` 下的旧权重文件
-2. 设置 `INFERENCE_MODE = False`，运行 `python run_comparison.py` 进行训练
-3. 观察 Loss 曲线是否平滑（尖峰 < 1e5）
-4. 确认 Reactive 模式的迁移数 > 0
-5. 设置 `INFERENCE_MODE = True`，运行推理验证
-6. 检查 Reactive 违规数是否降至 ~1000（与 SA 相当）
+1. 执行修改后，清理旧权重：`checkpoints/sac_*.pth`
+2. 设置 `INFERENCE_MODE = False`，运行训练
+3. 验收标准：
+   - Proactive Eval Epoch: **migrations > 200**
+   - Proactive 测试集: **violations < 1200**
+4. 设置 `INFERENCE_MODE = True`，运行推理验证
+5. 更新 `result.md` 报告
+
+---
+
+## 为什么不先做物理化重构？
+
+物理化奖励函数是**学术上的优化**，但：
+1. 当前问题根因是 **BC Schedule**，不是奖励函数
+2. Reactive 已用当前奖励函数成功修复
+3. 物理化会增加代码复杂度，调试困难
+4. 应先解决功能问题，再优化学术表达
+
+**建议顺序**：
+1. v3.10：修复 Proactive（BC Schedule + τ）
+2. v3.11：物理化奖励函数（如果需要）

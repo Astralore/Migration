@@ -1114,10 +1114,10 @@ def run_hybrid_sac_microservice(
     # Proactive Schedule: [0.95, 0.85, 0.65, 0.35, 0.10]
     # Reactive Schedule:  [0.98, 0.90, 0.75, 0.55, 0.30] (更保守)
     # =========================================================================
-    if proactive:
-        bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]  # Proactive: 原有 schedule
-    else:
-        bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # Reactive: 更慢衰减
+    # v3.10: 统一使用慢衰减 schedule，确保模型充分学习 SA 策略
+    # v3.9 实验证明：Reactive 用慢衰减成功修复，Proactive 用快衰减失效
+    # 因此统一使用慢衰减 schedule
+    bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # 统一慢衰减
     
     print(f"  [v3.7] JIT Migration + 3D Trigger Context (risk_ratio):")
     print(f"    - Train epochs: {num_epochs - 1}  |  Eval epoch: 1 (last)")
@@ -1149,7 +1149,7 @@ def run_hybrid_sac_microservice(
     # that allows entropy-driven exploration when BC probability is low
     alpha_init = 0.05
     gamma = 0.95
-    tau = 0.005
+    tau = 0.001  # v3.10: 从 0.005 降为 0.001，提高 Q 值稳定性
     batch_size = 32
     memory_size = 10000
     
