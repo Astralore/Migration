@@ -3,6 +3,8 @@ SLA-based migration trigger for edge microservice migration.
 QoS 与 reward 尺度解耦：仅用距离 (km) 与 calc_access_latency_ms (ms)。
 """
 
+import numpy as np
+
 from core.geo import haversine_distance
 from core.physics_utils import calc_access_latency_ms
 
@@ -18,6 +20,21 @@ PROACTIVE_WARNING_KM = 5.0
 # Trigger type constants
 TRIGGER_REACTIVE = "REACTIVE"
 TRIGGER_PROACTIVE = "PROACTIVE"
+
+
+def _future_distances_km_to_gateway(predicted_locations, gateway_server_lat, gateway_server_lon):
+    """(H,) 距离向量；与逐点 haversine 数学等价，向量化广播。"""
+    if not predicted_locations:
+        return np.zeros(0, dtype=np.float64)
+    arr = np.asarray(predicted_locations, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        arr = np.reshape(arr, (-1, 2))
+    plats = arr[:, 0]
+    plons = arr[:, 1]
+    return np.asarray(
+        haversine_distance(plats, plons, gateway_server_lat, gateway_server_lon),
+        dtype=np.float64,
+    )
 
 
 def check_sla_violation(
@@ -50,14 +67,11 @@ def check_proactive_sla_violation(
         return True
 
     if predicted_locations:
-        for pred_lat, pred_lon in predicted_locations:
-            future_dist = haversine_distance(
-                pred_lat, pred_lon,
-                gateway_server_lat,
-                gateway_server_lon,
-            )
-            if future_dist > PROACTIVE_WARNING_KM:
-                return True
+        fd = _future_distances_km_to_gateway(
+            predicted_locations, gateway_server_lat, gateway_server_lon,
+        )
+        if fd.size and bool(np.any(fd > PROACTIVE_WARNING_KM)):
+            return True
 
     return False
 
@@ -87,13 +101,10 @@ def get_trigger_type(
         return TRIGGER_REACTIVE
 
     if proactive_enabled and predicted_locations:
-        for pred_lat, pred_lon in predicted_locations:
-            future_dist = haversine_distance(
-                pred_lat, pred_lon,
-                gateway_server_lat,
-                gateway_server_lon,
-            )
-            if future_dist > PROACTIVE_WARNING_KM:
-                return TRIGGER_PROACTIVE
+        fd = _future_distances_km_to_gateway(
+            predicted_locations, gateway_server_lat, gateway_server_lon,
+        )
+        if fd.size and bool(np.any(fd > PROACTIVE_WARNING_KM)):
+            return TRIGGER_PROACTIVE
 
     return None

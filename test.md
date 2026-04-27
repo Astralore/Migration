@@ -1,6 +1,6 @@
-# 分阶段验证报告（覆盖 `command.md` 阶段一、二、三、四）
+# 分阶段验证报告（覆盖 `command.md` 阶段一、二、三、四、五）
 
-**依据**：工作区 `command.md`（物理毫秒化 + Context 解耦 + Hybrid SAC Logits Mask）。  
+**依据**：工作区 `command.md`（物理毫秒化 + Context 解耦 + Hybrid SAC Logits Mask + 向量化）。  
 **实施日期**：以本文件为准。
 
 ---
@@ -130,9 +130,25 @@ def apply_action_mask_to_logits(
 
 ---
 
-## 未纳入本次范围（按 `command.md`）
+## 阶段五：向量化（`core/geo.py`、`context.py`、`reward.py`、`state_builder.py`）
 
-- **阶段五**：向量化 — 未改。
+| 文件 | 向量化落点 | 说明 |
+|------|------------|------|
+| `core/geo.py` | `haversine_distance` | 支持 NumPy 广播（文档化；公式未改） |
+| `core/geo.py` | `find_k_nearest_servers` | 整表 `latitude`/`longitude` 一次 `haversine_distance` → `argpartition` + **稳定** `argsort`（并列距离与旧 `iterrows`+`sort` 顺序一致） |
+| `core/context.py` | `_future_distances_km_to_gateway` + `check_proactive_sla_violation` / `get_trigger_type` | 前瞻 `(H,)` 对网关常量广播，替代逐点 `for` + haversine |
+| `core/reward.py` | `build_servers_info` | 列 `to_numpy` + `dict(zip(...))`，去掉 `iterrows` |
+| `core/reward.py` | `calculate_microservice_reward` | 入口距离向量；`access_latency_ms = calc(max(d))`（`d>=0` 上 `calc` 单调，与 `max(calc(d))` 等价）；边列表批量 haversine + 掩码 `same`；`future_delay_ms` 为 `(H, n_entry)` 距离矩阵 + `np.dot` 权重 |
+| `core/state_builder.py` | `_mobility_features` | `np.asarray` + `np.mean(axis=0)` |
+| `core/state_builder.py` | `build_graph_state` | entry 最大距离与 SA 距离批量 haversine；`sa_stay` 仍逐节点比较（无距离循环） |
+
+**禁区**：未使用 `lru_cache`；未改 `physics_utils` 公式；`find_k_nearest_servers` 经 **全 k / 多坐标** 下与旧实现逐元素比对（含并列距离的 **stable** 序）。
+
+### 实验与回归（本次已跑）
+
+- **`python _verify_physics_reward_context.py`**：**退出码 0**，与向量化前同一套断言（context / reward / 导入）。
+- **`find_k_nearest_servers` 无损校验**：对 `edge_server_locations.csv` 在若干 `(lat,lon)` 与 `k in {1,3,5,len(df)}` 下，与 **逐行 `iterrows` + `sort`** 的暴力结果 **逐元一致**（含等距 tie-break）。
+- **微基准（本机）**：`find_k_nearest_servers(..., k=3)` 约 **500 次合计 ~20 ms**（量级供参考，非 CI 门禁）。
 
 ---
 
@@ -188,18 +204,18 @@ ALL CHECKS PASSED
 
 ### `run_comparison.py`（阶段三端到端烟测）
 
-**配置（验证用，非生产默认）**：`INFERENCE_MODE = False`；`TRAIN_END_INDEX = 2500`；Hybrid SAC 训练 `num_epochs = 2`（约 1 次 train + 1 次 eval）。目的：避免旧权重主导、缩短单次运行时间。
+**当时配置（阶段三短时烟测，已结束）**：`INFERENCE_MODE = False`；`TRAIN_END_INDEX = 2500`；Hybrid SAC `num_epochs = 2`。
+
+**当前仓库**：`run_comparison.py` 已恢复 **全量训练/对比默认** — `TRAIN_END_INDEX = 10000`，Proactive/Reactive 下 Hybrid SAC **`num_epochs = 6`**（与 `run_all_algorithms` 内 SAC 一致），`INFERENCE_MODE = False`（全量训练后出表；改为 `True` 时在 `[10000:15000)` 上加载 checkpoint 推理）。
 
 **命令**：`python run_comparison.py`（工作目录 `d:\Migration\Migrate-main`）。
 
-**结果摘要**：
+**结果摘要（短时烟测那次）**：
 
 - **退出码**：`0`。
 - **日志检索**：输出中 **无** `nan` / `NaN` / `RuntimeError` / `dimension` 等与梯度或维度相关的报错。
 - **Hybrid SAC（Reactive）**：`Hybrid SAC done in 46.3s`；权重写入 `checkpoints/sac_reactive.pth`；调试摘要中 `Explore actions (Actor sampling): 12`，`Total global steps: 402`。
 - **可视化**：`outputs/hybrid_sac_*_training.png` 等生成成功。
-
-全量训练请把 `run_comparison.py` 中上述验证项改回仓库原意（如 `TRAIN_END_INDEX`、`num_epochs`）。
 
 ---
 

@@ -38,11 +38,14 @@ def _mobility_features(user_lat, user_lon, predicted_locations):
     """Compute 2-dim normalised movement-trend features from predictions."""
     if not predicted_locations:
         return 0.0, 0.0
-    avg_dlat = np.mean([lat - user_lat for lat, lon in predicted_locations])
-    avg_dlon = np.mean([lon - user_lon for lat, lon in predicted_locations])
-    feat_dlat = np.clip(avg_dlat / MOBILITY_NORM, -1.0, 1.0)
-    feat_dlon = np.clip(avg_dlon / MOBILITY_NORM, -1.0, 1.0)
-    return float(feat_dlat), float(feat_dlon)
+    arr = np.asarray(predicted_locations, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        arr = np.reshape(arr, (-1, 2))
+    delta = arr - np.array([user_lat, user_lon], dtype=np.float64)
+    avg_dlat, avg_dlon = np.mean(delta, axis=0)
+    feat_dlat = float(np.clip(avg_dlat / MOBILITY_NORM, -1.0, 1.0))
+    feat_dlon = float(np.clip(avg_dlon / MOBILITY_NORM, -1.0, 1.0))
+    return feat_dlat, feat_dlon
 
 
 def build_node_state(
@@ -241,12 +244,19 @@ def build_graph_state(
     
     # Calculate max distance from entry nodes to user (risk indicator)
     entry_nodes = get_entry_nodes(dag_info)
-    max_entry_dist = 0.0
-    for node in entry_nodes:
-        srv_id = current_assignments[node]
-        srv_lat, srv_lon = servers_info[srv_id]
-        node_dist = haversine_distance(current_lat, current_lon, srv_lat, srv_lon)
-        max_entry_dist = max(max_entry_dist, node_dist)
+    if entry_nodes:
+        srv_lats = np.array(
+            [servers_info[current_assignments[n]][0] for n in entry_nodes],
+            dtype=np.float64,
+        )
+        srv_lons = np.array(
+            [servers_info[current_assignments[n]][1] for n in entry_nodes],
+            dtype=np.float64,
+        )
+        dists = haversine_distance(current_lat, current_lon, srv_lats, srv_lons)
+        max_entry_dist = float(np.max(dists))
+    else:
+        max_entry_dist = 0.0
     
     # risk_ratio: continuous risk signal, clamped to [0, 1]
     risk_ratio = min(max_entry_dist / SLA_DISTANCE_THRESHOLD_KM, 1.0)
@@ -263,17 +273,19 @@ def build_graph_state(
     # - sa_dist: distance from SA-proposed server to user (quality indicator)
     # - sa_stay: whether SA suggests keeping current placement (stability)
     sa_priors = np.zeros((n_nodes, 2), dtype=np.float32)
-    for i, node_name in enumerate(node_names):
-        sa_server = sa_proposal[node_name]
-        current_server = current_assignments[node_name]
-
-        # SA proposed server distance to user
-        sa_lat, sa_lon = servers_info[sa_server]
-        sa_dist = haversine_distance(current_lat, current_lon, sa_lat, sa_lon)
-        sa_priors[i, 0] = min(sa_dist / 50.0, 1.0)
-
-        # SA stay flag: 1 if SA suggests no migration for this node
-        sa_priors[i, 1] = 1.0 if sa_server == current_server else 0.0
+    sa_servers = np.array([sa_proposal[nm] for nm in node_names])
+    sa_lat = np.array([servers_info[int(s)][0] for s in sa_servers], dtype=np.float64)
+    sa_lon = np.array([servers_info[int(s)][1] for s in sa_servers], dtype=np.float64)
+    sa_dist = np.asarray(
+        haversine_distance(current_lat, current_lon, sa_lat, sa_lon),
+        dtype=np.float64,
+    )
+    sa_priors[:, 0] = np.minimum(sa_dist / 50.0, 1.0).astype(np.float32)
+    # 与逐节点 ``sa_server == current_server`` 语义一致（避免 object 数组比较歧义）
+    sa_priors[:, 1] = np.array(
+        [1.0 if sa_proposal[nm] == current_assignments[nm] else 0.0 for nm in node_names],
+        dtype=np.float32,
+    )
 
     return {
         'node_features': node_features,

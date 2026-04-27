@@ -11,7 +11,12 @@ from core.context import (
     DISTANCE_THRESHOLD_KM,
     USER_SLA_TOLERANCE_MS,
 )
-from core.physics_utils import calc_access_latency_ms, propagation_latency_ms
+from core.physics_utils import (
+    calc_access_latency_ms,
+    FIBER_SPEED_KM_MS,
+    BASE_ROUTER_DELAY_MS,
+)
+import numpy as np
 
 # --- 与 command.md 写死的物理 / 工程常量 ---
 MIN_BW_MBPS = 50.0
@@ -31,11 +36,14 @@ SLA_DISTANCE_THRESHOLD = DISTANCE_THRESHOLD_KM
 
 
 def build_servers_info(servers_df):
-    """Pre-build {server_id: (lat, lon)} lookup dict."""
-    info = {}
-    for _, row in servers_df.iterrows():
-        info[row['edge_server_id']] = (row['latitude'], row['longitude'])
-    return info
+    """Pre-build {server_id: (lat, lon)} lookup dict（列向量化，无 iterrows）。"""
+    ar = servers_df[["edge_server_id", "latitude", "longitude"]].to_numpy(copy=False)
+    return dict(
+        zip(
+            map(int, ar[:, 0]),
+            zip(ar[:, 1].astype(np.float64), ar[:, 2].astype(np.float64)),
+        )
+    )
 
 
 def calculate_microservice_reward(
@@ -59,20 +67,29 @@ def calculate_microservice_reward(
     user_lat, user_lon = user_location
     entry_nodes = get_entry_nodes(dag_info)
 
-    entry_distances_km = []
-    for node in entry_nodes:
-        srv_id = current_assignments[node]
-        srv_lat, srv_lon = servers_info[srv_id]
-        entry_distances_km.append(
-            haversine_distance(user_lat, user_lon, srv_lat, srv_lon)
+    if entry_nodes:
+        srv_lats = np.array(
+            [servers_info[current_assignments[node]][0] for node in entry_nodes],
+            dtype=np.float64,
         )
+        srv_lons = np.array(
+            [servers_info[current_assignments[node]][1] for node in entry_nodes],
+            dtype=np.float64,
+        )
+        entry_distances_km = np.asarray(
+            haversine_distance(user_lat, user_lon, srv_lats, srv_lons),
+            dtype=np.float64,
+        ).ravel()
+    else:
+        entry_distances_km = np.zeros(0, dtype=np.float64)
 
-    max_entry_dist_km = max(entry_distances_km) if entry_distances_km else 0.0
-    access_latency_ms = (
-        max(calc_access_latency_ms(d) for d in entry_distances_km)
-        if entry_distances_km
-        else 0.0
-    )
+    if entry_distances_km.size:
+        max_entry_dist_km = float(np.max(entry_distances_km))
+        # calc_access_latency_ms 在 d>=0 上单调，与 max(calc(d) for d in ...) 数值一致
+        access_latency_ms = float(calc_access_latency_ms(max_entry_dist_km))
+    else:
+        max_entry_dist_km = 0.0
+        access_latency_ms = 0.0
 
     risk_ratio = min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD, 1.0) if SLA_DISTANCE_THRESHOLD > 0 else 0.0
     effective_bandwidth = MIN_BW_MBPS + (MAX_BW_MBPS - MIN_BW_MBPS) * (risk_ratio ** 2)
@@ -91,48 +108,57 @@ def calculate_microservice_reward(
     tearing_delay_ms = 0.0
     comm_delay_ms = 0.0
 
-    for (src, dst), traffic in dag_info["edges"].items():
-        src_server = current_assignments[src]
-        dst_server = current_assignments[dst]
-        if src_server == dst_server:
-            continue
-        src_lat, src_lon = servers_info[src_server]
-        dst_lat, dst_lon = servers_info[dst_server]
-        edge_dist_km = haversine_distance(src_lat, src_lon, dst_lat, dst_lon)
-        norm_traffic = traffic / max_traffic if max_traffic > 0 else 0.0
-
-        cross_mb = min(float(traffic) * RPC_SIZE_MB, MAX_TEARING_MB)
-        tearing_delay_ms += (cross_mb / EDGE_BACKHAUL_MBPS) * 1000.0
-
-        comm_delay_ms += norm_traffic * calc_access_latency_ms(edge_dist_km)
+    edges_items = list(dag_info["edges"].items())
+    if edges_items:
+        traffics = np.array([float(t) for (_, _), t in edges_items], dtype=np.float64)
+        src_srv = np.array([current_assignments[s] for (s, d), _ in edges_items])
+        dst_srv = np.array([current_assignments[d] for (s, d), _ in edges_items])
+        same = src_srv == dst_srv
+        src_lat = np.array([servers_info[s][0] for s in src_srv], dtype=np.float64)
+        src_lon = np.array([servers_info[s][1] for s in src_srv], dtype=np.float64)
+        dst_lat = np.array([servers_info[s][0] for s in dst_srv], dtype=np.float64)
+        dst_lon = np.array([servers_info[s][1] for s in dst_srv], dtype=np.float64)
+        edge_dist_km = np.asarray(
+            haversine_distance(src_lat, src_lon, dst_lat, dst_lon),
+            dtype=np.float64,
+        )
+        norm_traffic = np.where(max_traffic > 0, traffics / max_traffic, 0.0)
+        cross_mb = np.minimum(traffics * RPC_SIZE_MB, MAX_TEARING_MB)
+        valid = ~same
+        tearing_delay_ms = float(np.sum(valid * (cross_mb / EDGE_BACKHAUL_MBPS) * 1000.0))
+        access_edge_ms = (np.maximum(0.0, edge_dist_km) / FIBER_SPEED_KM_MS) + BASE_ROUTER_DELAY_MS
+        comm_delay_ms = float(np.sum(valid * (norm_traffic * access_edge_ms)))
 
     future_delay_ms = 0.0
     if predicted_locations and entry_nodes:
-        future_distances = []
-        for pred_lat, pred_lon in predicted_locations:
-            step_dists = []
-            for node in entry_nodes:
-                srv_id = current_assignments[node]
-                srv_lat, srv_lon = servers_info[srv_id]
-                step_dists.append(
-                    haversine_distance(pred_lat, pred_lon, srv_lat, srv_lon)
-                )
-            future_distances.append(max(step_dists) if step_dists else 0.0)
+        pred = np.asarray(predicted_locations, dtype=np.float64)
+        if pred.ndim != 2 or pred.shape[1] != 2:
+            pred = np.reshape(pred, (-1, 2))
+        h = pred.shape[0]
+        plats = pred[:, 0][:, np.newaxis]
+        plons = pred[:, 1][:, np.newaxis]
+        e_lats = np.array(
+            [servers_info[current_assignments[node]][0] for node in entry_nodes],
+            dtype=np.float64,
+        )[np.newaxis, :]
+        e_lons = np.array(
+            [servers_info[current_assignments[node]][1] for node in entry_nodes],
+            dtype=np.float64,
+        )[np.newaxis, :]
+        dist_mat = haversine_distance(plats, plons, e_lats, e_lons)
+        d_per_step = np.max(dist_mat, axis=1)
+        w = FUTURE_DECAY ** np.arange(h, dtype=np.float64)
+        excess = np.maximum(0.0, d_per_step - FUTURE_DIST_THRESHOLD)
+        prop = np.where(excess <= 0.0, 0.0, excess / FIBER_SPEED_KM_MS)
+        w_sum = float(np.sum(w))
+        if w_sum > 0:
+            future_delay_ms = float(np.dot(prop, w)) / w_sum
 
-        if future_distances:
-            raw = 0.0
-            weight_sum = 0.0
-            for i, d in enumerate(future_distances):
-                w = FUTURE_DECAY ** i
-                excess_km = max(0.0, float(d) - FUTURE_DIST_THRESHOLD)
-                raw += propagation_latency_ms(excess_km) * w
-                weight_sum += w
-            future_delay_ms = raw / weight_sum if weight_sum > 0 else 0.0
-
-    sla_violations = 0
-    for d in entry_distances_km:
-        if d > SLA_DISTANCE_THRESHOLD:
-            sla_violations += 1
+    sla_violations = (
+        int(np.sum(entry_distances_km > SLA_DISTANCE_THRESHOLD))
+        if entry_distances_km.size
+        else 0
+    )
 
     spatial_violation = max_entry_dist_km > SLA_DISTANCE_THRESHOLD
     qos_violation = access_latency_ms > USER_SLA_TOLERANCE_MS
