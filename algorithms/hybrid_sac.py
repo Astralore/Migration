@@ -32,6 +32,7 @@ import random
 import copy
 import math
 import time
+from typing import Optional
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
@@ -42,6 +43,56 @@ from core.state_builder import build_graph_state
 from algorithms.sa import microservice_simulated_annealing
 
 FORECAST_HORIZON = 15
+
+# Action indices (command.md 阶段三)
+ACTION_STAY = 0
+ACTION_FOLLOW_SA = 1
+ACTION_NEAREST = 2
+ACTION_DIM = 3
+
+
+def build_microservice_action_mask(candidates, device: torch.device) -> torch.Tensor:
+    """
+    合法动作掩码 (action_dim,)，bool，与 logits 同 device。
+    当前：STAY / FOLLOW_SA 恒合法；NEAREST 需至少一个候选（k>=1 时合法）。
+    """
+    m = torch.ones(ACTION_DIM, dtype=torch.bool, device=device)
+    if not candidates or len(candidates) < 1:
+        m[ACTION_NEAREST] = False
+    return m
+
+
+def apply_action_mask_to_logits(
+    logits: torch.Tensor,
+    action_mask: Optional[torch.Tensor],
+    *,
+    fallback_action_index: int = ACTION_FOLLOW_SA,
+    fill_value: float = -1e9,
+) -> torch.Tensor:
+    """
+    对 logits 应用掩码；全非法行回退 FOLLOW_SA，避免 softmax NaN。
+    logits: (action_dim,) 或 (batch, action_dim)
+    action_mask: 同形状尾部维；None 表示全合法。
+    """
+    if action_mask is None:
+        return logits
+
+    squeeze_out = logits.dim() == 1
+    logits_work = logits.unsqueeze(0) if squeeze_out else logits
+
+    m = torch.as_tensor(action_mask, device=logits_work.device, dtype=torch.bool)
+    if m.dim() == 1:
+        m = m.unsqueeze(0).expand(logits_work.shape[0], -1)
+    if m.shape != logits_work.shape:
+        raise ValueError(f"action_mask shape {m.shape} != logits {logits_work.shape}")
+
+    m = m.clone()
+    all_invalid = ~m.any(dim=-1)
+    if all_invalid.any():
+        m[all_invalid, fallback_action_index] = True
+
+    out = logits_work.masked_fill(~m, fill_value)
+    return out.squeeze(0) if squeeze_out else out
 
 
 # =============================================================================
@@ -464,130 +515,59 @@ class SACDiscreteActor(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def forward(self, node_embedding, sa_prior):
+    def forward(
+        self,
+        node_embedding,
+        sa_prior,
+        action_mask: Optional[torch.Tensor] = None,
+    ):
         """
-        Compute action probabilities for a single node.
-        
-        Parameters
-        ----------
-        node_embedding : torch.Tensor, shape (embedding_dim,) or (batch, embedding_dim)
-            Graph-contextualized node embedding
-        sa_prior : torch.Tensor, shape (sa_prior_dim,) or (batch, sa_prior_dim)
-            SA recommendation features
-        
-        Returns
-        -------
-        action_probs : torch.Tensor, shape (action_dim,) or (batch, action_dim)
-            Probability distribution over actions
-        log_probs : torch.Tensor, same shape as action_probs
-            Log probabilities (for entropy computation)
+        Softmax 前对 logits 应用 action_mask；非法 logits 置 -1e9；
+        全非法行回退 FOLLOW_SA（command.md 阶段三）。
         """
-        # Handle both single node and batch inputs
         if node_embedding.dim() == 1:
             node_embedding = node_embedding.unsqueeze(0)
             sa_prior = sa_prior.unsqueeze(0)
             squeeze_output = True
         else:
             squeeze_output = False
-        
-        # Concatenate embedding with SA prior
+
         state = torch.cat([node_embedding, sa_prior], dim=-1)
-        
-        # Compute action logits
-        logits = self.policy_net(state)
-        
-        # Convert to probabilities via softmax
+        logits_raw = self.policy_net(state)
+        logits = apply_action_mask_to_logits(logits_raw, action_mask)
+
         action_probs = F.softmax(logits, dim=-1)
-        
-        # Compute log probabilities with numerical stability
-        # Add small epsilon to avoid log(0)
         log_probs = F.log_softmax(logits, dim=-1)
-        
+
         if squeeze_output:
             action_probs = action_probs.squeeze(0)
             log_probs = log_probs.squeeze(0)
-        
+
         return action_probs, log_probs
-    
-    def sample_action(self, node_embedding, sa_prior):
-        """
-        Sample action using categorical distribution (for exploration).
-        
-        Returns
-        -------
-        action : int
-            Sampled action index
-        log_prob : torch.Tensor
-            Log probability of sampled action
-        """
-        action_probs, log_probs = self.forward(node_embedding, sa_prior)
-        
-        # Create categorical distribution and sample
+
+    def sample_action(
+        self,
+        node_embedding,
+        sa_prior,
+        action_mask: Optional[torch.Tensor] = None,
+    ):
+        action_probs, log_probs = self.forward(node_embedding, sa_prior, action_mask)
         dist = Categorical(probs=action_probs)
         action = dist.sample()
-        
         return action.item(), log_probs[action]
-    
-    def get_action_deterministic(self, node_embedding, sa_prior):
-        """Get deterministic action (argmax) for evaluation."""
-        action_probs, _ = self.forward(node_embedding, sa_prior)
-        return action_probs.argmax().item()
-    
+
+    def get_action_deterministic(
+        self,
+        node_embedding,
+        sa_prior,
+        action_mask: Optional[torch.Tensor] = None,
+    ):
+        action_probs, _ = self.forward(node_embedding, sa_prior, action_mask)
+        return int(action_probs.argmax().item())
+
     def sample_action_with_mask(self, node_embedding, sa_prior, action_mask=None):
-        """
-        Sample action with optional action masking for DAG coherence (v3.1).
-        
-        Parameters
-        ----------
-        node_embedding : torch.Tensor
-        sa_prior : torch.Tensor
-        action_mask : torch.Tensor, shape (action_dim,), optional
-            Mask where 1.0 = valid action, 0.0 = invalid action.
-            Invalid actions get large negative logits before softmax.
-        
-        Returns
-        -------
-        action : int
-            Sampled action index
-        log_prob : torch.Tensor
-            Log probability of sampled action
-        """
-        # Handle both single node and batch inputs
-        if node_embedding.dim() == 1:
-            node_embedding = node_embedding.unsqueeze(0)
-            sa_prior = sa_prior.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-        
-        # Concatenate embedding with SA prior
-        state = torch.cat([node_embedding, sa_prior], dim=-1)
-        
-        # Compute action logits
-        logits = self.policy_net(state)
-        
-        # v3.1: Apply action masking BEFORE softmax
-        # This prevents DAG tearing by penalizing actions that
-        # would place nodes far from their DAG neighbors
-        if action_mask is not None:
-            # action_mask: 1.0 = valid, 0.0 = invalid
-            # We add -1e9 to invalid action logits
-            invalid_mask = (1.0 - action_mask) * (-1e9)
-            logits = logits + invalid_mask.unsqueeze(0) if logits.dim() == 2 else logits + invalid_mask
-        
-        # Convert to probabilities via softmax
-        action_probs = F.softmax(logits, dim=-1)
-        log_probs = F.log_softmax(logits, dim=-1)
-        
-        if squeeze_output:
-            action_probs = action_probs.squeeze(0)
-            log_probs = log_probs.squeeze(0)
-        
-        # Create categorical distribution and sample
-        dist = Categorical(probs=action_probs)
-        action = dist.sample()
-        
-        return action.item(), log_probs[action]
+        """与 sample_action 一致。"""
+        return self.sample_action(node_embedding, sa_prior, action_mask)
 
 
 # =============================================================================
@@ -853,7 +833,18 @@ def optimize_sac(
     total_actor_loss = torch.tensor(0.0, device=device)
     total_alpha_loss = torch.tensor(0.0, device=device)
     
-    for (graph_state, node_idx, action, reward, next_graph_state, done) in batch:
+    mask_all = torch.ones(ACTION_DIM, dtype=torch.bool, device=device)
+
+    for transition in batch:
+        if len(transition) >= 7:
+            graph_state, node_idx, action, reward, next_graph_state, done, action_mask_stored = transition
+            cur_action_mask = torch.as_tensor(
+                action_mask_stored, device=device, dtype=torch.bool
+            )
+        else:
+            graph_state, node_idx, action, reward, next_graph_state, done = transition
+            cur_action_mask = mask_all
+
         # =================================================================
         # Step 1: Compute Current State Embeddings
         # =================================================================
@@ -884,8 +875,10 @@ def optimize_sac(
                 next_node_emb = next_embeddings[node_idx]
                 next_node_sa_prior = next_sa_prior[node_idx]
                 
-                # Get next action probabilities from current actor
-                next_action_probs, next_log_probs = actor(next_node_emb, next_node_sa_prior)
+                # Get next action probabilities from current actor（下一状态无存储 mask 时用全合法）
+                next_action_probs, next_log_probs = actor(
+                    next_node_emb, next_node_sa_prior, mask_all
+                )
                 
                 # Get target Q-values
                 target_q1, target_q2 = target_critic(next_node_emb, next_node_sa_prior)
@@ -919,7 +912,7 @@ def optimize_sac(
         # Get action probabilities (need gradients here)
         # v3.1 FIX: Removed .detach() to allow gradients to flow back to GAT
         # This enables stateful_trigger_bias to be updated through actor loss
-        action_probs, log_probs = actor(node_emb, node_sa_prior)
+        action_probs, log_probs = actor(node_emb, node_sa_prior, cur_action_mask)
         
         # Get Q-values (detached to not affect actor gradient)
         with torch.no_grad():
@@ -1313,13 +1306,6 @@ def run_hybrid_sac_microservice(
                 if gateway_dist > 15.0:
                     total_violations += 1
                 
-                # Compute current DAG reward
-                current_dag_reward, _ = calculate_microservice_reward(
-                    taxi_id, dag_info,
-                    taxi_dag_assignments[taxi_id], taxi_dag_assignments[taxi_id],
-                    (current_lat, current_lon), servers_info,
-                )
-                
                 # -------------------------------------------------------------
                 # Trajectory prediction (if proactive mode)
                 # -------------------------------------------------------------
@@ -1336,7 +1322,7 @@ def run_hybrid_sac_microservice(
                 # -------------------------------------------------------------
                 trigger_type = get_trigger_type(
                     current_lat, current_lon, gw_lat, gw_lon,
-                    current_dag_reward, predicted_locations,
+                    predicted_locations=predicted_locations,
                     proactive_enabled=use_proactive,
                 )
                 
@@ -1397,6 +1383,7 @@ def run_hybrid_sac_microservice(
                 node_to_idx = {name: i for i, name in enumerate(graph_state['node_names'])}
                 node_transitions = []
                 nearest_server_id = candidates[0][0]
+                action_mask_phy = build_microservice_action_mask(candidates, device)
                 
                 # BC probability: training uses schedule; eval/inference forces 0 (no imitation)
                 if is_eval_epoch or inference_mode:
@@ -1422,8 +1409,10 @@ def run_hybrid_sac_microservice(
                             node_sa_prior = sa_prior_t[node_idx]
                             sa_proposed_server = sa_proposal[ms_node]
                             
-                            # 使用 deterministic 动作（argmax）
-                            action = actor.get_action_deterministic(node_emb, node_sa_prior)
+                            # 使用 deterministic 动作（argmax）+ 合法动作掩码
+                            action = actor.get_action_deterministic(
+                                node_emb, node_sa_prior, action_mask_phy
+                            )
                             
                             # 执行动作（更新 taxi_dag_assignments）
                             current_node_server = taxi_dag_assignments[taxi_id][ms_node]
@@ -1460,8 +1449,10 @@ def run_hybrid_sac_microservice(
                                 action = 1
                                 bc_actions_taken += 1
                             else:
-                                # Exploration: Sample from learned policy
-                                action, _ = actor.sample_action(node_emb, node_sa_prior)
+                                # Exploration: Sample from learned policy（带掩码）
+                                action, _ = actor.sample_action(
+                                    node_emb, node_sa_prior, action_mask_phy
+                                )
                                 explore_actions_taken += 1
                         
                         # Execute action
@@ -1523,6 +1514,7 @@ def run_hybrid_sac_microservice(
                 per_node_reward = reward / num_nodes  # Fair share of total reward
                 
                 if not is_eval_epoch:
+                    mask_cpu = action_mask_phy.detach().cpu().clone()
                     for i, (node_idx, action) in enumerate(node_transitions):
                         is_last = (i == len(node_transitions) - 1)
                         
@@ -1533,6 +1525,7 @@ def run_hybrid_sac_microservice(
                             per_node_reward,  # Dense reward: each node gets fair share
                             next_graph_state,
                             is_last,  # Only mark last node as done
+                            mask_cpu,
                         ))
                     
                     # -------------------------------------------------------------
@@ -1731,12 +1724,6 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             if gateway_dist > 15.0:
                 total_violations += 1
             
-            current_dag_reward, _ = calculate_microservice_reward(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id], taxi_dag_assignments[taxi_id],
-                (current_lat, current_lon), servers_info,
-            )
-            
             predicted_locations = None
             if use_proactive:
                 raw = predictor.predict_future(
@@ -1746,7 +1733,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             
             trigger_type = get_trigger_type(
                 current_lat, current_lon, gw_lat, gw_lon,
-                current_dag_reward, predicted_locations,
+                predicted_locations=predicted_locations,
                 proactive_enabled=use_proactive,
             )
             
@@ -1786,6 +1773,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             sorted_nodes = topological_sort(dag_info)
             node_to_idx = {name: i for i, name in enumerate(graph_state['node_names'])}
             nearest_server_id = candidates[0][0]
+            action_mask_phy = build_microservice_action_mask(candidates, device)
             
             for ms_node in sorted_nodes:
                 node_idx = node_to_idx[ms_node]
@@ -1796,7 +1784,9 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 
                 # Deterministic action selection
                 with torch.no_grad():
-                    action = actor.get_action_deterministic(node_emb, node_sa_prior)
+                    action = actor.get_action_deterministic(
+                        node_emb, node_sa_prior, action_mask_phy
+                    )
                 
                 current_node_server = taxi_dag_assignments[taxi_id][ms_node]
                 if action == 0:

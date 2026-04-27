@@ -157,12 +157,6 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             if gateway_dist > 15.0:
                 total_violations += 1
 
-            current_dag_reward, _ = calculate_microservice_reward(
-                taxi_id, dag_info,
-                taxi_dag_assignments[taxi_id], taxi_dag_assignments[taxi_id],
-                (current_lat, current_lon), servers_info,
-            )
-
             # --- Trajectory prediction (lon,lat) -> (lat,lon) ---
             predicted_locations = None
             if use_proactive:
@@ -174,7 +168,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             # --- Get trigger type (REACTIVE / PROACTIVE / None) ---
             trigger_type = get_trigger_type(
                 current_lat, current_lon, gw_lat, gw_lon,
-                current_dag_reward, predicted_locations,
+                predicted_locations=predicted_locations,
                 proactive_enabled=use_proactive,
             )
 

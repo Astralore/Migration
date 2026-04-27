@@ -1,88 +1,86 @@
 """
 SLA-based migration trigger for edge microservice migration.
-Supports both reactive and proactive (trajectory-prediction) modes.
-Returns explicit trigger_type for asymmetric migration cost calculation.
+QoS 与 reward 尺度解耦：仅用距离 (km) 与 calc_access_latency_ms (ms)。
 """
 
 from core.geo import haversine_distance
+from core.physics_utils import calc_access_latency_ms
 
 # Reactive threshold: actual SLA violation (user perceives outage)
 DISTANCE_THRESHOLD_KM = 15.0
-SLA_REWARD_THRESHOLD = -5.0
+
+# 与 command.md 一致：略小于「15km 对应延迟」，使 qos 可与 spatial 形成互补（仍 OR）
+USER_SLA_TOLERANCE_MS = calc_access_latency_ms(DISTANCE_THRESHOLD_KM) * 0.99
 
 # Proactive warning threshold: early-warning buffer zone
-# Triggers preemptive migration BEFORE actual violation occurs
-# v3.0: AGGRESSIVE PROACTIVE - set to 5.0km to force PROACTIVE triggers
-# This creates a 10km buffer zone (5-15km) to generate abundant PROACTIVE samples
-# Critical for GAT to learn asymmetric physical features between PROACTIVE/REACTIVE
 PROACTIVE_WARNING_KM = 5.0
 
 # Trigger type constants
-TRIGGER_REACTIVE = 'REACTIVE'
-TRIGGER_PROACTIVE = 'PROACTIVE'
+TRIGGER_REACTIVE = "REACTIVE"
+TRIGGER_PROACTIVE = "PROACTIVE"
 
 
-def check_sla_violation(user_lat, user_lon,
-                        gateway_server_lat, gateway_server_lon,
-                        current_dag_reward):
+def check_sla_violation(
+    user_lat, user_lon,
+    gateway_server_lat, gateway_server_lon,
+):
     """
-    Reactive trigger: current spatial or QoS violation.
-
-    Returns True when EITHER condition is met:
-      1. Spatial  — user-to-gateway distance > 15 km
-      2. QoS     — current DAG reward < SLA_REWARD_THRESHOLD
+    Reactive 触发：空间超阈 OR 接入延迟（ms）超 QoS 容限。
+    不再依赖 current_dag_reward。
     """
-    dist = haversine_distance(user_lat, user_lon,
-                              gateway_server_lat, gateway_server_lon)
-    spatial_violation = dist > DISTANCE_THRESHOLD_KM
-    qos_violation = current_dag_reward < SLA_REWARD_THRESHOLD
+    dist_km = haversine_distance(
+        user_lat, user_lon,
+        gateway_server_lat, gateway_server_lon,
+    )
+    spatial_violation = dist_km > DISTANCE_THRESHOLD_KM
+    qos_violation = calc_access_latency_ms(dist_km) > USER_SLA_TOLERANCE_MS
     return spatial_violation or qos_violation
 
 
-def check_proactive_sla_violation(user_lat, user_lon,
-                                  gateway_server_lat, gateway_server_lon,
-                                  current_dag_reward,
-                                  predicted_locations=None):
-    """
-    Proactive trigger: reactive check PLUS look-ahead over predicted trajectory.
-    Returns True if migration should be attempted.
-    """
-    if check_sla_violation(user_lat, user_lon,
-                           gateway_server_lat, gateway_server_lon,
-                           current_dag_reward):
+def check_proactive_sla_violation(
+    user_lat, user_lon,
+    gateway_server_lat, gateway_server_lon,
+    predicted_locations=None,
+):
+    """Proactive：先 Reactive 检查，再前瞻轨迹。"""
+    if check_sla_violation(
+        user_lat, user_lon,
+        gateway_server_lat, gateway_server_lon,
+    ):
         return True
 
     if predicted_locations:
         for pred_lat, pred_lon in predicted_locations:
-            future_dist = haversine_distance(pred_lat, pred_lon,
-                                             gateway_server_lat,
-                                             gateway_server_lon)
-            # Use warning threshold for proactive trigger (earlier than reactive)
+            future_dist = haversine_distance(
+                pred_lat, pred_lon,
+                gateway_server_lat,
+                gateway_server_lon,
+            )
             if future_dist > PROACTIVE_WARNING_KM:
                 return True
 
     return False
 
 
-def get_trigger_type(user_lat, user_lon,
-                     gateway_server_lat, gateway_server_lon,
-                     current_dag_reward,
-                     predicted_locations=None,
-                     proactive_enabled=False):
+def get_trigger_type(
+    user_lat, user_lon,
+    gateway_server_lat, gateway_server_lon,
+    predicted_locations=None,
+    proactive_enabled=False,
+):
     """
     Determine the trigger type for migration decision.
 
     Returns
     -------
     str or None
-        'REACTIVE'  — current state already violates SLA (user perceives outage)
-        'PROACTIVE' — predicted future violation (preemptive, user unaware)
+        'REACTIVE'  — current state already violates SLA
+        'PROACTIVE' — predicted future violation (preemptive)
         None        — no trigger needed
     """
     reactive_violation = check_sla_violation(
         user_lat, user_lon,
         gateway_server_lat, gateway_server_lon,
-        current_dag_reward,
     )
 
     if reactive_violation:
@@ -92,10 +90,9 @@ def get_trigger_type(user_lat, user_lon,
         for pred_lat, pred_lon in predicted_locations:
             future_dist = haversine_distance(
                 pred_lat, pred_lon,
-                gateway_server_lat, gateway_server_lon,
+                gateway_server_lat,
+                gateway_server_lon,
             )
-            # Use warning threshold for proactive trigger (13 km < 15 km)
-            # This creates a 2km buffer zone for preemptive migration
             if future_dist > PROACTIVE_WARNING_KM:
                 return TRIGGER_PROACTIVE
 

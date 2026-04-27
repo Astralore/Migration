@@ -21,11 +21,11 @@ from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_perf
 # =============================================================================
 # 工程化配置
 # =============================================================================
-INFERENCE_MODE = True  # False=训练模式, True=推理模式
+INFERENCE_MODE = False  # False=训练模式, True=推理模式（阶段三 Actor Mask 验证：短时训练）
 
 # 数据切分配置
 TRAIN_START_INDEX = 0
-TRAIN_END_INDEX = 10000      # 训练数据: [0, 10000)
+TRAIN_END_INDEX = 2500       # 短时验证：原为 10000；全量训练请改回
 TEST_START_INDEX = 10000
 TEST_END_INDEX = 15000       # 测试数据: [10000, 15000)
 
@@ -200,7 +200,7 @@ def main():
         print(f"{'=' * 60}")
         t0 = time.time()
         proactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-            df, servers_df, predictor=predictor, proactive=True, num_epochs=6,
+            df, servers_df, predictor=predictor, proactive=True, num_epochs=2,
             inference_mode=False,
             save_checkpoint_path=SAC_CHECKPOINT_PROACTIVE,
         )
@@ -235,7 +235,7 @@ def main():
         print(f"{'=' * 60}")
         t0 = time.time()
         reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-            df, servers_df, predictor=predictor, proactive=False, num_epochs=6,
+            df, servers_df, predictor=predictor, proactive=False, num_epochs=2,
             inference_mode=False,
             save_checkpoint_path=SAC_CHECKPOINT_REACTIVE,
         )
