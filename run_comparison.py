@@ -17,9 +17,8 @@ from core.data_loader import load_data, DEFAULT_TAXI_PATH, DEFAULT_SERVER_PATH
 from prediction.simple_predictor import SimpleTrajectoryPredictor
 from algorithms.dqn import run_dqn_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
-from algorithms.hybrid_sa_dqn import run_hybrid_microservice_fair
 from algorithms.hybrid_sac import run_hybrid_sac_microservice
-from evaluation.metrics import print_ranking, print_proactive_analysis, print_ranking_with_latency
+from evaluation.metrics import print_proactive_analysis, print_ranking_with_latency
 from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_performance_metrics
 
 # =============================================================================

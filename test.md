@@ -208,6 +208,8 @@ ALL CHECKS PASSED
 
 **当前仓库**：`run_comparison.py` 已恢复 **全量训练/对比默认** — `TRAIN_END_INDEX = 10000`，Proactive/Reactive 下 Hybrid SAC **`num_epochs = 6`**（与 `run_all_algorithms` 内 SAC 一致），`INFERENCE_MODE = False`（全量训练后出表；改为 `True` 时在 `[10000:15000)` 上加载 checkpoint 推理）。
 
+**一键全量（删旧 SAC 权重 → 训练 → 测试段推理 → 合并 `result.md`）**：`python run_comparison.py --pipeline`。
+
 **命令**：`python run_comparison.py`（工作目录 `d:\Migration\Migrate-main`）。
 
 **结果摘要（短时烟测那次）**：
