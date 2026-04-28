@@ -8,13 +8,17 @@ import math
 import copy
 import random
 import time
+from collections import defaultdict
+
+import pandas as pd
 from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
 from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE
-from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment
+from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment, topological_sort
 from core.reward import build_servers_info, calculate_microservice_reward
+from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
 
@@ -93,7 +97,9 @@ def microservice_simulated_annealing(
     return best_sol, best_cost
 
 
-def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
+def run_sa_microservice_fair(
+    df, servers_df, predictor=None, proactive=False, collect_dag_proactive_stats=False,
+):
     """
     SA microservice DAG migration main simulation.
 
@@ -101,12 +107,17 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     ----------
     predictor : SimpleTrajectoryPredictor or None
     proactive : bool
+    collect_dag_proactive_stats : bool
+        **仅用于推理实验**：为 True 时在 ``use_proactive`` 且 ``TRIGGER_PROACTIVE`` 的决策上
+        按 ``dag_type`` 旁路聚合 ``dag_proactive_migration_stats``。
+        **训练阶段必须保持 False**（不传或默认），不建表、不计数。
 
     Returns
     -------
     results : dict
         Contains: total_migrations, total_violations, proactive_decisions,
-                  decision_count, total_reward, reward_history.
+                  decision_count, total_reward, reward_history,
+                  dag_proactive_migration_stats（collect 时非空）.
     """
     servers_info = build_servers_info(servers_df)
     use_proactive = proactive and predictor is not None
@@ -128,8 +139,14 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
     total_decision_time = 0.0
     decision_count_for_latency = 0
 
+    dag_migration_stats = (
+        defaultdict(lambda: {"proactive_decisions": 0, "migrated_nodes": 0})
+        if collect_dag_proactive_stats else None
+    )
+
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
+    taxi_last = {}
 
     decision_count = 0
     pbar = tqdm(total=len(timestamps), desc="SA Microservice Migration")
@@ -140,6 +157,10 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
             taxi_id = row['taxi_id']
             current_lat = row['latitude']
             current_lon = row['longitude']
+            ts = pd.Timestamp(timestamp)
+            pf_kw = build_predict_future_time_kwargs(
+                taxi_last, taxi_id, row, current_lon, current_lat, ts
+            )
 
             if taxi_id not in taxi_dag_assignments:
                 nearest = find_k_nearest_servers(
@@ -150,6 +171,7 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 taxi_dag_assignments[taxi_id] = initialize_dag_assignment(
                     chosen_dag, nearest[0]
                 )
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
 
             dag_type = taxi_dag_type[taxi_id]
@@ -171,7 +193,7 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
             predicted_locations = None
             if use_proactive:
                 raw = predictor.predict_future(
-                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON, **pf_kw
                 )
                 predicted_locations = [(lat, lon) for lon, lat in raw]
 
@@ -183,6 +205,7 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
             )
 
             if trigger_type is None:
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
 
             decision_count += 1
@@ -228,11 +251,24 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
             total_communication_cost += details['communication_cost']
             total_migration_cost += details['migration_cost']
 
+            # 与 Hybrid SAC 同口径：拓扑序节点集合上比对迁移数
+            sorted_nodes = topological_sort(dag_info)
             nodes_migrated = sum(
-                1 for n in dag_info['nodes']
+                1 for n in sorted_nodes
                 if old_assignments[n] != best_assignments[n]
             )
             total_migrations += nodes_migrated
+
+            if (
+                collect_dag_proactive_stats
+                and dag_migration_stats is not None
+                and use_proactive
+                and trigger_type == TRIGGER_PROACTIVE
+            ):
+                dag_migration_stats[dag_type]["proactive_decisions"] += 1
+                dag_migration_stats[dag_type]["migrated_nodes"] += nodes_migrated
+
+            touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
 
         pbar.update(1)
     pbar.close()
@@ -251,4 +287,7 @@ def run_sa_microservice_fair(df, servers_df, predictor=None, proactive=False):
         'total_decision_time': total_decision_time,
         'decision_count_for_latency': decision_count_for_latency,
         'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,
+        'dag_proactive_migration_stats': (
+            {k: dict(v) for k, v in dag_migration_stats.items()} if dag_migration_stats else {}
+        ),
     }

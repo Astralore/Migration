@@ -10,9 +10,11 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from collections import deque
-from tqdm import tqdm
 import random
 import copy
+
+import pandas as pd
+from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
@@ -20,6 +22,7 @@ from core.context import get_trigger_type, TRIGGER_PROACTIVE
 from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, initialize_dag_assignment
 from core.reward import build_servers_info, calculate_microservice_reward
 from core.state_builder import build_node_state
+from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
 
@@ -119,6 +122,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
 
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
+    taxi_last = {}
 
     decision_count = 0
     pbar = tqdm(total=len(timestamps), desc="DQN Microservice Migration")
@@ -129,6 +133,10 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             taxi_id = row['taxi_id']
             current_lat = row['latitude']
             current_lon = row['longitude']
+            ts = pd.Timestamp(timestamp)
+            pf_kw = build_predict_future_time_kwargs(
+                taxi_last, taxi_id, row, current_lon, current_lat, ts
+            )
 
             if taxi_id not in taxi_dag_assignments:
                 nearest = find_k_nearest_servers(
@@ -139,6 +147,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 taxi_dag_assignments[taxi_id] = initialize_dag_assignment(
                     chosen_dag, nearest[0]
                 )
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
 
             dag_type = taxi_dag_type[taxi_id]
@@ -161,7 +170,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             predicted_locations = None
             if use_proactive:
                 raw = predictor.predict_future(
-                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON, **pf_kw
                 )
                 predicted_locations = [(lat, lon) for lon, lat in raw]
 
@@ -173,6 +182,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             )
 
             if trigger_type is None:
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
 
             decision_count += 1
@@ -264,6 +274,8 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
 
             if decision_count % target_update_freq == 0:
                 target_network.load_state_dict(q_network.state_dict())
+
+            touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
 
         pbar.update(1)
     pbar.close()

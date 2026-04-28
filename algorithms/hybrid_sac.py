@@ -21,12 +21,13 @@ Reference:
 """
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
-from collections import deque
+from collections import deque, defaultdict
 from tqdm import tqdm
 import random
 import copy
@@ -41,6 +42,7 @@ from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, i
 from core.reward import build_servers_info, calculate_microservice_reward
 from core.state_builder import build_graph_state
 from algorithms.sa import microservice_simulated_annealing
+from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
 FORECAST_HORIZON = 15
 
@@ -1075,6 +1077,8 @@ def run_hybrid_sac_microservice(
         total_decision_time : float (推理/评估时延总和)
         decision_count_for_latency : int (时延计数)
         avg_decision_time_ms : float (平均决策时延，毫秒)
+        dag_proactive_migration_stats : dict
+            **仅 inference_mode=True** 时按 DAG 旁路统计；训练阶段恒为 ``{}``。
     """
     servers_info = build_servers_info(servers_df)
     use_proactive = proactive and predictor is not None
@@ -1127,6 +1131,12 @@ def run_hybrid_sac_microservice(
     _debug_proactive_triggers = 0
     _debug_no_triggers = 0
     _debug_predictions_made = 0
+
+    # 旁路：仅推理实验（inference_mode）建表；训练阶段不分配、不写入
+    dag_migration_stats = (
+        defaultdict(lambda: {"proactive_decisions": 0, "migrated_nodes": 0})
+        if inference_mode else None
+    )
     
     # =========================================================================
     # Network Initialization
@@ -1233,6 +1243,7 @@ def run_hybrid_sac_microservice(
     global_step = 0  # Tracks total steps across all epochs
     
     for epoch in range(num_epochs):
+        taxi_last = {}
         print(f"\n  === Epoch {epoch + 1}/{num_epochs} ===")
         
         is_eval_epoch = (epoch == num_epochs - 1)
@@ -1280,7 +1291,11 @@ def run_hybrid_sac_microservice(
                 taxi_id = row['taxi_id']
                 current_lat = row['latitude']
                 current_lon = row['longitude']
-                
+                ts = pd.Timestamp(timestamp)
+                pf_kw = build_predict_future_time_kwargs(
+                    taxi_last, taxi_id, row, current_lon, current_lat, ts
+                )
+
                 # -------------------------------------------------------------
                 # Initialize new taxi with nearest server assignment
                 # -------------------------------------------------------------
@@ -1289,6 +1304,7 @@ def run_hybrid_sac_microservice(
                     chosen_dag = assign_dag_type()
                     taxi_dag_type[taxi_id] = chosen_dag
                     taxi_dag_assignments[taxi_id] = initialize_dag_assignment(chosen_dag, nearest[0])
+                    touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                     continue
                 
                 dag_type = taxi_dag_type[taxi_id]
@@ -1312,7 +1328,7 @@ def run_hybrid_sac_microservice(
                 predicted_locations = None
                 if use_proactive:
                     raw = predictor.predict_future(
-                        current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+                        current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON, **pf_kw
                     )
                     predicted_locations = [(lat, lon) for lon, lat in raw]
                     _debug_predictions_made += 1
@@ -1328,6 +1344,7 @@ def run_hybrid_sac_microservice(
                 
                 if trigger_type is None:
                     _debug_no_triggers += 1
+                    touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                     continue
                 
                 decision_count += 1
@@ -1490,6 +1507,15 @@ def run_hybrid_sac_microservice(
                     if old_assignments[n] != taxi_dag_assignments[taxi_id][n]
                 )
                 total_migrations += nodes_migrated
+
+                if (
+                    inference_mode
+                    and dag_migration_stats is not None
+                    and use_proactive
+                    and trigger_type == TRIGGER_PROACTIVE
+                ):
+                    dag_migration_stats[dag_type]["proactive_decisions"] += 1
+                    dag_migration_stats[dag_type]["migrated_nodes"] += nodes_migrated
                 
                 # -------------------------------------------------------------
                 # Phase E: Build Next State and Store Transitions
@@ -1558,6 +1584,8 @@ def run_hybrid_sac_microservice(
                     # Phase G: Soft Update Target Critic (Every Step)
                     # -------------------------------------------------------------
                     soft_update(target_critic, critic, tau)
+
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
             
             pbar.update(1)
         pbar.close()
@@ -1618,6 +1646,9 @@ def run_hybrid_sac_microservice(
         'total_decision_time': total_decision_time,
         'decision_count_for_latency': decision_count_for_latency,
         'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,
+        'dag_proactive_migration_stats': (
+            {k: dict(v) for k, v in dag_migration_stats.items()} if dag_migration_stats else {}
+        ),
     }
 
 
@@ -1696,7 +1727,8 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
     
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
-    
+    taxi_last = {}
+
     for timestamp in timestamps:
         current_rows = df_grouped.get_group(timestamp)
         
@@ -1704,12 +1736,17 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             taxi_id = row['taxi_id']
             current_lat = row['latitude']
             current_lon = row['longitude']
-            
+            ts = pd.Timestamp(timestamp)
+            pf_kw = build_predict_future_time_kwargs(
+                taxi_last, taxi_id, row, current_lon, current_lat, ts
+            )
+
             if taxi_id not in taxi_dag_assignments:
                 nearest = find_k_nearest_servers(current_lat, current_lon, servers_df, k=1)[0]
                 chosen_dag = assign_dag_type()
                 taxi_dag_type[taxi_id] = chosen_dag
                 taxi_dag_assignments[taxi_id] = initialize_dag_assignment(chosen_dag, nearest[0])
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
             
             dag_type = taxi_dag_type[taxi_id]
@@ -1727,7 +1764,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             predicted_locations = None
             if use_proactive:
                 raw = predictor.predict_future(
-                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON
+                    current_lon, current_lat, taxi_id, steps=FORECAST_HORIZON, **pf_kw
                 )
                 predicted_locations = [(lat, lon) for lon, lat in raw]
             
@@ -1738,6 +1775,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             )
             
             if trigger_type is None:
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
             
             candidates = find_k_nearest_servers(current_lat, current_lon, servers_df, k=3)
@@ -1812,6 +1850,8 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 if old_assignments[n] != taxi_dag_assignments[taxi_id][n]
             )
             total_migrations += nodes_migrated
+
+            touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
     
     gat_network.train()
     actor.train()

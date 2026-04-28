@@ -1,211 +1,151 @@
-# 微服务迁移：物理毫秒化与 Actor Mask 重构施工图（与当前实现对齐）
+角色设定：
 
-> 角色：按本仓库 **现有调用关系**（`sa.py` / `dqn.py` / `hybrid_sac.py` / `hybrid_sa_dqn.py` → `context.get_trigger_type` → `reward.calculate_microservice_reward`）实施；禁止引入 `reward`↔`context` 循环导入。
-
----
-
-## 0. 影响面清单（实施前必读）
-
-| 模块 | 变更要点 |
-|------|----------|
-| `core/physics_utils.py` | **新建**：光速常量、`calc_access_latency_ms`；可再放 **仅与物理相关的** 阈值常量（见下）。 |
-| `core/reward.py` | `calculate_microservice_reward` 改为全 ms 分量与 `total_cost_ms`；`details` 字段名建议保留或做映射，避免 `hybrid_sac` 等依赖方断裂。 |
-| `core/context.py` | `check_sla_violation` **去掉** `current_dag_reward`；`get_trigger_type` **去掉**该形参；`check_proactive_sla_violation` 同步改签名。 |
-| `algorithms/hybrid_sac.py` | 动作 **0=STAY / 1=FOLLOW_SA / 2=NEAREST**（与 `SACDiscreteActor` 注释一致）；`sample_action` 与 `get_action_deterministic` **统一走带 mask 的路径**；若尚无 mask 构造逻辑，需在 **主循环内** 或 `state_builder` 中实现 `build_action_mask(...)`。 |
-| `algorithms/sa.py` / `dqn.py` / `hybrid_sa_dqn.py` | 所有 `get_trigger_type(..., current_dag_reward, ...)` 改为 **不传 reward**（或传 `None` 若暂做兼容层）。 |
-| `core/geo.py` | 可选：`find_k_nearest_servers` 对 **600 台** 服务器做 **numpy 距离矩阵**（与向量化阶段一致）。 |
-| `core/state_builder.py` | 批量 haversine / 与预测相关的 **mobility 特征** 向量化。 |
-
-**训练**：奖励尺度与 MDP 变更后须 **废弃旧 checkpoint**，`run_comparison.py` 中 `INFERENCE_MODE=False` 重训。
+你是一位顶级的 AI 数据工程师和系统架构师。为满足顶会论文对**数据协议可复现、训练/测试实体不重叠、子集与全城叙事一致**的要求，对 `core/data_loader.py` 与 `run_comparison.py` 按下列计划重构。方案仍为 **「活跃车辆子集（Strategy D）」+「按车辆零样本切分（Strategy B）」** 的组合；以下条款按**本仓库现有代码路径**做了对齐与细化，实施时以本文为准。
 
 ---
 
-## 阶段一：`core/physics_utils.py`（无环、单位无歧义）
+## 设计原则（与当前实现对齐）
 
-1. **常量**（与当前 `command` 审查结论一致）  
-   - `FIBER_SPEED_KM_MS = 200.0`  # 语义：**km/ms**（≈ 200,000 km/s）  
-   - `BASE_ROUTER_DELAY_MS = 2.0`  
-   - **禁止**再使用「名为 `_KM_S` 却赋 200.0 表示 km/s」的写法。
-
-2. **公共函数**（供 `reward`、`context` **单向** `import`）：
-
-```python
-def calc_access_latency_ms(distance_km: float) -> float:
-    """一次真实接入：传播 + 固定路由/协议基线 (ms)。用于用户→入口、跨边传播等「新开连接」语义。"""
-    return (distance_km / FIBER_SPEED_KM_MS) + BASE_ROUTER_DELAY_MS
-
-
-def propagation_latency_ms(distance_km: float) -> float:
-    """仅传播段 (ms)，不含 BASE_ROUTER_DELAY。distance_km<=0 时须返回 0.0。
-    用于 Future 超额距离等「非新开物理端口」的惩罚，避免安全步吃到 2ms 幽灵基线。"""
-    if distance_km <= 0.0:
-        return 0.0
-    return distance_km / FIBER_SPEED_KM_MS
-```
-
-**单位**：`FIBER_SPEED_KM_MS` 为 **km/ms** 时，`distance_km / FIBER_SPEED_KM_MS` 已为 **ms**，**禁止**再乘 `1000`（否则与阶段一矛盾）。
-
-3. **可选**：将 `SLA_DISTANCE_THRESHOLD_KM = 15.0` 放在本文件或继续仅在 `context.py` 定义一处，**`reward.py` 中 SLA 判断必须与 `context.DISTANCE_THRESHOLD_KM` 同源**（建议 `context` 从 `physics_utils` 只 import 函数，阈值仍保留在 `context` 并在 `reward` 中 `from core.context import DISTANCE_THRESHOLD_KM` 或反向由 `physics_utils` 导出常量二选一，**全仓库单一真源**）。
+1. **处理顺序固定**：读 CSV → 保留四列 → `date_time` 解析 → **`sort_values(['taxi_id','date_time'])`** → `dropna`（经纬度）→ **同车时间去重（§1.1）** → **速度阈值跳变清洗** → **剔除单车有效点过少车辆** → **按车计数、取 Top‑`active_users_limit` 活跃车** →（可选）**断层 `episode_id` 标注** → 返回。不在取 Top‑N 之后再做全表级排序破坏车内线序。
+2. **`run_comparison` 单次加载、再切分**：全流水线中**同一份**「清洗 + Top‑N」后的 `df_active` 只通过一次 `load_data` 得到；**禁止**训练阶段与推理阶段各自调用 `load_data` 且参数不一致导致子集漂移。
+3. **RL 与物理惩罚**：`algorithms/*` 内**单步奖励解析式、Hybrid SAC 核心训练循环**不修改。允许为**合法时空断层**增加**数据契约**（如 `episode_id` 或仿真外层对已存在的 \(\Delta t\) 阈值做状态重置），以避免「惩罚链不合理地跨越换班/长途」；该改动须与现有按时间步驱动逻辑对齐，**不**通过删光断层之后数据实现。
+4. **数据集文件**：不删除、不覆盖 `data/` 下原始 CSV。
 
 ---
 
-## 阶段二：`core/reward.py` — 全毫秒 `total_cost_ms`
+## 阶段一：重构 `core/data_loader.py`（清洗 + 活跃度提纯）
 
-### 2.1 JIT 带宽（与现实现 `risk_ratio` 定义一致）
+### 1.1 严谨的 GPS 异常清洗（Velocity-based Jump Filtering）
 
-- `risk_ratio = min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD, 1.0)`，其中 `max_entry_dist_km` 与当前实现对 **各 entry** 取 max 一致。  
-- 常量建议：`MIN_BW_MBPS = 50.0`，`MAX_BW_MBPS = 500.0`（与先前规格一致，可微调）。  
-- `effective_bandwidth = MIN_BW_MBPS + (MAX_BW_MBPS - MIN_BW_MBPS) * (risk_ratio ** 2)`  
-- **Proactive / Reactive 不对称**：若需保留「Reactive 迁移更痛」，在 **`migration_delay_ms` 上** 乘 `TRIGGER_REACTIVE` 对应系数（从 `core.context` 引入常量），**不要**再依赖 `current_dag_reward` 触发。
+在**每辆车内部**、已按 `date_time` 排序后，**必须先执行时间去重（Drop Duplicates）**：
 
-### 2.2 多节点迁移（**Per-node 累加**，对齐当前 `for node ... if assignment changed`）
+- **去重规则**：对同一 `taxi_id` 下 **`date_time` 完全相同**的冗余行（设备连发、重传等）予以剔除，只保留一条。实现上在排序、去经纬度空值之后，对 **`['taxi_id', 'date_time']`** 做 **`drop_duplicates(..., keep='first')`**（`keep` 写死为 `first`，并在论文脚注说明）。  
+  - **目的**：保证后续相邻有效行之间 **\(\Delta t > 0\)**（在解析精度内），避免 \(\Delta t = 0\) 带来的 **除零、\(\inf\)** 及速度筛选逻辑崩溃；同时去除 \(\Delta t = 0\) 且 \(\Delta d > 0\)（同刻漂移）或 \(\Delta d = 0\)（纯重复）的病态边。  
+  - **脚注级说明**：若业务上存在「同秒不同坐标」且非重复噪声，当前主协议仍只保留首条；若未来需亚秒区分，可改为更高精度时间列，**本实验不展开**。
 
-对 **`current_assignments[node] != previous_assignments[node]`** 的每个节点：
+去重完成后，再对相邻两行 \((i, i+1)\) 计算：
 
-`migration_delay_ms += ((image_mb + state_mb) / effective_bandwidth) * 1000.0`
+- **时间差** \(\Delta t\)（秒；在去重后主路径上应 **> 0**；若仍出现 \(\Delta t \le 0\) 的边角，**跳过该边**不参与速度判定、不除零）与 **Haversine 距离** \(\Delta d\)（公里）。
+- **异常漂移剔除（毛刺）**：瞬时速度 \(v = (\Delta d / \Delta t) \times 3600\)（km/h）。当 **\(v > v_{\max}\)**（默认 **`v_max_kmh = 200`**，可配置）时，视为 GPS 定位漂移，**剔除该步的终点行**（与「荒谬边」的后一点一致）；可循环扫描直至稳定或设最大轮次。
+- **合法物理断层（换班 / 长途 / 长时间静止后再出发）**：若 **\(v \le v_{\max}\)**，但 **\(\Delta t\)** 超过**断层阈值**（默认 **`gap_dt_hours = 2`**，可配置），或 \(\Delta d\) 极大却与 \(\Delta t\) 一致地对应「合理低速」——**禁止**为「去毛刺」而删除断层**之后**的轨迹；不得把后续数据整体判废。
+- **断层与仿真/惩罚的衔接（二选一或组合，实施前在代码中核查后选定）**：
+  - **优先**：若环境/外层循环**已对极大 \(\Delta t\)** 做**状态或放置重置**（不把上一刻物理量硬接到下一刻），则数据侧可**仅保留清洗后的连续行**，依赖现有逻辑即可。
+  - **否则**：在 DataFrame 上为每条记录增加 **`episode_id`**（建议规则：同 `taxi_id` 内，每当出现「合法断层」边则在后一行递增 `episode_id`），由仿真按 **`(taxi_id, episode_id)` 或按 `episode_id` 分段** 重置与物理惩罚相关的状态，使**惩罚链不跨越时空**；**不删除**断层后数据。
+- Haversine 与速度判定用 **纯 NumPy** 实现即可。
 
-（无状态节点 `state_mb=0` 仍只迁镜像。）
+### 1.2 高质量活跃子集（Strategy D）
 
-### 2.3 Tearing（**原始 RPC 次数** + **Cap**，避免「归一化 × 5KB」过小）
+- 新增参数 **`active_users_limit`**（默认 **`100`**；`None` 表示不截车、保留当前清洗后全部车辆）。
+- 新增参数 **`min_vehicle_points`**（默认 **`100`**，与 `SimpleTrajectoryPredictor.fit` 内门槛对齐）：在跳变清洗之后、Top‑N 之前，**先剔除**「单车总有效点数 **< `min_vehicle_points`**」的劣质实体。
+- 再按 **`taxi_id` 分组计数**（行数），**降序**取前 **`active_users_limit`** 个 `taxi_id`，只保留这些车的所有行。
+- 与现有 **`sample_fraction`** 的约定：若论文主实验以「活跃 Top‑N」为准，则 **`run_comparison` 路径下二者互斥**——调用时 **`sample_fraction=1.0`** 且仅用 `active_users_limit`；若未来需随机子样车，在文档中写明顺序为「先 `sample_fraction` 抽车 → 再清洗 → 再滤点 → 再 Top‑N」，**本对比实验不采用该组合**。
 
-**暗坑**：若用 `norm_traffic * RPC_SIZE_MB` 且 `norm_traffic∈[0,1]`，则每边等效流量 **亚 MB 级**，除以 Gbps 骨干后延迟 **≈0**，撕裂约束名存实亡。
+### 1.3 行级索引参数 `start_index` / `end_index`（与旧脚本兼容）
 
-**定案**（写死，实现勿猜）：
+- **不再作为 `run_comparison` 的主协议**；论文与默认配置不描述行号切分。
+- **建议保留**函数参数并标注 **`legacy`**：仅在显式传入时于「取活跃 Top‑N **之后**」再 `iloc[start:end]`，用于与历史结果对照或快速 smoke test；默认全为 `None`。
+- **`chunk_size`**：保留为开发用截断；**主实验关闭**。
 
-- 常量：`RPC_SIZE_MB = 0.005`，`MAX_TEARING_MB = 50.0`，`EDGE_BACKHAUL_MBPS = 1000.0`  
-- 边上 **原始调用次数** 记为 `traffic`（与 `dag_info['edges'][(src,dst)]` 一致，即当前 `reward` 循环里的 `traffic`）。  
-- 仅 **`src_server != dst_server`** 的边：  
-  `cross_mb = min(traffic * RPC_SIZE_MB, MAX_TEARING_MB)`  
-  `tearing_delay_ms += (cross_mb / EDGE_BACKHAUL_MBPS) * 1000.0`  
+### 1.4 返回值与可观测性
 
-**若某路径上只剩 `norm_traffic`**：先在同一 DAG 内取 `max_traffic = max(dag_info['edges'].values())`，再 **`raw_rpc_count = norm_traffic * max_traffic`**，然后 **`cross_mb = min(raw_rpc_count * RPC_SIZE_MB, MAX_TEARING_MB)`**。
-
-### 2.4 跨边「传播型」通信延迟（**承接**原 `communication_cost`）
-
-当前实现有独立的 **`norm_traffic * dist_km`** 边项；全 ms 化后建议单独一项，避免信息丢失：
-
-- 对跨服务器边：`comm_delay_ms += norm_traffic * calc_access_latency_ms(edge_dist_km)`  
-- 或与 tearing 合并文档化；**`total_cost_ms` 中至少保留一种「边级延迟」**。  
-
-### 2.5 Future（**衰减 + 归一 + 与 `FUTURE_DIST_THRESHOLD` 对齐**；**禁止 BASE 幽灵**）
-
-与现 **`reward.py`** 一致：仅对 **预测距离超过 `FUTURE_DIST_THRESHOLD`（km）** 的 **超额部分** 计惩罚。
-
-**暗坑**：若对 `excess_km` 使用 `calc_access_latency_ms(excess_km)`，则 **`excess_km=0` 时仍有 `BASE_ROUTER_DELAY_MS`**，未来全程安全也会出现 **≈2ms/步** 的虚假 Future 成本，抬高总 cost 基线。
-
-**定案**：超额部分 **只计传播 ms**，**不加** `BASE_ROUTER_DELAY_MS`（用阶段一的 **`propagation_latency_ms`**）：
-
-- `len(future_distances)==0` → `future_delay_ms = 0.0`  
-- 否则（`d` 为该步用于判定的距离 km，多入口时取该步 **各 entry 的最大距离** 再与阈值比较）：  
-  `excess_km = max(0.0, d - FUTURE_DIST_THRESHOLD)`  
-  `raw = sum(propagation_latency_ms(excess_km) * (FUTURE_DECAY ** i) for i, d in enumerate(future_distances))`  
-  `weight_sum = sum(FUTURE_DECAY ** i for i in range(len(future_distances)))`  
-  `future_delay_ms = raw / weight_sum`  
-
-当所有步均安全时，各步 `excess_km=0` → **`future_delay_ms = 0`**。
-
-### 2.6 多入口 Access（木桶：**max**）
-
-`access_latency_ms = max(calc_access_latency_ms(dist_km) for dist_km in entry_distances_km)`
-
-### 2.7 SLA 显式项（与文档「双重计价」声明一致；**与阶段四双条件对齐**）
-
-**暗坑**：若阶段四已用 **`reactive_violation = spatial or qos`**（空间超阈 **或** 纯接入延迟超 `USER_SLA_TOLERANCE_MS`），而 Reward 仅在 **`max(entry_distances_km) > SLA_DISTANCE_THRESHOLD`** 时扣 **`sla_penalty_ms`**，则会出现 **Context 已判违规、Reward 不扣 5000** 的 **监督信号错位**（模型可钻空子）。
-
-**定案**：`sla_penalty_ms` 的触发条件与 **阶段四** 在语义上 **同构**（空间 **OR** 接入延迟 QoS）：
-
-- **线性**：已含在 **`access_latency_ms`**（§2.6：`max(calc_access_latency_ms(dist_km) for dist_km in entry_distances_km)`）随各入口距离增长。  
-- **跳变**：当  
-  **`max(entry_distances_km) > SLA_DISTANCE_THRESHOLD`** **OR** **`access_latency_ms > USER_SLA_TOLERANCE_MS`**  
-  时，`sla_penalty_ms = SLA_PENALTY_MS`（如 `5000.0`），否则 `0.0`。  
-
-（第二项即「各入口接入延迟取木桶最劣后仍超 QoS 容限」；与 `max(calc_access_latency_ms(d) for d in ...)` 是否 **严格大于** `USER_SLA_TOLERANCE_MS` 与 §2.6 的 **`access_latency_ms`** 为 **同一标量**，实现时 **禁止** 另算一套口径。）
-
-- **多入口与 Context 对齐（建议）**：阶段四若仅对 **单一 gateway 距离** 做 `qos`，而 Reward 用 **多入口 max**，仍存在边缘不一致；建议在 **`get_trigger_type` / `check_sla_violation`** 中对 **所有 entry** 计算 `calc_access_latency_ms` 并取 **max** 再与 **`USER_SLA_TOLERANCE_MS`** 比较，与 §2.6 **同源**。
-
-- **禁止**在 `access_latency_ms` 上再乘旧版 `SLA_VIOLATION_MULTIPLIER`（避免与 `sla_penalty_ms` 三重叠加）。
-
-### 2.8 合并与 Reward 截断（**避免「平原效应」**）
-
-`total_cost_ms = access_latency_ms + migration_delay_ms + tearing_delay_ms + comm_delay_ms + future_delay_ms + sla_penalty_ms`  
-
-**暗坑**：若 `sla_penalty_ms = 5000` 且 **`reward = max(-total_cost_ms, -5000)`**，则 **`total_cost_ms ∈ [5000, 5000+其它)`** 时 reward **全部被钳到 -5000**（违规又重迁 vs 违规少迁 **同分**），Critic 在违规邻域 **梯度平原**。
-
-**定案**：截断下限的绝对值须 **大于** 单次 SLA 跳变 + 典型附加成本上界，留出「违规 + 不同附加代价」的可分梯度空间。建议：
-
-```python
-SLA_PENALTY_MS = 5000.0
-REWARD_CLIP_MIN = -10000.0  # 可随训练再调，须满足 REWARD_CLIP_MIN < -(SLA_PENALTY_MS + 典型 migration/future 上界)
-reward = max(-total_cost_ms, REWARD_CLIP_MIN)
-```
+- 返回 **DataFrame**；列至少包含 `taxi_id`, `date_time`, `latitude`, `longitude`；若启用断层策略，增加 **`episode_id`**（整型）。
+- 日志建议打印：原始行数、**时间去重删除行数**、剔除跳变行数、因点数不足剔除车辆数、最终车辆数、最终记录数。
 
 ---
 
-## 阶段三：`algorithms/hybrid_sac.py` — Logits Mask（PyTorch）
+## 阶段二：重构 `run_comparison.py`（Strategy B + 与预测器衔接）
 
-**动作语义**：`0=STAY`，`1=FOLLOW_SA`，`2=NEAREST`（与 `SACDiscreteActor` 类注释一致）。
+### 2.1 统一数据入口
 
-1. 在 **`forward` 末尾** 或 **独立方法** `forward_masked(..., action_mask)` 中：先算 `logits = self.policy_net(state)`，再应用 mask。  
-2. **设备与 dtype**：`action_mask_tensor = torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)`；若 mask 为 float「1=合法」，先 `> 0` 转 bool。  
-3. **全非法保护**（禁止无脑全 STAY；**兼容 1D 推断与 2D Batch 训练**）：  
-   - **1D** `mask.shape == (action_dim,)`：`if not mask.any(): mask[1] = True`（**FOLLOW_SA**）。  
-   - **2D** `mask.shape == (batch_size, action_dim)`：对 **`~mask.any(dim=-1)`** 的行，将 **`mask[row, 1] = True`**；**禁止**写 `mask[1] = True`（会把 **batch 维整条** 误标为合法或触发维度错误）。  
+- 删除对 **`TRAIN_START_INDEX` / `TRAIN_END_INDEX` / `TEST_START_INDEX` / `TEST_END_INDEX`** 的依赖（常量可删或改为仅文档注释中的「历史行为」）。
+- 启动时：`df_active = load_data(DEFAULT_TAXI_PATH, sample_fraction=1.0, active_users_limit=100, start_index=None, end_index=None, chunk_size=None)`（参数名以实际实现为准）。
 
-```python
-if action_mask_tensor.dim() == 1:
-    if not action_mask_tensor.any():
-        action_mask_tensor[1] = True
-else:
-    all_invalid = ~action_mask_tensor.any(dim=-1)
-    action_mask_tensor[all_invalid, 1] = True
-```
+### 2.2 可复现的 Train / Test 按车划分
 
-4. **`logits = logits.masked_fill(~action_mask_tensor, -1e9)`** 或等价写法；**batch 维**时 **`logits`** 与 **`action_mask_tensor`** 均为 **`(batch, action_dim)`**。  
-5. **`sample_action` / `get_action_deterministic`**：均改为调用上述逻辑（可复用 `sample_action_with_mask` 并新增 `get_action_deterministic_masked`，避免两套实现）。  
-6. **Critic**：训练时对非法动作的 Q 处理与现 **离散 SAC** 实现保持一致（仅合法动作参与 `log_pi` 或文档规定的方式）。
+- `unique_ids = df_active['taxi_id'].unique()`；断言数量与 `active_users_limit` 一致（或 ≤ limit 若数据不足）。
+- 使用 **`numpy.random.default_rng(SPLIT_SEED)`**（建议 **`SPLIT_SEED = 42`**）对 `unique_ids` **打散后**按 **80% / 20%** 划分为 `train_taxi_ids` / `test_taxi_ids`（整除时注意余数分配规则写死，例如前 80% 为 train）。
+- `train_df = df_active[df_active['taxi_id'].isin(train_taxi_ids)]`，`test_df` 同理；**两车集合不相交**。
 
----
+### 2.3 训练阶段（`run_training_phase`）
 
-## 阶段四：`core/context.py` — 触发器与 Reward 解耦
+- **`SimpleTrajectoryPredictor`**：**仅在 `train_df` 上 `fit`**。
+- **SA / DQN / Hybrid SAC（训练）**：**仅在 `train_df` 上**运行（与当前「整段 df 训 RL」结构一致，只是 df 语义改为「训练车全时段轨迹」）。
+- 保存 SAC checkpoint 等行为不变。
 
-1. `from core.physics_utils import calc_access_latency_ms`（**不得**反向让 `physics_utils` import `context`）。  
-2. **`USER_SLA_TOLERANCE_MS` 标定**（推荐，与空间 SLA 一致）：  
-   `USER_SLA_TOLERANCE_MS = calc_access_latency_ms(DISTANCE_THRESHOLD_KM)`  
-   或略小（如 `* 0.99`）用于「纯延迟」略早于 15 km 的告警；**须与产品语义一致**。  
-3. **Reactive 双条件**（防 SLA 被架空；**与 §2.7 对齐**）：  
+### 2.4 推理阶段（`run_inference_phase`）
 
-单入口（仅 `gateway_node`）时可写：
+- **不再第二次调用 `load_data` 生成不同子集**；在进程内复用**同一 `df_active`**（或从 `run_training_phase` 返回的划分结果 / 序列化 seed 可重算），保证与训练阶段同一数据协议。
+- **`predictor`**：仍 **仅在 `train_df` 上 `fit`**（与现逻辑一致：推理前用训练车拟合预测器）。
+- **评测用 `test_df`**：所有算法入口传入的仿真 **`df` 为 `test_df`**（零样本新车 + 未见该 `taxi_id` 于 predictor 拟合集）。
 
-```python
-dist_km = haversine_distance(user_lat, user_lon, gateway_server_lat, gateway_server_lon)
-spatial = dist_km > DISTANCE_THRESHOLD_KM
-qos = calc_access_latency_ms(dist_km) > USER_SLA_TOLERANCE_MS
-reactive_violation = spatial or qos
-```
+### 2.5 预测器在测试车上的行为（时间归一化局部运动学，推荐且必须）
 
-**多入口（建议与 `reward` 一致）**：对每个 entry 算 `dist_e`，令 **`dist_worst_km = max(dist_e)`**，**`spatial = dist_worst_km > DISTANCE_THRESHOLD_KM`**，**`qos = max(calc_access_latency_ms(dist_e) for ...) > USER_SLA_TOLERANCE_MS`**（与 §2.6 **`access_latency_ms`** 定义一致），再 **`reactive_violation = spatial or qos`**。
+真实轨迹**采样间隔非均匀**：若将相邻点的 **\((dx, dy) = (lon_t - lon_{t-1}, lat_t - lat_{t-1})\)** 直接当作「下一步位移」叠加，而环境前瞻对应的是**更短或不同的 wall-clock**，会产生**尺度崩塌**（例如 \(\Delta t_{\text{prev}} = 60\text{s}\) 的位移被误用到 **10 s** 前瞻上放大数倍）。
 
-4. **删除** `current_dag_reward < SLA_REWARD_THRESHOLD` 分支；`check_sla_violation` / `get_trigger_type` / `check_proactive_sla_violation` **删除** `current_dag_reward` 参数，并更新 **全部调用方**（见第 0 节）。  
-5. **Proactive 前瞻**：仍使用 `PROACTIVE_WARNING_KM` 与 `predicted_locations` 循环；向量化见阶段五。
+**本计划采用且必须实现方案 A（唯一主方案）——标准速度向量 + 按前瞻时间积分**：
 
----
+- 修改 **`SimpleTrajectoryPredictor.predict_future`**：当 **`taxi_id ∉ velocity_factors`** 时，**不**查全局字典中该车条目。使用调用方提供的 **当前步与上一步**的经纬度及时间（或等价地提供 **`Δt_prev > 0`（秒）`**），先算**每秒变化率**（标准速度向量，单位：经度/秒、纬度/秒）：
+  \[
+  (v_{\text{lon}}, v_{\text{lat}}) = \left(\frac{lon_t - lon_{t-1}}{Δt_{\text{prev}}},\ \frac{lat_t - lat_{t-1}}{Δt_{\text{prev}}}\right),\quad Δt_{\text{prev}} = (t - t_{\text{prev}})\ \text{（秒）}.
+  \]
+- **未来坐标**：对需要前瞻的 wall-clock 跨度 **`Δt_future`**（或由多步 **`Δt_{future,k}`** 组成的序列），用
+  \[
+  lon_{\text{future}} = lon_t + v_{\text{lon}} \times Δt_{\text{future}},\quad lat_{\text{future}} = lat_t + v_{\text{lat}} \times Δt_{\text{future}}
+  \]
+  做外推；**多步**时对各步 **`Δt_{future,k}` 分别乘同一 \((v_{\text{lon}}, v_{\text{lat}})\)** 再累加，或按实现用「当前点 + 段内 \(v \times Δt\)」迭代推进，**禁止**在无时间信息时假定「一步 = 固定秒」。
+- **与现有 `steps` 接口衔接**：若当前 API 仍以 **`steps`**（整数步数）为主，调用方必须同时传入 **与各步对应的环境 wall-clock 间隔**（标量「每步 \(Δt\)」或逐点数组），使 **`steps` 仅表示重复外推次数**，每一步乘的 **`Δt_future`** 有明确定义；否则须在环境中将 `steps` 显式绑定到秒级 `Δt_future` 并在论文写清。
 
-## 阶段五：向量化（禁止 `lru_cache`）
+**回合边界与「幽灵上一步」（必须）**：
 
-1. **`core/geo.py`**：`find_k_nearest_servers` 对固定 `servers_df` 可预计算坐标矩阵，单次查询为 **向量距离 → `argpartition`** 取 top-k。  
-2. **`core/context.py`**：`get_trigger_type` 内对未来点与网关的 haversine，改为 **`numpy` 广播**（`(H,)` 对常量 gw）。  
-3. **`core/reward.py`**：`future_delay_ms` 中入口距离矩阵 **(H, n_entry)** 向量化。  
-4. **`core/state_builder.py`**：`_mobility_features` 等对 `predicted_locations` 的循环改为 **numpy `mean(axis=0)`**。
+- **调用方改造**：在 **`sa.py` / `dqn.py` / `hybrid_sac.py`** 中，仿真循环内记录并传入 **上一时刻经纬度与时间**（或 **`Δt_prev`**）。  
+- **极其重要**：当检测到 **环境 reset**、或 **当前步为新 `episode_id` 的回合第一步**（与 §1.1 合法物理断层对齐）、或 **当前 `taxi_id` 与上一记录不连续** 时，必须将 **`prev_lon` / `prev_lat` / `prev_time`（或 `Δt_prev`）设为 `None`**，或等价地将 **`prev_*` 视为与当前坐标/时间相同** 且 **`Δt_prev` 不可用**，**明确走「无历史 / 原地」分支**；**禁止**用跨断层、跨夜的上一坐标计算瞬时速度，避免「幽灵上一步」。
 
----
+**无历史的第一步**：`prev_*` 缺失或 `Δt_prev` 无效时，退化为**原地不动**（与现实现对「无信息」一致）。
 
-## 验收要求（提交审查用）
+**接口（示意）**：`predict_future(..., prev_lon=, prev_lat=, prev_time=, current_time=)` 或传入 **`delta_t_prev_sec`**；未来步需 **`delta_t_future_sec`**（逐步或标量）。当 **`taxi_id ∈ velocity_factors`** 时，可保持现有字典支路；若希望全路径时间一致，**可选**将字典支路也升级为同一秒级外推（**非硬性**，以免扩大改动面）。
 
-1. `core/physics_utils.py`：**完整**常量 + `calc_access_latency_ms` 源码。  
-2. `core/context.py`：**双条件** `reactive_violation` + **已移除** `current_dag_reward` 的 `check_sla_violation` 签名。  
-3. `core/reward.py`：**一行** `total_cost_ms = ...`；**`cross_mb`** 使用 **`traffic` 或 `norm_traffic*max_traffic` 还原**；**`future_delay_ms`** 使用 **`propagation_latency_ms(excess_km)`**（**非** `calc_access_latency_ms(excess_km)`）+ **`/ weight_sum`**；**`reward = max(..., REWARD_CLIP_MIN)`** 且 **`REWARD_CLIP_MIN <= -10000`** 或与 `SLA_PENALTY_MS` 显式留裕度。  
-4. `algorithms/hybrid_sac.py`：**Tensor mask** + **全非法回退 FOLLOW_SA（索引 1）**；**1D/2D mask** 分支（`dim==1` vs `all_invalid = ~mask.any(dim=-1); mask[all_invalid,1]=True`）+ `sample_action`/`get_action_deterministic` **均已接入**。  
+**论文表述**：在方法节将上述约定命名为 **「对未见实体的 Local Kinematic Estimation（局部运动学估计，时间归一化）」**。
+
+**方案 B（仅作消融）**：全程原地前瞻；须在附录标注，**不作为主结果协议**。
+
+### 2.6 与 `fit` 内 `len(taxi_data) < 100` 的交互
+
+- **数据侧**：§1.2 已在 Top‑N 前剔除 **< `min_vehicle_points`** 的车，与 `fit` 门槛一致，减少「无字典条目」的训练车。
+- **训练侧**：`fit` 内仍可保留「单车 **< 100** 不写入 `velocity_factors`」作为保险；此类车若在训练集中仍存在，**优先依赖日志告警**；其前瞻在训练中可走 **§2.5** 的时间归一化局部支路（须传 **`prev_*` + 时间或 `Δt_prev`**，并遵守回合边界）或原地。
 
 ---
 
-*本文件已根据当前仓库实现（`reward.py` 四分量、`context.py` 触发链、`hybrid_sac.py` Actor 动作定义、多算法调用 `get_trigger_type`）做补充与排版修正。*
+## 阶段三：实验报告与打印（`result.md` / 控制台）
+
+- **`generate_experiment_report` / `generate_full_pipeline_report`** 中「数据范围」文案：改为描述 **「活跃 Top‑N + 按车 80/20 + seed」**，例如：`active_users_limit=100, train_taxis=80, test_taxis=20, split_seed=42`，**禁止**再写 `[0:10000)` 等行号切片语义为主协议。
+- 若保留 legacy 行切片对照跑，在报告中单独一行标注 **legacy**。
+
+---
+
+## 阶段四：其它入口（非阻塞，建议后续统一）
+
+- `run_sa.py` / `run_dqn.py` / `run_hybrid.py` 仍使用 `chunk_size`；与主论文 **`run_comparison`** 协议不一致时，在 README 或脚本头注释中说明；**可选**后续改为调用同一 `load_data(..., active_users_limit=...)`  helper。
+
+---
+
+## 实施验收清单
+
+- [ ] `load_data`：顺序符合 §设计原则；**同车 `date_time` 去重** → **速度阈值**毛刺剔除 + **合法断层**不删后续；**先 `min_vehicle_points` 滤车再 Top‑N**；`episode_id` 或环境 \(\Delta t\) 重置已按 §1.1 落实其一；无除零 / `inf` 泄漏。
+- [ ] `run_comparison`：无 `TRAIN_*_INDEX`/`TEST_*_INDEX` 主路径；`df_active` 单次一致；`train_df`/`test_df` 车不交。
+- [ ] Predictor：**§2.5 时间归一化局部运动学**；`v_lon/v_lat` 由 **`Δt_prev`** 定义；前瞻乘 **`Δt_future`**；三算法传入 **`prev_*`+时间**；**reset / 新 `episode_id` / 轨迹不连续** 时不传幽灵 `prev_*`。
+- [ ] 报告：`result.md` 数据协议描述与代码一致。
+- [ ] 原始数据文件未删除。
+
+---
+
+## 交付物（供自检 / 文档）
+
+实施完成后，在 PR 或附录中**贴出或引用**：
+
+1. `data_loader.py` 中 **`taxi_id`+`date_time` 去重 + Haversine 速度阈值清洗 + Top‑活跃车** 的核心片段。
+2. `run_comparison.py` 中 **`df_active` → `train_df`/`test_df` 划分 + 训练/推理各传入哪张表** 的核心片段。
+3. `simple_predictor.py` 中 **时间归一化 Local Kinematic（`v_lon/v_lat`、`Δt_prev`/`Δt_future`、回合边界）** 片段，以及 **`sa`/`dqn`/`hybrid_sac`** 传入 **`prev_*`+时间** 与 **reset/`episode_id` 置空** 的片段。
+
+---
+
+**硬性约束**：不修改强化学习奖励、物理惩罚与 Hybrid SAC 核心训练循环逻辑；不改变原始数据集文件；本文件为实施蓝本，与历史 `command.md` 中「EVAL_END_INDEX」等笔误以**仓库内实际符号（如 `TEST_*`）及本文**为准。

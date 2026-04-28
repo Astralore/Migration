@@ -11,6 +11,8 @@ import argparse
 import os
 import time
 from datetime import datetime
+
+import numpy as np
 import pandas as pd
 
 from core.data_loader import load_data, DEFAULT_TAXI_PATH, DEFAULT_SERVER_PATH
@@ -26,21 +28,81 @@ from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_perf
 # =============================================================================
 INFERENCE_MODE = False  # False=训练模式（全量对比）, True=推理模式（加载 checkpoint 在测试段评测）
 
-# 数据切分配置
-TRAIN_START_INDEX = 0
-TRAIN_END_INDEX = 10000      # 训练数据: [0, 10000)
-TEST_START_INDEX = 10000
-TEST_END_INDEX = 15000       # 测试数据: [10000, 15000)
+# Strategy B：活跃 Top‑N + 按车 80/20（command.md 阶段二）
+SPLIT_SEED = 42
+ACTIVE_USERS_LIMIT = 100
+MIN_VEHICLE_POINTS = 100
 
 # 权重保存路径
 CHECKPOINT_DIR = "checkpoints"
 SAC_CHECKPOINT_PROACTIVE = "checkpoints/sac_proactive.pth"
 SAC_CHECKPOINT_REACTIVE = "checkpoints/sac_reactive.pth"
 
-# 原有配置
-CHUNK_SIZE = 10000
 PROACTIVE = True
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
+
+
+def _split_train_test_taxis(df_active):
+    """80/20 disjoint split by taxi_id; reproducible with default_rng(SPLIT_SEED)."""
+    unique_ids = df_active["taxi_id"].unique()
+    rng = np.random.default_rng(SPLIT_SEED)
+    shuffled = rng.permutation(unique_ids)
+    n = len(shuffled)
+    n_train = int(np.floor(0.8 * n))
+    train_ids = set(shuffled[:n_train])
+    test_ids = set(shuffled[n_train:])
+    train_df = df_active[df_active["taxi_id"].isin(train_ids)].reset_index(drop=True)
+    test_df = df_active[df_active["taxi_id"].isin(test_ids)].reset_index(drop=True)
+    return train_df, test_df, train_ids, test_ids
+
+
+def _data_protocol_line(train_df, test_df, phase_label):
+    return (
+        f"{phase_label}: load_data(active_users_limit={ACTIVE_USERS_LIMIT}, "
+        f"min_vehicle_points={MIN_VEHICLE_POINTS}) + default_rng({SPLIT_SEED}) 80/20 by taxi_id; "
+        f"train_taxis={train_df['taxi_id'].nunique()}, test_taxis={test_df['taxi_id'].nunique()}"
+    )
+
+
+def _dag_stats_markdown_table(stats):
+    """与论文表头一致：DAG Name | Proactive Decisions | Total Migrated Nodes | Avg Nodes per Decision"""
+    lines = [
+        "| DAG Name | Proactive Decisions | Total Migrated Nodes | Avg Nodes per Decision |\n",
+        "|----------|---------------------|----------------------|------------------------|\n",
+    ]
+    if not stats:
+        lines.append("| *（无样本）* | — | — | — |\n")
+        return "".join(lines)
+    for dag_name in sorted(stats.keys()):
+        b = stats[dag_name]
+        pd_c = int(b["proactive_decisions"])
+        mn = int(b["migrated_nodes"])
+        avg = (mn / pd_c) if pd_c > 0 else 0.0
+        lines.append(f"| {dag_name} | {pd_c} | {mn} | {avg:.2f} |\n")
+    return "".join(lines)
+
+
+def build_dag_adaptive_dual_appendix(proactive_results, section_heading="## 五、"):
+    """
+    SA 与 Hybrid SAC 的 Proactive 按 DAG 统计（与 hybrid_sac / sa 源码旁路条件一致）。
+    section_heading: 单文件推理报告建议用 ``## 四、``；流水线合并报告用 ``## 五、``。
+    """
+    sa_stats = (proactive_results.get("SA") or {}).get("dag_proactive_migration_stats") or {}
+    sac_stats = (proactive_results.get("Hybrid SAC") or {}).get("dag_proactive_migration_stats") or {}
+    return (
+        f"\n{section_heading}Proactive 按 DAG 自适应迁移统计（SA 与 Hybrid SAC 同口径）\n\n"
+        "**统一条件**：已启用前瞻（`use_proactive`）；`get_trigger_type(...) == PROACTIVE`；"
+        "单次决策内在 **同一拓扑序 `sorted_nodes`** 上比较 `previous_assignments` 与决策后节点放置，"
+        "统计发生变更的节点数 `migrated_nodes_count`；按 **DAG Name**（`dag_type`）聚合 "
+        "`proactive_decisions` 与 `migrated_nodes`；**Avg = migrated / proactive_decisions**（保留两位小数）。\n\n"
+        "**开关对齐（仅推理实验）**：Hybrid SAC 仅在 `inference_mode=True` 时分配并写入；"
+        "SA 仅在 `run_inference_phase` 的 Proactive 分支传入 `collect_dag_proactive_stats=True`。"
+        "**训练阶段**两种算法均不采集本统计。\n\n"
+        "### SA（Simulated Annealing）\n\n"
+        + _dag_stats_markdown_table(sa_stats)
+        + "\n### Hybrid SAC\n\n"
+        + _dag_stats_markdown_table(sac_stats)
+    )
 
 
 def _remove_sac_checkpoints_for_fresh_train():
@@ -59,10 +121,21 @@ def _remove_sac_checkpoints_for_fresh_train():
         print("  [PIPELINE] No existing SAC checkpoints to remove (fresh train).")
 
 
-def generate_experiment_report(proactive_results, reactive_results, is_inference_mode):
+def generate_experiment_report(
+    proactive_results, reactive_results, is_inference_mode,
+    train_df=None, test_df=None,
+):
     """自动生成 result.md 实验报告（单模式）。"""
     mode_str = "推理模式 (Inference)" if is_inference_mode else "训练模式 (Training)"
-    data_range = f"[{TEST_START_INDEX}:{TEST_END_INDEX}]" if is_inference_mode else f"[{TRAIN_START_INDEX}:{TRAIN_END_INDEX}]"
+    if train_df is not None and test_df is not None:
+        data_range = _data_protocol_line(
+            train_df, test_df, "推理 test_df" if is_inference_mode else "训练 train_df"
+        )
+    else:
+        data_range = (
+            f"load_data(active_users_limit={ACTIVE_USERS_LIMIT}, "
+            f"min_vehicle_points={MIN_VEHICLE_POINTS}); default_rng({SPLIT_SEED}) 80/20 split"
+        )
 
     report = f"""# 微服务迁移算法对比实验报告
 
@@ -114,6 +187,8 @@ def generate_experiment_report(proactive_results, reactive_results, is_inference
             report += f"- **SA 平均决策时延**: {sa_latency:.2f} ms\n"
             report += f"- **加速比**: SAC 比 SA 快 **{speedup:.1f}x**\n"
 
+    if is_inference_mode:
+        report += build_dag_adaptive_dual_appendix(proactive_results, section_heading="## 四、")
     report += "\n---\n\n*报告自动生成*\n"
 
     with open("result.md", "w", encoding="utf-8") as f:
@@ -138,6 +213,8 @@ def generate_full_pipeline_report(
     infer_reactive,
     wall_train_s,
     wall_infer_s,
+    train_df,
+    test_df,
 ):
     """
     训练段 + 测试段推理合并报告；记录与近期工程改动相关的指标说明。
@@ -168,10 +245,14 @@ def generate_full_pipeline_report(
         b = inf.get(key, 0)
         return f"- **{label}**（训练段 → 测试段）: {a} → {b}\n"
 
+    proto = _data_protocol_line(train_df, test_df, "数据协议")
+
     report = f"""# 微服务迁移算法对比实验报告（全量流水线）
 
 **生成时间**：{ts}  
-**流程**：启动前已删除 `sac_proactive.pth` / `sac_reactive.pth`（若存在）→ **训练** `[{TRAIN_START_INDEX}:{TRAIN_END_INDEX})` → 保存新权重 → **推理** `[{TEST_START_INDEX}:{TEST_END_INDEX})` 加载新权重评测 Hybrid SAC。
+**流程**：启动前已删除 `sac_proactive.pth` / `sac_reactive.pth`（若存在）→ **训练**（仅 `train_df`）→ 保存新权重 → **推理**（仅 `test_df`，同一划分）加载新权重评测 Hybrid SAC。
+
+**数据协议（Strategy B）**：{proto}
 
 **工程上下文（与指标相关）**：
 
@@ -183,13 +264,13 @@ def generate_full_pipeline_report(
 
 ---
 
-## 一、训练段结果 `[{TRAIN_START_INDEX}:{TRAIN_END_INDEX})`
+## 一、训练段结果（train_df）
 
 {table_pro(train_proactive, train_reactive, "Proactive（上表）/ Reactive（下表）")}
 
 ---
 
-## 二、测试段推理结果 `[{TEST_START_INDEX}:{TEST_END_INDEX})`
+## 二、测试段推理结果（test_df）
 
 *Hybrid SAC 使用训练段刚写入的 checkpoint；DQN/SA 无磁盘权重，在测试段上按既有脚本逻辑运行。*
 
@@ -225,6 +306,7 @@ def generate_full_pipeline_report(
     else:
         report += "- （略）\n"
 
+    report += build_dag_adaptive_dual_appendix(infer_proactive, section_heading="## 五、")
     report += "\n---\n\n*报告由 `run_comparison.py --pipeline` 自动生成*\n"
 
     with open("result.md", "w", encoding="utf-8") as f:
@@ -233,12 +315,21 @@ def generate_full_pipeline_report(
 
 
 def run_training_phase(servers_df):
-    """训练段：返回 proactive_results, reactive_results。"""
-    print(f"\n[MODE] Training Mode - Data: [{TRAIN_START_INDEX}:{TRAIN_END_INDEX}]")
-    df = load_data(DEFAULT_TAXI_PATH, start_index=TRAIN_START_INDEX, end_index=TRAIN_END_INDEX)
+    """训练段：仅 train_df；返回结果、predictor、train_df、test_df（供推理复用划分）。"""
+    df_active = load_data(
+        DEFAULT_TAXI_PATH,
+        sample_fraction=1.0,
+        active_users_limit=ACTIVE_USERS_LIMIT,
+        min_vehicle_points=MIN_VEHICLE_POINTS,
+    )
+    train_df, test_df, _, _ = _split_train_test_taxis(df_active)
+    print("\n[MODE] Training — Strategy B (train_df only)")
+    print(
+        f"  { _data_protocol_line(train_df, test_df, 'split') }"
+    )
 
     predictor = SimpleTrajectoryPredictor(forecast_horizon=FORECAST_HORIZON)
-    predictor.fit(df)
+    predictor.fit(train_df)
     print(f"  Predictor fitted: {len(predictor.velocity_factors)} taxis with velocity data")
 
     proactive_results = {}
@@ -248,19 +339,19 @@ def run_training_phase(servers_df):
     print("#" * 80)
     t0 = time.time()
     proactive_results["SA"] = run_sa_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=True
+        train_df, servers_df, predictor=predictor, proactive=True
     )
     print(f"  SA done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
     proactive_results["DQN"] = run_dqn_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=True
+        train_df, servers_df, predictor=predictor, proactive=True
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
     proactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        df, servers_df, predictor=predictor, proactive=True, num_epochs=6,
+        train_df, servers_df, predictor=predictor, proactive=True, num_epochs=6,
         inference_mode=False,
         save_checkpoint_path=SAC_CHECKPOINT_PROACTIVE,
     )
@@ -273,37 +364,48 @@ def run_training_phase(servers_df):
 
     t0 = time.time()
     reactive_results["SA"] = run_sa_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=False
+        train_df, servers_df, predictor=predictor, proactive=False
     )
     print(f"  SA done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
     reactive_results["DQN"] = run_dqn_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=False
+        train_df, servers_df, predictor=predictor, proactive=False
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
     reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        df, servers_df, predictor=predictor, proactive=False, num_epochs=6,
+        train_df, servers_df, predictor=predictor, proactive=False, num_epochs=6,
         inference_mode=False,
         save_checkpoint_path=SAC_CHECKPOINT_REACTIVE,
     )
     print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
 
-    return proactive_results, reactive_results, predictor
+    return proactive_results, reactive_results, predictor, train_df, test_df
 
 
-def run_inference_phase(servers_df):
-    """测试段推理：预测器在训练段拟合，评测在测试段。"""
-    print(f"\n[MODE] Inference Mode - Data: [{TEST_START_INDEX}:{TEST_END_INDEX}]")
+def run_inference_phase(servers_df, train_df=None, test_df=None):
+    """测试段推理：predictor 仅在 train_df 上 fit；算法仿真仅使用 test_df。"""
+    if train_df is None or test_df is None:
+        df_active = load_data(
+            DEFAULT_TAXI_PATH,
+            sample_fraction=1.0,
+            active_users_limit=ACTIVE_USERS_LIMIT,
+            min_vehicle_points=MIN_VEHICLE_POINTS,
+        )
+        train_df, test_df, _, _ = _split_train_test_taxis(df_active)
+        print("\n[MODE] Inference — loaded df_active + split (standalone inference)")
+    else:
+        print("\n[MODE] Inference — reusing train_df/test_df from training phase (single load_data in train)")
 
-    train_df = load_data(DEFAULT_TAXI_PATH, start_index=TRAIN_START_INDEX, end_index=TRAIN_END_INDEX)
+    print(f"  { _data_protocol_line(train_df, test_df, 'split') }")
+
     predictor = SimpleTrajectoryPredictor(forecast_horizon=FORECAST_HORIZON)
     predictor.fit(train_df)
-    print(f"  Predictor fitted on TRAINING data [{TRAIN_START_INDEX}:{TRAIN_END_INDEX}]")
+    print("  Predictor fitted on train_df only")
 
-    df = load_data(DEFAULT_TAXI_PATH, start_index=TEST_START_INDEX, end_index=TEST_END_INDEX)
+    df = test_df
 
     proactive_results = {}
     print("\n" + "#" * 80)
@@ -312,7 +414,8 @@ def run_inference_phase(servers_df):
 
     t0 = time.time()
     proactive_results["SA"] = run_sa_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=True
+        df, servers_df, predictor=predictor, proactive=True,
+        collect_dag_proactive_stats=True,
     )
     print(f"  SA done in {time.time() - t0:.1f}s")
 
@@ -355,7 +458,7 @@ def run_inference_phase(servers_df):
     )
     print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
 
-    return proactive_results, reactive_results
+    return proactive_results, reactive_results, train_df, test_df
 
 
 def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
@@ -484,13 +587,13 @@ def main():
         _remove_sac_checkpoints_for_fresh_train()
 
         t_train = time.time()
-        train_pro, train_rea, _ = run_training_phase(servers_df)
+        train_pro, train_rea, _, train_df, test_df = run_training_phase(servers_df)
         wall_train = time.time() - t_train
 
         _print_results_and_plots(train_pro, train_rea)
 
         t_inf = time.time()
-        infer_pro, infer_rea = run_inference_phase(servers_df)
+        infer_pro, infer_rea, _, _ = run_inference_phase(servers_df, train_df, test_df)
         wall_infer = time.time() - t_inf
 
         print("\n" + "#" * 80)
@@ -503,6 +606,8 @@ def main():
             train_pro, train_rea, infer_pro, infer_rea,
             wall_train_s=wall_train,
             wall_infer_s=wall_infer,
+            train_df=train_df,
+            test_df=test_df,
         )
 
         # 曲线以训练段为准（含完整 loss_history）
@@ -522,13 +627,16 @@ def main():
         return
 
     if not INFERENCE_MODE:
-        train_pro, train_rea, _ = run_training_phase(servers_df)
+        train_pro, train_rea, _, train_df, test_df = run_training_phase(servers_df)
         proactive_results, reactive_results = train_pro, train_rea
     else:
-        proactive_results, reactive_results = run_inference_phase(servers_df)
+        proactive_results, reactive_results, train_df, test_df = run_inference_phase(servers_df)
 
     _print_results_and_plots(proactive_results, reactive_results)
-    generate_experiment_report(proactive_results, reactive_results, INFERENCE_MODE)
+    generate_experiment_report(
+        proactive_results, reactive_results, INFERENCE_MODE,
+        train_df=train_df, test_df=test_df,
+    )
 
 
 if __name__ == "__main__":
