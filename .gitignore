@@ -9,3 +9,6 @@ build/
 mec_migration/
 .DS_Store
 Thumbs.db
+
+# 预处理轨迹体积大，默认不提交；需要团队共享时可删除下行并纳入版本控制
+data/processed/*.csv

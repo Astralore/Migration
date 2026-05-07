@@ -5,12 +5,18 @@ import time
 import numpy as np
 import pandas as pd
 
-from core.data_loader import load_data, DEFAULT_TAXI_PATH, DEFAULT_SERVER_PATH
+from core.data_loader import (
+    load_data,
+    DEFAULT_TAXI_PATH,
+    DEFAULT_SERVER_PATH,
+    DEFAULT_PROCESSED_TAXI_PATH,
+)
 from algorithms.hybrid_sa_dqn import run_hybrid_microservice_fair
 from evaluation.metrics import compute_score
 from evaluation.plot import plot_training_curves
 
-CHUNK_SIZE = 10000
+_ACTIVE_USERS_LIMIT = 100
+_MIN_VEHICLE_POINTS = 100
 
 
 def main():
@@ -18,7 +24,13 @@ def main():
     print("  Hybrid RL-Refined SA Microservice Migration — Full Run")
     print("=" * 60)
 
-    df = load_data(DEFAULT_TAXI_PATH, chunk_size=CHUNK_SIZE)
+    df = load_data(
+        DEFAULT_TAXI_PATH,
+        sample_fraction=1.0,
+        active_users_limit=_ACTIVE_USERS_LIMIT,
+        min_vehicle_points=_MIN_VEHICLE_POINTS,
+        processed_csv=DEFAULT_PROCESSED_TAXI_PATH,
+    )
     servers_df = pd.read_csv(DEFAULT_SERVER_PATH)
     print(f"  Edge servers loaded: {len(servers_df)}")
 

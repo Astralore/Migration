@@ -1,88 +1,85 @@
-# 数据管线与阶段二实施记录（`command.md`）
+# Hybrid SAC：Smoke 测试与判读报告
+
+> 本文档按请求**覆盖写入**：记录一次带 `HYBRID_SAC_DEBUG_STEPS` 的 `run_comparison.py` 烟雾跑法、终端结论与日志片段。  
+> 根因与代码级修复（`argmax(softmax)` → masked logits + tie-break、reward 埋点）见仓库内 `algorithms/hybrid_sac.py`、`core/reward.py`。
 
 ---
 
-## 阶段一（简要）：`core/data_loader.py`
+## 一、Smoke 配置（临时，跑完后已恢复默认）
 
-**范围**：仅 `core/data_loader.py`；未改 CSV。要点：同车 `(taxi_id, date_time)` 去重 → Haversine + \(v>200\) km/h 多轮删点 → `min_vehicle_points` / `active_users_limit` → `episode_id`（>2 h 断层）。默认 `active_users_limit=None` 等保持旧调用可选；主实验显式传 `100`。
+在 `run_comparison.py` 顶层曾临时设为：
 
-验证：`python core/data_loader.py`。典型规模：约 100 车、约 20.7 万行（见前文表）。
+- `ACTIVE_USERS_LIMIT = 5`（意图：极少车辆）
+- `NUM_EPOCHS = 1`（Hybrid SAC 仅 1 轮）
+- `INFERENCE_MODE = False`（走训练流程）
 
----
+**命令（Windows PowerShell）：**
 
-## 阶段二：`run_comparison.py` + 预测器 + 三算法调用
-
-### 修改范围（**未**再改 `core/data_loader.py` 与原始 CSV）
-
-| 文件 | 内容 |
-|------|------|
-| `run_comparison.py` | 删除 `TRAIN_*_INDEX` / `TEST_*_INDEX`；`load_data(..., active_users_limit=100, min_vehicle_points=100)` 得 `df_active`；`default_rng(42)` 80/20 划分 `train_df`/`test_df`；训练全程 `train_df`，推理全程 `test_df`；流水线推理复用训练返回的划分（避免重复语义）；报告文案改为 Strategy B 描述 |
-| `prediction/simple_predictor.py` | `touch_taxi_last` / `build_predict_future_time_kwargs`（`episode_id` 变化则清空 prev，防幽灵上一步）；`predict_future` 对**未见** `taxi_id`：\((v_{lon},v_{lat})=(\Delta lon/\Delta t_{prev},\Delta lat/\Delta t_{prev})\)，每步 `lon += v_lon * Δt_future`（默认 `Δt_future=\Delta t_{prev}`）；无历史则原地；已知车仍用原字典 `(dx,dy)` 步进；`**_kwargs` 吸收多余关键字 |
-| `algorithms/sa.py` | `taxi_last` + 每步 `pf_kw` 传入 `predict_future`；init / 无 trigger / 正常决策路径均 `touch_taxi_last` |
-| `algorithms/dqn.py` | 同上 |
-| `algorithms/hybrid_sac.py` | 同上；**每个 epoch 开始** `taxi_last = {}`；`evaluate_sac_policy` 同样逻辑 |
-
-### `run_comparison.py` 核心逻辑（摘录）
-
-```python
-SPLIT_SEED = 42
-ACTIVE_USERS_LIMIT = 100
-MIN_VEHICLE_POINTS = 100
-
-def _split_train_test_taxis(df_active):
-    shuffled = np.random.default_rng(SPLIT_SEED).permutation(df_active["taxi_id"].unique())
-    n_train = int(np.floor(0.8 * len(shuffled)))
-    train_ids = set(shuffled[:n_train])
-    test_ids = set(shuffled[n_train:])
-    ...
-
-def run_training_phase(servers_df):
-    df_active = load_data(..., active_users_limit=100, min_vehicle_points=100)
-    train_df, test_df, _, _ = _split_train_test_taxis(df_active)
-    predictor.fit(train_df)
-    run_sa_microservice_fair(train_df, ...); ...  # 全部 train_df
-
-def run_inference_phase(servers_df, train_df=None, test_df=None):
-    ...
-    predictor.fit(train_df)
-    df = test_df
-    run_*_microservice_fair(df, ...)  # 仅 test_df
+```powershell
+$env:HYBRID_SAC_DEBUG_STEPS="200"
+python run_comparison.py
 ```
 
+**说明（重要）：**
+
+1. **`ACTIVE_USERS_LIMIT=5` 未缩小本次语料**：`load_data` 命中已存在的预清洗 CSV `taxi_cleaned_active100_min100_eps2h.csv`，仍为 **约 100 辆车、20 万+ 行**。真·5 车极速需 `processed_csv=False` 或提供 `active_users_limit=5` 对应的 processed 文件。  
+2. **`NUM_EPOCHS=1`** 时，`is_eval_epoch = (epoch == num_epochs - 1)` 在唯一一轮上恒为 **True**，Hybrid SAC **整段为 EVAL**，**不会调用 `sample_action`**，因此流水线日志中**不会出现** `[HYBRID_SAC_DBG action]` / `sampled_action` 行；这不表示修复失效。  
+3. 测试结束后 **`run_comparison.py` 已恢复**为正式默认：`ACTIVE_USERS_LIMIT=100`，Hybrid SAC **`num_epochs=6`**。
+
 ---
 
-## 阶段二 Smoke Test（命令行）
+## 二、判读结论（针对两项核心问题）
 
-**命令**（项目根目录）：
+### 1. 死锁是否解除？
+
+**结论：已解除。**
+
+- **端到端汇总**：`PAPER SUMMARY` 中 Hybrid SAC 为 **`Migrations: 2448 -> 2664`**，迁移计数非零，与「评估阶段永远 STAY」的旧 bug 不一致。  
+- **确定性路径**：对接近全零的 logits，`get_action_deterministic` 输出为 **`1`（FOLLOW_SA）**（masked logits + tie-break），而非旧版在均匀 softmax 上 `argmax` 得到的 **`0`（STAY）**。  
+- **`sampled_action` 脑电波**：因 `NUM_EPOCHS=1` 无探索分支，在同一环境下用**独立微脚本**连续调用 `sample_action`，可见 `sampled_action` 在 **0 / 1 / 2** 间变化（见下文片段 B）。
+
+### 2. 奖励截断（Reward Clipping）是否严重？
+
+**结论：在前 200 条 `[HYBRID_SAC_DBG reward]` 窗口内，未发现「`total_cost_ms` 极大、`reward` 死死卡在 `-10000`」的顶格截断。**
+
+- 该窗口内 `total_cost_ms` 峰值约 **6000+ ms**（例如 ~6088），`reward(clipped)` 与 `-total_cost_ms` 一致。  
+- 计数在 **`core/reward.py` 模块 import 时**初始化，**前 200 条**多来自 **SA/DQN** 较早阶段的 reward 调用，不等同于「纯 SAC 专属」序列。  
+- 全量日志中若出现大量 `total_cost_ms >> 10000` 且 `reward` 恒为 `-10000`，再单独评估是否调 `REWARD_CLIP_MIN` / 尺度；**本次测试未修改 reward 公式**。
+
+---
+
+## 三、代表性日志片段
+
+**A）Smoke 日志中的 reward 埋点（`total_cost` 与 `reward` 未顶格 `-10000`）：**
 
 ```text
-python -c "from core.data_loader import load_data, DEFAULT_TAXI_PATH; from run_comparison import _split_train_test_taxis, ACTIVE_USERS_LIMIT; df=load_data(DEFAULT_TAXI_PATH, active_users_limit=ACTIVE_USERS_LIMIT, min_vehicle_points=100); tr, te, a, b=_split_train_test_taxis(df); print('taxis', len(a), len(b), 'rows', len(tr), len(te)); from prediction.simple_predictor import SimpleTrajectoryPredictor; import pandas as pd; p=SimpleTrajectoryPredictor(3); p.fit(tr); t0=pd.Timestamp('2008-01-01 00:00:00'); t1=pd.Timestamp('2008-01-01 00:05:00'); r=p.predict_future(116.5, 39.9, list(te['taxi_id'].unique())[0], steps=2, prev_lon=116.0, prev_lat=39.9, prev_time=t0, current_time=t1); print('pred', r)"
+[HYBRID_SAC_DBG reward] total_cost_ms=2.027105227329716 migration_delay_ms=0.0 tearing_delay_ms=0.0 sla_penalty_ms=0.0 access_latency_ms=2.027105227329716 reward(clipped)=-2.027105227329716 REWARD_CLIP_MIN=-10000.0
+[HYBRID_SAC_DBG reward] total_cost_ms=6088.549187775138 migration_delay_ms=6085.93107302262 tearing_delay_ms=0.58 sla_penalty_ms=0.0 access_latency_ms=2.027105227329716 reward(clipped)=-6088.549187775138 REWARD_CLIP_MIN=-10000.0
+[HYBRID_SAC_DBG reward] total_cost_ms=2610.2032967848795 migration_delay_ms=2555.723320695299 tearing_delay_ms=50.42 sla_penalty_ms=0.0 access_latency_ms=2.027105227329716 reward(clipped)=-2610.2032967848795 REWARD_CLIP_MIN=-10000.0
 ```
 
-**实际输出（节选）**：
+**B）微脚本下的动作采样（均匀 softmax 时采样到 2 / 1 / 0）：**
 
 ```text
-taxis 80 20 rows 159333 48085
-pred [(117.0, 39.9), (117.5, 39.9)]
+[HYBRID_SAC_DBG action] logits_raw=[-5.4554183e-10  1.6606618e-09 -4.0260391e-09] logits_masked=[-5.4554183e-10  1.6606618e-09 -4.0260391e-09] softmax_probs=[0.33333334 0.33333334 0.33333334] mask=[True, True, True] sampled_action=2
+[HYBRID_SAC_DBG action] ... softmax_probs=[0.33333334 0.33333334 0.33333334] mask=[True, True, True] sampled_action=1
+[HYBRID_SAC_DBG action] ... softmax_probs=[0.33333334 0.33333334 0.33333334] mask=[True, True, True] sampled_action=0
 ```
 
-- **80 / 20 辆车**，**train 行数 159333**、**test 行数 48085**（与当前 `data/taxi_with_health_info.csv` 及阶段一清洗一致）。
-- **未见车**在 \(\Delta t_{prev}=300\) s、\(\Delta lon=0.5\)° 下两步外推：经度每步 +0.5°（`delta_t_future` 默认等于 `delta_t_prev`）。
-
-**模块导入**：
+**C）端到端汇总（迁移非零）：**
 
 ```text
-python -c "import run_comparison; print('import ok')"
+  Hybrid SAC:
+    - Migrations: 2448 -> 2664
 ```
-
-输出：`import ok`。
 
 ---
 
-## 未执行项
+## 四、产物与复现提示
 
-- 未跑完整 `python run_comparison.py --pipeline`（全量 SA/DQN/Hybrid SAC 多 epoch 耗时较长）；需要完整端到端指标时在本地执行即可。
+- 一次完整 smoke 的终端输出曾写入项目根目录 **`smoke_hybrid_sac_log.txt`**（与 `Tee-Object` 行为有关；若需与 Cursor 终端文件对照，以当时会话的 `terminals/*.txt` 为准）。  
+- 复现「动作埋点」：`HYBRID_SAC_DEBUG_STEPS` 在**启动进程前**设置；若要在 **`run_comparison` 流水线内**看到 `sampled_action`，需 **`num_epochs >= 2`**（存在非最后一轮的训练轮）或单独写微脚本调用 `sample_action`。
 
 ---
 
-*阶段一完整实现见 `core/data_loader.py`；阶段二见 `run_comparison.py` 与 `prediction/simple_predictor.py` 及三算法文件。*
+*若需恢复更早版本的 `test.md`（例如阶段一/二数据管线长文），请从 Git 历史中检出。*

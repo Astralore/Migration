@@ -14,8 +14,12 @@ DISTANCE_THRESHOLD_KM = 15.0
 # 与 command.md 一致：略小于「15km 对应延迟」，使 qos 可与 spatial 形成互补（仍 OR）
 USER_SLA_TOLERANCE_MS = calc_access_latency_ms(DISTANCE_THRESHOLD_KM) * 0.99
 
-# Proactive warning threshold: early-warning buffer zone
+# 旧版距离缓冲（仅供 check_proactive_sla_violation 等兼容；get_trigger_type 已改 TTV）
 PROACTIVE_WARNING_KM = 5.0
+
+# C3：前瞻时间步长（秒）与保守迁移耗时兜底（秒），不扩展 get_trigger_type 形参
+_DEFAULT_FORECAST_STEP_DT_SEC = 60.0
+_ESTIMATED_MIGRATION_TIME_S_FALLBACK = 2.0
 
 # Trigger type constants
 TRIGGER_REACTIVE = "REACTIVE"
@@ -76,6 +80,17 @@ def check_proactive_sla_violation(
     return False
 
 
+def _ttv_seconds_to_sla_breach(fd, step_dt_sec):
+    """首次达到 SLA 空间阈值的预测时间（秒）；达不到则 +inf。fd 为前瞻到 gateway 距离 (H,)。"""
+    if fd.size == 0:
+        return float("inf")
+    dt = float(step_dt_sec) if float(step_dt_sec) > 0 else _DEFAULT_FORECAST_STEP_DT_SEC
+    for h in range(fd.size):
+        if fd[h] >= DISTANCE_THRESHOLD_KM:
+            return (h + 1) * dt
+    return float("inf")
+
+
 def get_trigger_type(
     user_lat, user_lon,
     gateway_server_lat, gateway_server_lon,
@@ -104,7 +119,9 @@ def get_trigger_type(
         fd = _future_distances_km_to_gateway(
             predicted_locations, gateway_server_lat, gateway_server_lon,
         )
-        if fd.size and bool(np.any(fd > PROACTIVE_WARNING_KM)):
+        ttv_s = _ttv_seconds_to_sla_breach(fd, _DEFAULT_FORECAST_STEP_DT_SEC)
+        est_mig_s = _ESTIMATED_MIGRATION_TIME_S_FALLBACK
+        if np.isfinite(ttv_s) and ttv_s <= est_mig_s + 1.0:
             return TRIGGER_PROACTIVE
 
     return None

@@ -15,7 +15,12 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from core.data_loader import load_data, DEFAULT_TAXI_PATH, DEFAULT_SERVER_PATH
+from core.data_loader import (
+    load_data,
+    DEFAULT_TAXI_PATH,
+    DEFAULT_SERVER_PATH,
+    DEFAULT_PROCESSED_TAXI_PATH,
+)
 from prediction.simple_predictor import SimpleTrajectoryPredictor
 from algorithms.dqn import run_dqn_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
@@ -33,10 +38,14 @@ SPLIT_SEED = 42
 ACTIVE_USERS_LIMIT = 100
 MIN_VEHICLE_POINTS = 100
 
+# 若存在则直接读清洗结果 CSV，避免每次从原始 CSV 全量清洗（首次请运行 ``python -m core.data_loader --export``）
+
 # 权重保存路径
 CHECKPOINT_DIR = "checkpoints"
 SAC_CHECKPOINT_PROACTIVE = "checkpoints/sac_proactive.pth"
 SAC_CHECKPOINT_REACTIVE = "checkpoints/sac_reactive.pth"
+DQN_CHECKPOINT_PROACTIVE = "checkpoints/dqn_proactive.pth"
+DQN_CHECKPOINT_REACTIVE = "checkpoints/dqn_reactive.pth"
 
 PROACTIVE = True
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
@@ -54,6 +63,16 @@ def _split_train_test_taxis(df_active):
     train_df = df_active[df_active["taxi_id"].isin(train_ids)].reset_index(drop=True)
     test_df = df_active[df_active["taxi_id"].isin(test_ids)].reset_index(drop=True)
     return train_df, test_df, train_ids, test_ids
+
+
+def _avg_total_cost_ms(res):
+    """单次触发决策的平均总代价（接入 + 通信 + 迁移），单位 ms。"""
+    lat = float(res.get("total_access_latency") or 0)
+    comm = float(res.get("total_communication_cost") or 0)
+    mig = float(res.get("total_migration_cost") or 0)
+    total_ms = lat + comm + mig
+    dc = int(res.get("decision_count") or 0)
+    return (total_ms / dc) if dc > 0 else 0.0
 
 
 def _data_protocol_line(train_df, test_df, phase_label):
@@ -147,28 +166,34 @@ def generate_experiment_report(
 
 ## 一、Proactive 模式结果
 
-| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Score |
-|-----------|------------|------------|---------------------|------------------|-------|
+| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Avg Total Cost (ms) |
+|-----------|------------|------------|---------------------|------------------|---------------------|
 """
 
     for name, res in proactive_results.items():
         latency = res.get('avg_decision_time_ms', 0)
-        score = res['total_migrations'] + 0.5 * res['total_violations']
-        report += f"| {name} | {res['total_migrations']} | {res['total_violations']} | {res.get('proactive_decisions', 0)} | {latency:.2f} | {score:.1f} |\n"
+        avg_cost = _avg_total_cost_ms(res)
+        report += (
+            f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
+            f"{res.get('proactive_decisions', 0)} | {latency:.2f} | {avg_cost:.2f} |\n"
+        )
 
     report += """
 ---
 
 ## 二、Reactive 模式结果
 
-| Algorithm | Migrations | Violations | Avg Latency (ms) | Score |
-|-----------|------------|------------|------------------|-------|
+| Algorithm | Migrations | Violations | Avg Latency (ms) | Avg Total Cost (ms) |
+|-----------|------------|------------|------------------|---------------------|
 """
 
     for name, res in reactive_results.items():
         latency = res.get('avg_decision_time_ms', 0)
-        score = res['total_migrations'] + 0.5 * res['total_violations']
-        report += f"| {name} | {res['total_migrations']} | {res['total_violations']} | {latency:.2f} | {score:.1f} |\n"
+        avg_cost = _avg_total_cost_ms(res)
+        report += (
+            f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
+            f"{latency:.2f} | {avg_cost:.2f} |\n"
+        )
 
     report += """
 ---
@@ -199,11 +224,17 @@ def generate_experiment_report(
 
 def _metrics_row(name, res, proactive_table=False):
     latency = res.get('avg_decision_time_ms', 0)
-    score = res['total_migrations'] + 0.5 * res['total_violations']
+    avg_cost = _avg_total_cost_ms(res)
     pro_d = res.get('proactive_decisions', 0)
     if proactive_table:
-        return f"| {name} | {res['total_migrations']} | {res['total_violations']} | {pro_d} | {latency:.2f} | {score:.1f} |\n"
-    return f"| {name} | {res['total_migrations']} | {res['total_violations']} | {latency:.2f} | {score:.1f} |\n"
+        return (
+            f"| {name} | {res['total_migrations']} | {res['total_violations']} | {pro_d} | "
+            f"{latency:.2f} | {avg_cost:.2f} |\n"
+        )
+    return (
+        f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
+        f"{latency:.2f} | {avg_cost:.2f} |\n"
+    )
 
 
 def generate_full_pipeline_report(
@@ -223,13 +254,13 @@ def generate_full_pipeline_report(
 
     def table_pro(pro, rea, title):
         s = f"### {title}\n\n"
-        s += "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Score |\n"
-        s += "|-----------|------------|------------|---------------------|------------------|-------|\n"
+        s += "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Avg Total Cost (ms) |\n"
+        s += "|-----------|------------|------------|---------------------|------------------|---------------------|\n"
         for name in ["SA", "DQN", "Hybrid SAC"]:
             if name in pro:
                 s += _metrics_row(name, pro[name], proactive_table=True)
-        s += "\n| Algorithm | Migrations | Violations | Avg Latency (ms) | Score |\n"
-        s += "|-----------|------------|------------|------------------|-------|\n"
+        s += "\n| Algorithm | Migrations | Violations | Avg Latency (ms) | Avg Total Cost (ms) |\n"
+        s += "|-----------|------------|------------|------------------|---------------------|\n"
         for name in ["SA", "DQN", "Hybrid SAC"]:
             if name in rea:
                 s += _metrics_row(name, rea[name], proactive_table=False)
@@ -272,7 +303,7 @@ def generate_full_pipeline_report(
 
 ## 二、测试段推理结果（test_df）
 
-*Hybrid SAC 使用训练段刚写入的 checkpoint；DQN/SA 无磁盘权重，在测试段上按既有脚本逻辑运行。*
+*Hybrid SAC 与 DQN 在测试段加载训练段保存的 checkpoint；SA 无磁盘权重，在测试段按既有脚本逻辑运行。*
 
 {table_pro(infer_proactive, infer_reactive, "Proactive（上表）/ Reactive（下表）")}
 
@@ -321,6 +352,7 @@ def run_training_phase(servers_df):
         sample_fraction=1.0,
         active_users_limit=ACTIVE_USERS_LIMIT,
         min_vehicle_points=MIN_VEHICLE_POINTS,
+        processed_csv=DEFAULT_PROCESSED_TAXI_PATH,
     )
     train_df, test_df, _, _ = _split_train_test_taxis(df_active)
     print("\n[MODE] Training — Strategy B (train_df only)")
@@ -345,7 +377,8 @@ def run_training_phase(servers_df):
 
     t0 = time.time()
     proactive_results["DQN"] = run_dqn_microservice_fair(
-        train_df, servers_df, predictor=predictor, proactive=True
+        train_df, servers_df, predictor=predictor, proactive=True,
+        save_checkpoint_path=DQN_CHECKPOINT_PROACTIVE,
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
@@ -370,13 +403,14 @@ def run_training_phase(servers_df):
 
     t0 = time.time()
     reactive_results["DQN"] = run_dqn_microservice_fair(
-        train_df, servers_df, predictor=predictor, proactive=False
+        train_df, servers_df, predictor=predictor, proactive=False,
+        save_checkpoint_path=DQN_CHECKPOINT_REACTIVE,
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
     reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        train_df, servers_df, predictor=predictor, proactive=False, num_epochs=6,
+        train_df, servers_df, predictor=predictor, proactive=False, num_epochs=2,
         inference_mode=False,
         save_checkpoint_path=SAC_CHECKPOINT_REACTIVE,
     )
@@ -393,6 +427,7 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
             sample_fraction=1.0,
             active_users_limit=ACTIVE_USERS_LIMIT,
             min_vehicle_points=MIN_VEHICLE_POINTS,
+            processed_csv=DEFAULT_PROCESSED_TAXI_PATH,
         )
         train_df, test_df, _, _ = _split_train_test_taxis(df_active)
         print("\n[MODE] Inference — loaded df_active + split (standalone inference)")
@@ -421,7 +456,9 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
 
     t0 = time.time()
     proactive_results["DQN"] = run_dqn_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=True
+        df, servers_df, predictor=predictor, proactive=True,
+        inference_mode=True,
+        checkpoint_path=DQN_CHECKPOINT_PROACTIVE,
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
@@ -446,7 +483,9 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
 
     t0 = time.time()
     reactive_results["DQN"] = run_dqn_microservice_fair(
-        df, servers_df, predictor=predictor, proactive=False
+        df, servers_df, predictor=predictor, proactive=False,
+        inference_mode=True,
+        checkpoint_path=DQN_CHECKPOINT_REACTIVE,
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 

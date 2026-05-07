@@ -23,11 +23,23 @@ from prediction.simple_predictor import build_predict_future_time_kwargs, touch_
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
 
 
+class MicroserviceSAReturn(tuple):
+    """
+    2-tuple (best_assignments, best_cost) 解包与原生元组一致；
+    附加 ``sa_stats`` 字典：含接受率、劣解接受率及原始计数（不破坏现有 ``a, b = ...`` 调用）。
+    """
+
+    def __new__(cls, best_assignments, best_cost, sa_stats):
+        obj = tuple.__new__(cls, (best_assignments, best_cost))
+        obj.sa_stats = sa_stats
+        return obj
+
+
 def microservice_simulated_annealing(
     taxi_id, dag_info, current_assignments, candidates,
     user_location, servers_info,
     previous_assignments=None,
-    temp=100.0, cooling_rate=0.95, max_iter=30,
+    temp=3000.0, cooling_rate=0.97, max_iter=50,
     predicted_locations=None,
     trigger_type=TRIGGER_REACTIVE,
 ):
@@ -38,7 +50,11 @@ def microservice_simulated_annealing(
     future topology violation penalty so that SA also optimises for predicted
     user movement.
 
-    Returns (best_assignments, best_cost).
+    Returns
+    -------
+    MicroserviceSAReturn
+        可像 ``(best_assignments, best_cost)`` 一样解包为两项；
+        统计指标见 ``result.sa_stats``（含 ``sa_accept_rate``、``sa_worse_accept_rate`` 等）。
     """
     if previous_assignments is None:
         previous_assignments = current_assignments
@@ -58,6 +74,10 @@ def microservice_simulated_annealing(
     best_sol = dict(current_sol)
     best_cost = current_cost
 
+    sa_accept_count = 0
+    sa_worse_accept_count = 0
+    sa_neighbor_count = 0
+
     for _iteration in range(max_iter):
         node = random.choice(all_nodes)
         old_server = current_sol[node]
@@ -67,6 +87,8 @@ def microservice_simulated_annealing(
             temp *= cooling_rate
             continue
         new_server = random.choice(other_servers)
+
+        sa_neighbor_count += 1
 
         neighbor_sol = dict(current_sol)
         neighbor_sol[node] = new_server
@@ -86,6 +108,9 @@ def microservice_simulated_annealing(
             accept = random.random() < math.exp(-delta / temp) if temp > 1e-10 else False
 
         if accept:
+            sa_accept_count += 1
+            if delta > 0:
+                sa_worse_accept_count += 1
             current_sol = neighbor_sol
             current_cost = neighbor_cost
             if current_cost < best_cost:
@@ -94,7 +119,22 @@ def microservice_simulated_annealing(
 
         temp *= cooling_rate
 
-    return best_sol, best_cost
+    sa_accept_rate = (
+        sa_accept_count / sa_neighbor_count if sa_neighbor_count > 0 else 0.0
+    )
+    sa_worse_accept_rate = (
+        sa_worse_accept_count / sa_neighbor_count if sa_neighbor_count > 0 else 0.0
+    )
+
+    sa_stats = {
+        "sa_accept_count": sa_accept_count,
+        "sa_worse_accept_count": sa_worse_accept_count,
+        "sa_neighbor_count": sa_neighbor_count,
+        "sa_accept_rate": sa_accept_rate,
+        "sa_worse_accept_rate": sa_worse_accept_rate,
+    }
+
+    return MicroserviceSAReturn(best_sol, best_cost, sa_stats)
 
 
 def run_sa_microservice_fair(

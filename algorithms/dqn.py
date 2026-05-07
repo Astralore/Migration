@@ -4,6 +4,8 @@ Supports both reactive and proactive (trajectory-prediction) modes.
 Implements asymmetric migration cost based on trigger type.
 """
 
+import os
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,7 +20,7 @@ from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
-from core.context import get_trigger_type, TRIGGER_PROACTIVE
+from core.context import get_trigger_type, TRIGGER_PROACTIVE, check_sla_violation
 from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, initialize_dag_assignment
 from core.reward import build_servers_info, calculate_microservice_reward
 from core.state_builder import build_node_state
@@ -68,7 +70,34 @@ def optimize_model(memory, policy_net, target_net, optimizer, device,
     return loss.item()
 
 
-def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
+def _save_dqn_checkpoint(path, q_net, target_net):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "q_network": q_net.state_dict(),
+            "target_network": target_net.state_dict(),
+        },
+        path,
+    )
+    print(f"  [DQN SAVE] Weights saved to {path}")
+
+
+def _load_dqn_checkpoint(path, q_net, target_net, device):
+    ckpt = torch.load(path, map_location=device)
+    q_net.load_state_dict(ckpt["q_network"])
+    target_net.load_state_dict(ckpt["target_network"])
+    print(f"  [DQN LOAD] Weights loaded from {path}")
+
+
+def run_dqn_microservice_fair(
+    df,
+    servers_df,
+    predictor=None,
+    proactive=False,
+    inference_mode=False,
+    checkpoint_path=None,
+    save_checkpoint_path=None,
+):
     """
     DQN microservice DAG collaborative migration main simulation.
 
@@ -109,7 +138,13 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
     optimizer = optim.Adam(q_network.parameters(), lr=0.001)
 
     memory = deque(maxlen=5000)
-    epsilon = 0.3
+    if inference_mode:
+        if checkpoint_path is None:
+            raise ValueError("inference_mode=True 但未提供 checkpoint_path")
+        _load_dqn_checkpoint(checkpoint_path, q_network, target_network, device)
+        epsilon = 0.0
+    else:
+        epsilon = 0.3
     epsilon_decay = 0.995
     epsilon_min = 0.01
     batch_size = 32
@@ -119,6 +154,8 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
     loss_history = []
     reward_history = []
     epsilon_history = []
+
+    total_decision_time = 0.0
 
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
@@ -162,8 +199,8 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
                 current_lat, current_lon, gw_lat, gw_lon
             )
 
-            # --- SCORING: Real violation count (independent of trigger) ---
-            if gateway_dist > 15.0:
+            # --- SCORING: 与 context.check_sla_violation 一致的 SLA 计数 ---
+            if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
                 total_violations += 1
 
             # --- Trajectory prediction (lon,lat) -> (lat,lon) ---
@@ -196,6 +233,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
             sorted_nodes = topological_sort(dag_info)
             node_transitions = []
 
+            t_decision_start = time.perf_counter()
             for ms_node in sorted_nodes:
                 state = build_node_state(
                     current_lat, current_lon, timestamp, gateway_dist,
@@ -226,6 +264,8 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
 
                 taxi_dag_assignments[taxi_id][ms_node] = new_server
                 node_transitions.append((state, action))
+
+            total_decision_time += time.perf_counter() - t_decision_start
 
             # Reward with asymmetric migration cost
             reward, details = calculate_microservice_reward(
@@ -261,18 +301,19 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
                     done = False
                 memory.append((s, a, step_reward, next_s, done))
 
-            loss_val = optimize_model(
-                memory, q_network, target_network, optimizer, device,
-                batch_size=batch_size, gamma=gamma_td,
-            )
-            if loss_val is not None:
-                loss_history.append(loss_val)
-                if epsilon > epsilon_min:
-                    epsilon *= epsilon_decay
+            if not inference_mode:
+                loss_val = optimize_model(
+                    memory, q_network, target_network, optimizer, device,
+                    batch_size=batch_size, gamma=gamma_td,
+                )
+                if loss_val is not None:
+                    loss_history.append(loss_val)
+                    if epsilon > epsilon_min:
+                        epsilon *= epsilon_decay
 
             epsilon_history.append(epsilon)
 
-            if decision_count % target_update_freq == 0:
+            if not inference_mode and decision_count % target_update_freq == 0:
                 target_network.load_state_dict(q_network.state_dict())
 
             touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
@@ -280,6 +321,12 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
         pbar.update(1)
     pbar.close()
 
+    if not inference_mode and save_checkpoint_path:
+        _save_dqn_checkpoint(save_checkpoint_path, q_network, target_network)
+
+    avg_ms = (
+        (total_decision_time / decision_count * 1000.0) if decision_count > 0 else 0.0
+    )
     return {
         'total_migrations': total_migrations,
         'total_violations': total_violations,
@@ -292,4 +339,7 @@ def run_dqn_microservice_fair(df, servers_df, predictor=None, proactive=False):
         'loss_history': loss_history,
         'reward_history': reward_history,
         'epsilon_history': epsilon_history,
+        'total_decision_time': total_decision_time,
+        'decision_count_for_latency': decision_count,
+        'avg_decision_time_ms': avg_ms,
     }

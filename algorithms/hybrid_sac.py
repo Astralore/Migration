@@ -20,6 +20,7 @@ Reference:
 - Christodoulou, "Soft Actor-Critic for Discrete Action Settings", 2019
 """
 
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -37,7 +38,12 @@ from typing import Optional
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
-from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE
+from core.context import (
+    get_trigger_type,
+    TRIGGER_PROACTIVE,
+    TRIGGER_REACTIVE,
+    check_sla_violation,
+)
 from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, initialize_dag_assignment
 from core.reward import build_servers_info, calculate_microservice_reward
 from core.state_builder import build_graph_state
@@ -51,6 +57,9 @@ ACTION_STAY = 0
 ACTION_FOLLOW_SA = 1
 ACTION_NEAREST = 2
 ACTION_DIM = 3
+
+# 设 HYBRID_SAC_DEBUG_STEPS=120 时，前 120 次动作采样会打印 logits / mask / action（训练探索期排障）。
+_hybrid_sac_dbg_action_remaining = int(os.environ.get("HYBRID_SAC_DEBUG_STEPS", "0") or "0")
 
 
 def build_microservice_action_mask(candidates, device: torch.device) -> torch.Tensor:
@@ -517,6 +526,24 @@ class SACDiscreteActor(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
+    def _forward_logits_core(
+        self,
+        node_embedding,
+        sa_prior,
+        action_mask: Optional[torch.Tensor] = None,
+    ):
+        """返回 (logits_raw, logits_masked, squeeze_output)。batch 维始终保留在 logits 中。"""
+        squeeze_output = False
+        if node_embedding.dim() == 1:
+            node_embedding = node_embedding.unsqueeze(0)
+            sa_prior = sa_prior.unsqueeze(0)
+            squeeze_output = True
+
+        state = torch.cat([node_embedding, sa_prior], dim=-1)
+        logits_raw = self.policy_net(state)
+        logits = apply_action_mask_to_logits(logits_raw, action_mask)
+        return logits_raw, logits, squeeze_output
+
     def forward(
         self,
         node_embedding,
@@ -527,16 +554,9 @@ class SACDiscreteActor(nn.Module):
         Softmax 前对 logits 应用 action_mask；非法 logits 置 -1e9；
         全非法行回退 FOLLOW_SA（command.md 阶段三）。
         """
-        if node_embedding.dim() == 1:
-            node_embedding = node_embedding.unsqueeze(0)
-            sa_prior = sa_prior.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
-        state = torch.cat([node_embedding, sa_prior], dim=-1)
-        logits_raw = self.policy_net(state)
-        logits = apply_action_mask_to_logits(logits_raw, action_mask)
+        _, logits, squeeze_output = self._forward_logits_core(
+            node_embedding, sa_prior, action_mask
+        )
 
         action_probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -553,10 +573,47 @@ class SACDiscreteActor(nn.Module):
         sa_prior,
         action_mask: Optional[torch.Tensor] = None,
     ):
-        action_probs, log_probs = self.forward(node_embedding, sa_prior, action_mask)
+        global _hybrid_sac_dbg_action_remaining
+        logits_raw, logits, squeeze_output = self._forward_logits_core(
+            node_embedding, sa_prior, action_mask
+        )
+
+        action_probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        if squeeze_output:
+            action_probs = action_probs.squeeze(0)
+            log_probs = log_probs.squeeze(0)
+
         dist = Categorical(probs=action_probs)
         action = dist.sample()
-        return action.item(), log_probs[action]
+        action_int = action.item()
+
+        if _hybrid_sac_dbg_action_remaining > 0:
+            _hybrid_sac_dbg_action_remaining -= 1
+            with torch.no_grad():
+                row0 = logits[0] if logits.dim() == 2 else logits
+                row_raw = logits_raw[0] if logits_raw.dim() == 2 else logits_raw
+                m = action_mask
+                if m is None:
+                    m_str = "None(all True)"
+                else:
+                    mv = m if m.dim() == 1 else m[0]
+                    m_str = str(mv.detach().cpu().tolist())
+                print(
+                    "[HYBRID_SAC_DBG action] logits_raw=",
+                    row_raw.detach().cpu().numpy(),
+                    " logits_masked=",
+                    row0.detach().cpu().numpy(),
+                    " softmax_probs=",
+                    action_probs.detach().cpu().numpy(),
+                    " mask=",
+                    m_str,
+                    " sampled_action=",
+                    action_int,
+                    sep="",
+                )
+
+        return action_int, log_probs[action]
 
     def get_action_deterministic(
         self,
@@ -564,8 +621,20 @@ class SACDiscreteActor(nn.Module):
         sa_prior,
         action_mask: Optional[torch.Tensor] = None,
     ):
-        action_probs, _ = self.forward(node_embedding, sa_prior, action_mask)
-        return int(action_probs.argmax().item())
+        # 对 masked logits 取 argmax，避免「均匀 softmax 时 argmax(probs) 恒为 0」的 PyTorch 行为导致评估阶段永远 STAY。
+        _, logits, squeeze_output = self._forward_logits_core(
+            node_embedding, sa_prior, action_mask
+        )
+        tie_break = torch.tensor(
+            [0.0, 1e-5, 0.5e-5], device=logits.device, dtype=logits.dtype
+        )
+        if logits.dim() == 2:
+            tie_break = tie_break.unsqueeze(0).expand_as(logits)
+        scores = logits + tie_break
+        idx = scores.argmax(dim=-1)
+        if squeeze_output:
+            idx = idx.squeeze(0)
+        return int(idx.item())
 
     def sample_action_with_mask(self, node_embedding, sa_prior, action_mask=None):
         """与 sample_action 一致。"""
@@ -781,7 +850,9 @@ def optimize_sac(
     Parameters
     ----------
     memory : deque
-        Replay buffer containing (graph_state, node_idx, action, reward, next_graph_state, done)
+        Replay buffer containing (graph_state, node_idx, action, reward, next_graph_state, done, mask).
+        Transitions use DAG-local ``done`` (True only on last node): sparse reward on terminal step,
+        and bootstrap discount controlled via ``effective_gamma`` (1.0 inside DAG, γ at horizon).
     gat_network : TriggerAwareGAT
         Graph attention network for embedding computation
     actor : SACDiscreteActor
@@ -1150,7 +1221,7 @@ def run_hybrid_sac_microservice(
     # v3.3: Moderate exploration temperature for Soft BC
     # With gradual probability decay, we can use a balanced alpha
     # that allows entropy-driven exploration when BC probability is low
-    alpha_init = 0.05
+    alpha_init = 0.001  # C2.1：与缩放 reward 同量级，抑制过高熵导致的随机策略
     gamma = 0.95
     tau = 0.005
     batch_size = 32
@@ -1241,12 +1312,18 @@ def run_hybrid_sac_microservice(
     
     decision_count = 0
     global_step = 0  # Tracks total steps across all epochs
+    # C3.2：Proactive 防抖——taxi_id -> 达到该仿真步后才允许再次 Proactive（unlock_step）
+    migration_lock = {}
+    sim_step = 0
     
     for epoch in range(num_epochs):
+        is_eval_epoch = (epoch == num_epochs - 1)
+        # A1: 最后一轮 eval 前清空 DAG / 轨迹缓存，避免训练期状态泄漏到评测，从干净 nearest 起步
+        if is_eval_epoch:
+            taxi_dag_assignments.clear()
+            taxi_dag_type.clear()
         taxi_last = {}
         print(f"\n  === Epoch {epoch + 1}/{num_epochs} ===")
-        
-        is_eval_epoch = (epoch == num_epochs - 1)
         
         if is_eval_epoch:
             print("  [EVAL] Pure evaluation epoch — reset reported metrics; "
@@ -1285,6 +1362,7 @@ def run_hybrid_sac_microservice(
         )
         
         for timestamp in timestamps:
+            sim_step += 1
             current_rows = df_grouped.get_group(timestamp)
             
             for _, row in current_rows.iterrows():
@@ -1319,7 +1397,7 @@ def run_hybrid_sac_microservice(
                 gw_lat, gw_lon = servers_info[gateway_server_id]
                 gateway_dist = haversine_distance(current_lat, current_lon, gw_lat, gw_lon)
                 
-                if gateway_dist > 15.0:
+                if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
                     total_violations += 1
                 
                 # -------------------------------------------------------------
@@ -1334,12 +1412,16 @@ def run_hybrid_sac_microservice(
                     _debug_predictions_made += 1
                 
                 # -------------------------------------------------------------
-                # Get trigger type
+                # Get trigger type（C3.2：锁定期内关闭 Proactive，Reactive 仍可走）
                 # -------------------------------------------------------------
+                proactive_gate = use_proactive and (
+                    taxi_id not in migration_lock
+                    or sim_step >= migration_lock[taxi_id]
+                )
                 trigger_type = get_trigger_type(
                     current_lat, current_lon, gw_lat, gw_lon,
                     predicted_locations=predicted_locations,
-                    proactive_enabled=use_proactive,
+                    proactive_enabled=proactive_gate,
                 )
                 
                 if trigger_type is None:
@@ -1585,6 +1667,9 @@ def run_hybrid_sac_microservice(
                     # -------------------------------------------------------------
                     soft_update(target_critic, critic, tau)
 
+                if trigger_type == TRIGGER_PROACTIVE:
+                    migration_lock[taxi_id] = sim_step + 2
+
                 touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
             
             pbar.update(1)
@@ -1728,8 +1813,11 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
     timestamps = sorted(df['date_time'].unique())
     df_grouped = df.groupby('date_time')
     taxi_last = {}
+    migration_lock = {}
+    sim_step = 0
 
     for timestamp in timestamps:
+        sim_step += 1
         current_rows = df_grouped.get_group(timestamp)
         
         for _, row in current_rows.iterrows():
@@ -1758,7 +1846,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
             gw_lat, gw_lon = servers_info[gateway_server_id]
             gateway_dist = haversine_distance(current_lat, current_lon, gw_lat, gw_lon)
             
-            if gateway_dist > 15.0:
+            if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
                 total_violations += 1
             
             predicted_locations = None
@@ -1768,10 +1856,13 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 )
                 predicted_locations = [(lat, lon) for lon, lat in raw]
             
+            proactive_gate = use_proactive and (
+                taxi_id not in migration_lock or sim_step >= migration_lock[taxi_id]
+            )
             trigger_type = get_trigger_type(
                 current_lat, current_lon, gw_lat, gw_lon,
                 predicted_locations=predicted_locations,
-                proactive_enabled=use_proactive,
+                proactive_enabled=proactive_gate,
             )
             
             if trigger_type is None:
@@ -1844,6 +1935,8 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 trigger_type=trigger_type,
             )
             total_reward_sum += reward
+            if trigger_type == "Proactive":
+                migration_lock[taxi_id] = sim_step + 2
             
             nodes_migrated = sum(
                 1 for n in sorted_nodes

@@ -3,6 +3,8 @@ Reward calculation for microservice DAG placement (ms 量纲 total_cost_ms).
 对齐 command.md 阶段二：JIT 迁移、tearing、comm、future、SLA 跳变与截断。
 """
 
+import os
+
 from core.geo import haversine_distance
 from core.dag_utils import get_entry_nodes
 from core.context import (
@@ -27,9 +29,15 @@ EDGE_BACKHAUL_MBPS = 1000.0
 FUTURE_DECAY = 0.9
 FUTURE_DIST_THRESHOLD = 15.0
 SLA_PENALTY_MS = 5000.0
-REWARD_CLIP_MIN = -10000.0
+# C2：缩放回报下界（reward = max(-total_cost_ms/1000, REWARD_CLIP_MIN)）
+REWARD_CLIP_MIN = -10.0
+MB_TO_MBIT = 8.0
+BASE_MIGRATION_OVERHEAD_MS = 200.0
 # Reactive 下迁移段额外系数（原 gamma 不对称语义的简化承接）
 REACTIVE_MIGRATION_MULT = 1.5
+
+# 与 HYBRID_SAC_DEBUG_STEPS 对齐：前 N 次 reward 计算打印 total_cost 分解（排障迁移惩罚 vs SLA）。
+_reward_dbg_remaining = int(os.environ.get("HYBRID_SAC_DEBUG_STEPS", "0") or "0")
 
 # 与 context 单一真源（reward 内仍用此名便于阅读）
 SLA_DISTANCE_THRESHOLD = DISTANCE_THRESHOLD_KM
@@ -61,7 +69,7 @@ def calculate_microservice_reward(
     trigger_type=TRIGGER_REACTIVE,
 ):
     """
-    Returns (reward, details). reward = max(-total_cost_ms, REWARD_CLIP_MIN).
+    Returns (reward, details). reward = max(-total_cost_ms / 1000.0, REWARD_CLIP_MIN)；details["total_cost_ms"] 仍为真实 ms。
     details 保留旧键名，值为 ms 或兼容字段，降低调用方断裂风险。
     """
     user_lat, user_lon = user_location
@@ -99,7 +107,11 @@ def calculate_microservice_reward(
         if current_assignments[node] != previous_assignments[node]:
             image_mb = float(node_props["image_mb"])
             state_mb = float(node_props["state_mb"])
-            delta_ms = ((image_mb + state_mb) / effective_bandwidth) * 1000.0
+            # C1：字节→比特 ×8；带宽按 Mbps；每迁移节点加容器启动底噪（ms）
+            delta_ms = (
+                ((image_mb + state_mb) * MB_TO_MBIT / effective_bandwidth) * 1000.0
+                + BASE_MIGRATION_OVERHEAD_MS
+            )
             if trigger_type == TRIGGER_REACTIVE:
                 delta_ms *= REACTIVE_MIGRATION_MULT
             migration_delay_ms += delta_ms
@@ -173,7 +185,28 @@ def calculate_microservice_reward(
         + sla_penalty_ms
     )
 
-    reward = max(-total_cost_ms, REWARD_CLIP_MIN)
+    reward = max(-total_cost_ms / 1000.0, REWARD_CLIP_MIN)
+
+    global _reward_dbg_remaining
+    if _reward_dbg_remaining > 0:
+        _reward_dbg_remaining -= 1
+        print(
+            "[HYBRID_SAC_DBG reward] total_cost_ms=",
+            total_cost_ms,
+            " migration_delay_ms=",
+            migration_delay_ms,
+            " tearing_delay_ms=",
+            tearing_delay_ms,
+            " sla_penalty_ms=",
+            sla_penalty_ms,
+            " access_latency_ms=",
+            access_latency_ms,
+            " reward(clipped)=",
+            reward,
+            " REWARD_CLIP_MIN=",
+            REWARD_CLIP_MIN,
+            sep="",
+        )
 
     details = {
         "access_latency": access_latency_ms,

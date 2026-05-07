@@ -1,4 +1,5 @@
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -8,8 +9,15 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 DEFAULT_TAXI_PATH = os.path.join(DATA_DIR, "taxi_with_health_info.csv")
 DEFAULT_SERVER_PATH = os.path.join(DATA_DIR, "edge_server_locations.csv")
 
+# 与论文主协议一致：清洗 + Top100 + min100 + episode；生成后供全项目直接读取，避免每次全量清洗
+PROCESSED_DATA_DIR = os.path.join(DATA_DIR, "processed")
+DEFAULT_PROCESSED_TAXI_PATH = os.path.join(
+    PROCESSED_DATA_DIR,
+    "taxi_cleaned_active100_min100_eps2h.csv",
+)
 
 CORE_COLUMNS = ["taxi_id", "date_time", "latitude", "longitude"]
+PROCESSED_REQUIRED_COLUMNS = CORE_COLUMNS + ["episode_id"]
 
 # Earth radius (km) for Haversine
 _EARTH_RADIUS_KM = 6371.0088
@@ -92,6 +100,69 @@ def _assign_episode_ids(df, gap_dt_hours=2.0):
     return out.sort_values(["taxi_id", "date_time"]).reset_index(drop=True)
 
 
+def _load_from_processed_csv(processed_path, start_index, end_index, chunk_size):
+    """Read pre-built cleaned CSV (same schema as pipeline output)."""
+    print(f"Loading pre-processed corpus from {processed_path} ...")
+    df = pd.read_csv(processed_path)
+    missing = [c for c in PROCESSED_REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Processed file missing columns {missing}: {processed_path}")
+    df = df[PROCESSED_REQUIRED_COLUMNS].copy()
+    df["date_time"] = pd.to_datetime(df["date_time"])
+    df = df.sort_values(["taxi_id", "date_time"]).reset_index(drop=True)
+    df["episode_id"] = df["episode_id"].astype(np.int64)
+
+    if start_index is not None and end_index is not None:
+        df = df.iloc[start_index:end_index].reset_index(drop=True)
+        print(f"  [legacy] Sliced data: [{start_index}:{end_index}], {len(df):,} records")
+
+    if chunk_size is not None and chunk_size > 0:
+        df = df.head(chunk_size)
+        print(f"  Truncated to {chunk_size} rows.")
+
+    print(
+        f"  [processed] rows={len(df):,}, taxis={df['taxi_id'].nunique():,} "
+        f"(skipped raw cleaning pipeline)"
+    )
+    return df
+
+
+def export_cleaned_corpus(
+    out_path=None,
+    file_path=None,
+    sample_fraction=1.0,
+    active_users_limit=100,
+    min_vehicle_points=100,
+    v_max_kmh=200.0,
+    gap_dt_hours=2.0,
+    max_jump_clean_rounds=50,
+):
+    """
+    Run full cleaning from raw CSV and write to ``out_path`` (default: DEFAULT_PROCESSED_TAXI_PATH).
+
+    Does not read ``processed_csv`` shortcut — always rebuilds from raw for a reproducible export.
+    """
+    if out_path is None:
+        out_path = DEFAULT_PROCESSED_TAXI_PATH
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    df = load_data(
+        file_path=file_path,
+        processed_csv=False,
+        sample_fraction=sample_fraction,
+        chunk_size=None,
+        start_index=None,
+        end_index=None,
+        active_users_limit=active_users_limit,
+        min_vehicle_points=min_vehicle_points,
+        v_max_kmh=v_max_kmh,
+        gap_dt_hours=gap_dt_hours,
+        max_jump_clean_rounds=max_jump_clean_rounds,
+    )
+    df.to_csv(out_path, index=False)
+    print(f"  [export] Wrote {len(df):,} rows to {out_path}")
+    return out_path
+
+
 def load_data(
     file_path=None,
     sample_fraction=1.0,
@@ -103,35 +174,24 @@ def load_data(
     v_max_kmh=200.0,
     gap_dt_hours=2.0,
     max_jump_clean_rounds=50,
+    processed_csv=None,
 ):
     """
     Load taxi trajectory CSV, keeping only physical-movement columns.
 
-    Phase-1 pipeline (command.md): sort → dropna → 同车时间去重 → 向量化速度毛刺清洗
-    (v > v_max_kmh) → 剔除点数过少车辆 → Top‑N 活跃车 → episode_id（合法断层）→
-    可选 legacy 行切片 → 可选 chunk_size。
+    If ``processed_csv`` is a path to an existing CSV built by this pipeline (see
+    ``export_cleaned_corpus``), load it directly and **skip** dedup/jump/Top‑N work.
 
-    Parameters
-    ----------
-    file_path : str, optional
-        Path to CSV file. Defaults to DEFAULT_TAXI_PATH.
-    sample_fraction : float, optional
-        Fraction of taxis to sample (0.0-1.0). Default 1.0 (all taxis). Applied before sorting.
-    chunk_size : int, optional
-        Truncate to first N rows of the **final** result (dev only).
-    start_index, end_index : int, optional
-        Legacy: applied **after** active_users_limit / min_vehicle_points, on the final DataFrame.
-    active_users_limit : int, optional
-        Keep only the top-N taxis by row count after prior filters. ``None`` = no limit.
-    min_vehicle_points : int, optional
-        Drop taxis with fewer than this many rows after jump cleaning. ``None`` = no filter.
-    v_max_kmh : float
-        Instantaneous speed threshold (km/h) for jump removal; default 200.
-    gap_dt_hours : float
-        Time gap (hours) after which ``episode_id`` increments; default 2.
-    max_jump_clean_rounds : int
-        Max iterations for jump removal until stable.
+    Pass ``processed_csv=False`` to force the raw pipeline (used by ``export_cleaned_corpus``).
+
+    Phase-1 pipeline (raw): sort → dropna → 同车时间去重 → 向量化速度毛刺清洗
+    (v > v_max_kmh) → 剔除点数过少车辆 → Top‑N 活跃车 → episode_id → 可选 legacy 行切片 → 可选 chunk_size。
     """
+    if processed_csv is not False and processed_csv is not None:
+        proc = os.path.abspath(processed_csv)
+        if os.path.isfile(proc):
+            return _load_from_processed_csv(proc, start_index, end_index, chunk_size)
+
     if file_path is None:
         file_path = DEFAULT_TAXI_PATH
     print(f"Loading data from {file_path} ...")
@@ -182,7 +242,6 @@ def load_data(
             f"rows {n_before_min:,} -> {len(df):,}"
         )
     else:
-        n_low_taxis = 0
         print("  min_vehicle_points: disabled (None)")
 
     n_before_topn = len(df)
@@ -222,19 +281,25 @@ def load_data(
 
 
 if __name__ == "__main__":
-    print("=== data_loader.py local validation (command.md phase 1) ===\n")
-    out = load_data(
-        None,
-        sample_fraction=1.0,
-        chunk_size=None,
-        start_index=None,
-        end_index=None,
-        active_users_limit=100,
-        min_vehicle_points=100,
-        v_max_kmh=200.0,
-        gap_dt_hours=2.0,
-    )
-    print("\n--- Returned DataFrame head (5 rows) ---")
-    print(out.head(5).to_string())
-    print("\nColumns:", list(out.columns))
-    print("Done.")
+    if len(sys.argv) > 1 and sys.argv[1] == "--export":
+        print("=== Export cleaned corpus to data/processed/ ===\n")
+        export_cleaned_corpus()
+        print("Done.")
+    else:
+        print("=== data_loader.py local validation (command.md phase 1) ===\n")
+        out = load_data(
+            None,
+            sample_fraction=1.0,
+            chunk_size=None,
+            start_index=None,
+            end_index=None,
+            active_users_limit=100,
+            min_vehicle_points=100,
+            v_max_kmh=200.0,
+            gap_dt_hours=2.0,
+            processed_csv=False,
+        )
+        print("\n--- Returned DataFrame head (5 rows) ---")
+        print(out.head(5).to_string())
+        print("\nColumns:", list(out.columns))
+        print("Done.")
