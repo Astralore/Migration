@@ -51,13 +51,36 @@ def build_predict_future_time_kwargs(taxi_last, taxi_id, row, current_lon, curre
     out["prev_lon"] = plon
     out["prev_lat"] = plat
     out["prev_time"] = pt
+    out["delta_t_prev_sec"] = dt
+    out["delta_t_future_sec"] = dt
+    out["forecast_step_dt_sec"] = dt
     return out
 
 
 class SimpleTrajectoryPredictor:
-    def __init__(self, forecast_horizon=3):
+    def __init__(self, forecast_horizon=3, local_velocity_alpha=0.85, max_local_dt_sec=300.0):
         self.forecast_horizon = forecast_horizon
+        self.local_velocity_alpha = float(local_velocity_alpha)
+        self.max_local_dt_sec = float(max_local_dt_sec)
         self.velocity_factors = {}
+        self.prediction_stats = {
+            "local_velocity_used": 0,
+            "fusion_used": 0,
+            "historical_fallback_used": 0,
+            "stationary_fallback_used": 0,
+            "dt_rejected": 0,
+        }
+
+    def reset_stats(self):
+        for key in self.prediction_stats:
+            self.prediction_stats[key] = 0
+
+    def get_stats(self):
+        return dict(self.prediction_stats)
+
+    def _record_stat(self, key):
+        if key in self.prediction_stats:
+            self.prediction_stats[key] += 1
 
     def fit(self, df):
         print("Fitting trajectory predictor...")
@@ -90,27 +113,21 @@ class SimpleTrajectoryPredictor:
         """
         Returns list of (lon, lat) for each forecast step.
 
-        Known ``taxi_id``: legacy per-step mean (dx, dy) in degree space (unchanged).
+        Local velocity is preferred for both known and unseen taxis when a recent
+        same-episode GPS interval is available and not too stale. For known
+        taxis, local motion is fused with historical mean per-step displacement.
 
-        Unknown ``taxi_id``: time-normalized local kinematics when prev_* and dt_prev valid:
-        v_lon = (lon - prev_lon) / dt_prev, v_lat = (lat - prev_lat) / dt_prev (degrees/sec);
-        each step: lon += v_lon * dt_future, lat += v_lat * dt_future.
-        If ``delta_t_future_sec`` is None, uses dt_prev for each step.
+        Fallback order:
+        1. valid local velocity + historical mean -> EMA fusion
+        2. valid local velocity only -> local kinematics
+        3. historical mean only -> historical per-step displacement
+        4. neither -> stationary prediction
         """
         if steps is None:
             steps = self.forecast_horizon
 
-        if taxi_id in self.velocity_factors:
-            dx, dy = self.velocity_factors[taxi_id]
-            future = []
-            lon, lat = current_lon, current_lat
-            for _ in range(steps):
-                lon += dx
-                lat += dy
-                future.append((lon, lat))
-            return future
+        historical_step = self.velocity_factors.get(taxi_id)
 
-        # --- Unseen taxi: local kinematic (time-normalized) ---
         dt_prev = None
         if delta_t_prev_sec is not None and float(delta_t_prev_sec) > 0:
             dt_prev = float(delta_t_prev_sec)
@@ -124,35 +141,69 @@ class SimpleTrajectoryPredictor:
                 pd.Timestamp(current_time) - pd.Timestamp(prev_time)
             ).total_seconds()
 
-        if (
-            dt_prev is None
-            or dt_prev <= 0
-            or prev_lon is None
-            or prev_lat is None
-        ):
-            return [(current_lon, current_lat)] * steps
-
-        v_lon = (float(current_lon) - float(prev_lon)) / dt_prev
-        v_lat = (float(current_lat) - float(prev_lat)) / dt_prev
-
         def _dt_for_step(k):
             if delta_t_future_sec is None:
-                return dt_prev
+                return dt_prev if dt_prev is not None and dt_prev > 0 else 1.0
             if isinstance(delta_t_future_sec, (int, float, np.integer, np.floating)):
                 return float(delta_t_future_sec)
             seq = list(delta_t_future_sec)
             if k < len(seq):
                 return float(seq[k])
-            return dt_prev
+            return dt_prev if dt_prev is not None and dt_prev > 0 else 1.0
+
+        local_valid = (
+            dt_prev is not None
+            and 0 < dt_prev <= self.max_local_dt_sec
+            and prev_lon is not None
+            and prev_lat is not None
+        )
+        if (
+            dt_prev is not None
+            and dt_prev > self.max_local_dt_sec
+            and prev_lon is not None
+            and prev_lat is not None
+        ):
+            self._record_stat("dt_rejected")
+
+        v_lon = v_lat = None
+        if local_valid:
+            v_lon = (float(current_lon) - float(prev_lon)) / dt_prev
+            v_lat = (float(current_lat) - float(prev_lat)) / dt_prev
+
+        if local_valid and historical_step is not None:
+            mode = "fusion"
+            self._record_stat("fusion_used")
+            self._record_stat("local_velocity_used")
+        elif local_valid:
+            mode = "local"
+            self._record_stat("local_velocity_used")
+        elif historical_step is not None:
+            mode = "historical"
+            self._record_stat("historical_fallback_used")
+        else:
+            mode = "stationary"
+            self._record_stat("stationary_fallback_used")
 
         lon, lat = float(current_lon), float(current_lat)
         out = []
         for k in range(steps):
             dtf = _dt_for_step(k)
             if dtf <= 0:
-                out.append((lon, lat))
-                continue
-            lon += v_lon * dtf
-            lat += v_lat * dtf
+                dtf = dt_prev if dt_prev is not None and dt_prev > 0 else 1.0
+
+            if mode == "fusion":
+                hist_dx, hist_dy = historical_step
+                local_step_lon = v_lon * dtf
+                local_step_lat = v_lat * dtf
+                alpha = self.local_velocity_alpha
+                lon += alpha * local_step_lon + (1.0 - alpha) * float(hist_dx)
+                lat += alpha * local_step_lat + (1.0 - alpha) * float(hist_dy)
+            elif mode == "local":
+                lon += v_lon * dtf
+                lat += v_lat * dtf
+            elif mode == "historical":
+                hist_dx, hist_dy = historical_step
+                lon += float(hist_dx)
+                lat += float(hist_dy)
             out.append((lon, lat))
         return out

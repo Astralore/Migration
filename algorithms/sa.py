@@ -15,9 +15,9 @@ from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
-from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE
+from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE, check_sla_violation
 from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment, topological_sort
-from core.reward import build_servers_info, calculate_microservice_reward
+from core.reward import build_servers_info, calculate_microservice_reward, estimate_dag_migration_time_s
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
@@ -174,6 +174,10 @@ def run_sa_microservice_fair(
     total_access_latency = 0.0
     total_communication_cost = 0.0
     total_migration_cost = 0.0
+    total_cost_ms_sum = 0.0
+    total_sla_penalty_ms = 0.0
+    total_tearing_penalty_ms = 0.0
+    total_future_penalty_ms = 0.0
     
     # 时延探针初始化
     total_decision_time = 0.0
@@ -226,7 +230,7 @@ def run_sa_microservice_fair(
             )
 
             # --- SCORING: Real violation count (independent of trigger) ---
-            if gateway_dist > 15.0:
+            if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
                 total_violations += 1
 
             # --- Trajectory prediction ---
@@ -242,6 +246,10 @@ def run_sa_microservice_fair(
                 current_lat, current_lon, gw_lat, gw_lon,
                 predicted_locations=predicted_locations,
                 proactive_enabled=use_proactive,
+                estimated_migration_time_s=estimate_dag_migration_time_s(
+                    dag_info, gateway_dist_km=gateway_dist, trigger_type=TRIGGER_PROACTIVE
+                ),
+                forecast_step_dt_sec=pf_kw.get("forecast_step_dt_sec"),
             )
 
             if trigger_type is None:
@@ -290,6 +298,10 @@ def run_sa_microservice_fair(
             total_access_latency += details['access_latency']
             total_communication_cost += details['communication_cost']
             total_migration_cost += details['migration_cost']
+            total_cost_ms_sum += details['total_cost_ms']
+            total_sla_penalty_ms += details.get('sla_penalty_ms', 0.0)
+            total_tearing_penalty_ms += details.get('tearing_penalty_ms', details.get('tearing_penalty', 0.0))
+            total_future_penalty_ms += details.get('future_penalty_ms', details.get('future_penalty', 0.0))
 
             # 与 Hybrid SAC 同口径：拓扑序节点集合上比对迁移数
             sorted_nodes = topological_sort(dag_info)
@@ -322,6 +334,10 @@ def run_sa_microservice_fair(
         'total_access_latency': total_access_latency,
         'total_communication_cost': total_communication_cost,
         'total_migration_cost': total_migration_cost,
+        'total_cost_ms_sum': total_cost_ms_sum,
+        'total_sla_penalty_ms': total_sla_penalty_ms,
+        'total_tearing_penalty_ms': total_tearing_penalty_ms,
+        'total_future_penalty_ms': total_future_penalty_ms,
         'reward_history': reward_history,
         # 时延信息
         'total_decision_time': total_decision_time,

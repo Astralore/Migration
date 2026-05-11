@@ -45,7 +45,7 @@ from core.context import (
     check_sla_violation,
 )
 from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, initialize_dag_assignment
-from core.reward import build_servers_info, calculate_microservice_reward
+from core.reward import build_servers_info, calculate_microservice_reward, estimate_dag_migration_time_s
 from core.state_builder import build_graph_state
 from algorithms.sa import microservice_simulated_annealing
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
@@ -60,6 +60,7 @@ ACTION_DIM = 3
 
 # 设 HYBRID_SAC_DEBUG_STEPS=120 时，前 120 次动作采样会打印 logits / mask / action（训练探索期排障）。
 _hybrid_sac_dbg_action_remaining = int(os.environ.get("HYBRID_SAC_DEBUG_STEPS", "0") or "0")
+_hybrid_sac_dbg_transition_remaining = int(os.environ.get("HYBRID_SAC_DEBUG_STEPS", "0") or "0")
 
 
 def build_microservice_action_mask(candidates, device: torch.device) -> torch.Tensor:
@@ -782,6 +783,7 @@ def optimize_sac(
     target_entropy=None,
     log_alpha=None,
     alpha_optimizer=None,
+    bc_loss_weight=1.0,
 ):
     """
     Discrete SAC Optimization Step.
@@ -886,6 +888,8 @@ def optimize_sac(
         'alpha': float (current temperature)
         'entropy': float (policy entropy)
     """
+    global _hybrid_sac_dbg_transition_remaining
+
     if len(memory) < batch_size:
         return None
     
@@ -896,6 +900,7 @@ def optimize_sac(
     actor_losses = []
     entropies = []
     alpha_losses = []
+    imitation_losses = []
     
     # Zero gradients
     gat_optimizer.zero_grad()
@@ -909,7 +914,26 @@ def optimize_sac(
     mask_all = torch.ones(ACTION_DIM, dtype=torch.bool, device=device)
 
     for transition in batch:
-        if len(transition) >= 7:
+        next_node_idx = None
+        has_bc_target = False
+        bc_target_action = ACTION_FOLLOW_SA
+        if len(transition) >= 10:
+            (
+                graph_state,
+                node_idx,
+                action,
+                reward,
+                next_graph_state,
+                done,
+                action_mask_stored,
+                next_node_idx,
+                has_bc_target,
+                bc_target_action,
+            ) = transition
+            cur_action_mask = torch.as_tensor(
+                action_mask_stored, device=device, dtype=torch.bool
+            )
+        elif len(transition) >= 7:
             graph_state, node_idx, action, reward, next_graph_state, done, action_mask_stored = transition
             cur_action_mask = torch.as_tensor(
                 action_mask_stored, device=device, dtype=torch.bool
@@ -945,8 +969,24 @@ def optimize_sac(
                 next_sa_prior = torch.FloatTensor(next_graph_state['sa_priors']).to(device)
                 
                 next_embeddings = gat_network(next_node_feat, next_adj, next_trigger)
-                next_node_emb = next_embeddings[node_idx]
-                next_node_sa_prior = next_sa_prior[node_idx]
+                bootstrap_node_idx = (
+                    int(next_node_idx)
+                    if next_node_idx is not None and int(next_node_idx) >= 0
+                    else int(node_idx)
+                )
+                if _hybrid_sac_dbg_transition_remaining > 0:
+                    _hybrid_sac_dbg_transition_remaining -= 1
+                    print(
+                        "[HYBRID_SAC_DBG transition] node_idx=",
+                        int(node_idx),
+                        " next_node_idx=",
+                        int(bootstrap_node_idx),
+                        " done=",
+                        bool(done),
+                        sep="",
+                    )
+                next_node_emb = next_embeddings[bootstrap_node_idx]
+                next_node_sa_prior = next_sa_prior[bootstrap_node_idx]
                 
                 # Get next action probabilities from current actor（下一状态无存储 mask 时用全合法）
                 next_action_probs, next_log_probs = actor(
@@ -962,7 +1002,8 @@ def optimize_sac(
                 next_value = (next_action_probs * (target_q_min - alpha * next_log_probs)).sum()
                 
                 # TD target: y = r + γ V(s')
-                target_value = torch.tensor(reward, dtype=torch.float32, device=device) + gamma * next_value
+                effective_gamma = 1.0
+                target_value = torch.tensor(reward, dtype=torch.float32, device=device) + effective_gamma * next_value
         
         # =================================================================
         # Step 3: Critic Loss
@@ -995,6 +1036,27 @@ def optimize_sac(
         # Actor loss: Σ_a π(a|s) [α log π(a|s) - Q(s,a)]
         # We want to MINIMIZE this, which MAXIMIZES Q - α log π (i.e., reward + entropy)
         actor_loss = (action_probs * (alpha * log_probs - q_min)).sum()
+        if has_bc_target:
+            _, logits_for_bc, _ = actor._forward_logits_core(
+                node_emb, node_sa_prior, cur_action_mask
+            )
+            if logits_for_bc.dim() == 1:
+                logits_for_bc = logits_for_bc.unsqueeze(0)
+            bc_target = torch.tensor(
+                [int(bc_target_action)], device=device, dtype=torch.long
+            )
+            imitation_loss = F.cross_entropy(logits_for_bc, bc_target)
+            actor_loss = actor_loss + (bc_loss_weight * imitation_loss)
+            imitation_losses.append(imitation_loss.item())
+            if _hybrid_sac_dbg_transition_remaining > 0:
+                _hybrid_sac_dbg_transition_remaining -= 1
+                print(
+                    "[HYBRID_SAC_DBG imitation] target=",
+                    int(bc_target_action),
+                    " loss=",
+                    float(imitation_loss.item()),
+                    sep="",
+                )
         total_actor_loss = total_actor_loss + actor_loss
         actor_losses.append(actor_loss.item())
         
@@ -1048,6 +1110,7 @@ def optimize_sac(
         'actor_loss': np.mean(actor_losses),
         'alpha': current_alpha,
         'entropy': np.mean(entropies),
+        'imitation_loss': float(np.mean(imitation_losses)) if imitation_losses else 0.0,
     }
 
 
@@ -1165,6 +1228,10 @@ def run_hybrid_sac_microservice(
     total_access_latency = 0.0
     total_communication_cost = 0.0
     total_migration_cost = 0.0
+    total_cost_ms_sum = 0.0
+    total_sla_penalty_ms = 0.0
+    total_tearing_penalty_ms = 0.0
+    total_future_penalty_ms = 0.0
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: TriggerAwareGAT + Discrete SAC")
@@ -1202,6 +1269,9 @@ def run_hybrid_sac_microservice(
     _debug_proactive_triggers = 0
     _debug_no_triggers = 0
     _debug_predictions_made = 0
+    eval_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
+    eval_action_migration_counts = np.zeros(ACTION_DIM, dtype=np.int64)
+    eval_follow_sa_stay = 0
 
     # 旁路：仅推理实验（inference_mode）建表；训练阶段不分配、不写入
     dag_migration_stats = (
@@ -1221,7 +1291,7 @@ def run_hybrid_sac_microservice(
     # v3.3: Moderate exploration temperature for Soft BC
     # With gradual probability decay, we can use a balanced alpha
     # that allows entropy-driven exploration when BC probability is low
-    alpha_init = 0.001  # C2.1：与缩放 reward 同量级，抑制过高熵导致的随机策略
+    alpha_init = 0.003  # log reward 后适度提高探索，缓解过早收敛到 STAY
     gamma = 0.95
     tau = 0.005
     batch_size = 32
@@ -1286,6 +1356,7 @@ def run_hybrid_sac_microservice(
     reward_history = []
     entropy_history = []
     alpha_history = []
+    imitation_loss_history = []
     
     # 时延探针初始化
     total_decision_time = 0.0
@@ -1336,6 +1407,13 @@ def run_hybrid_sac_microservice(
             total_access_latency = 0.0
             total_communication_cost = 0.0
             total_migration_cost = 0.0
+            total_cost_ms_sum = 0.0
+            total_sla_penalty_ms = 0.0
+            total_tearing_penalty_ms = 0.0
+            total_future_penalty_ms = 0.0
+            eval_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
+            eval_action_migration_counts = np.zeros(ACTION_DIM, dtype=np.int64)
+            eval_follow_sa_stay = 0
             gat_network.eval()
             actor.eval()
             critic.eval()
@@ -1422,6 +1500,10 @@ def run_hybrid_sac_microservice(
                     current_lat, current_lon, gw_lat, gw_lon,
                     predicted_locations=predicted_locations,
                     proactive_enabled=proactive_gate,
+                    estimated_migration_time_s=estimate_dag_migration_time_s(
+                        dag_info, gateway_dist_km=gateway_dist, trigger_type=TRIGGER_PROACTIVE
+                    ),
+                    forecast_step_dt_sec=pf_kw.get("forecast_step_dt_sec"),
                 )
                 
                 if trigger_type is None:
@@ -1451,6 +1533,7 @@ def run_hybrid_sac_microservice(
                     previous_assignments=old_assignments,
                     predicted_locations=predicted_locations,
                     trigger_type=trigger_type,
+                    max_iter=15,
                 )
                 
                 # -------------------------------------------------------------
@@ -1522,6 +1605,11 @@ def run_hybrid_sac_microservice(
                             else:  # NEAREST
                                 target_server = nearest_server_id
                             
+                            eval_action_counts[action] += 1
+                            if action == ACTION_FOLLOW_SA and sa_proposed_server == current_node_server:
+                                eval_follow_sa_stay += 1
+                            if target_server != current_node_server:
+                                eval_action_migration_counts[action] += 1
                             taxi_dag_assignments[taxi_id][ms_node] = target_server
                             node_transitions.append((node_idx, action))
                     # === 纯决策时间结束 ===
@@ -1530,22 +1618,56 @@ def run_hybrid_sac_microservice(
                     total_decision_time += (t_end - t_start)
                     decision_count_for_latency += 1
                 else:
-                    # 训练模式：原有逻辑
-                    for ms_node in sorted_nodes:
+                    # 训练模式：逐节点构造 cur/next state，保证 DAG 内 MDP 时序真实。
+                    for pos, ms_node in enumerate(sorted_nodes):
+                        cur_graph_state = build_graph_state(
+                            taxi_id, dag_info,
+                            taxi_dag_assignments[taxi_id],
+                            servers_info, trigger_type,
+                            sa_proposal, candidates,
+                            current_lat, current_lon,
+                        )
+                        cur_node_to_idx = {
+                            name: i for i, name in enumerate(cur_graph_state['node_names'])
+                        }
+                        node_feat_step = torch.FloatTensor(
+                            cur_graph_state['node_features']
+                        ).to(device)
+                        adj_step = torch.FloatTensor(cur_graph_state['adj_matrix']).to(device)
+                        trigger_step = torch.FloatTensor(
+                            cur_graph_state['trigger_context']
+                        ).to(device)
+                        sa_prior_step = torch.FloatTensor(
+                            cur_graph_state['sa_priors']
+                        ).to(device)
+                        with torch.no_grad():
+                            embeddings_step = gat_network(
+                                node_feat_step, adj_step, trigger_step
+                            )
                         node_idx = node_to_idx[ms_node]
                         sa_proposed_server = sa_proposal[ms_node]
-                        
+
                         # Get node embedding and SA prior
-                        node_emb = embeddings[node_idx]
-                        node_sa_prior = sa_prior_t[node_idx]
-                        
+                        node_emb = embeddings_step[node_idx]
+                        node_sa_prior = sa_prior_step[node_idx]
+                        current_node_server = taxi_dag_assignments[taxi_id][ms_node]
+                        bc_target_action = (
+                            ACTION_FOLLOW_SA
+                            if sa_proposed_server != current_node_server
+                            else ACTION_STAY
+                        )
+                        used_bc_target = False
+
                         # ---------------------------------------------------------
-                        # v3.3: Soft BC with Probability Decay
+                        # v3.3/v5: Soft BC with conditional imitation target.
                         # ---------------------------------------------------------
                         with torch.no_grad():
-                            if random.random() < current_bc_prob:
-                                # Imitation: Follow SA recommendation
-                                action = 1
+                            if (
+                                bc_target_action == ACTION_FOLLOW_SA
+                                and random.random() < current_bc_prob
+                            ):
+                                action = bc_target_action
+                                used_bc_target = True
                                 bc_actions_taken += 1
                             else:
                                 # Exploration: Sample from learned policy（带掩码）
@@ -1554,8 +1676,6 @@ def run_hybrid_sac_microservice(
                                 )
                                 explore_actions_taken += 1
                         
-                        # Execute action
-                        current_node_server = taxi_dag_assignments[taxi_id][ms_node]
                         if action == 0:  # STAY
                             target_server = current_node_server
                         elif action == 1:  # FOLLOW SA
@@ -1564,7 +1684,29 @@ def run_hybrid_sac_microservice(
                             target_server = nearest_server_id
                         
                         taxi_dag_assignments[taxi_id][ms_node] = target_server
-                        node_transitions.append((node_idx, action))
+                        next_graph_state_step = build_graph_state(
+                            taxi_id, dag_info,
+                            taxi_dag_assignments[taxi_id],
+                            servers_info, trigger_type,
+                            sa_proposal, candidates,
+                            current_lat, current_lon,
+                        )
+                        is_last_node = (pos == len(sorted_nodes) - 1)
+                        next_node_idx = (
+                            -1
+                            if is_last_node
+                            else cur_node_to_idx[sorted_nodes[pos + 1]]
+                        )
+                        node_transitions.append({
+                            "graph_state": cur_graph_state,
+                            "node_idx": node_idx,
+                            "action": action,
+                            "next_graph_state": next_graph_state_step,
+                            "next_node_idx": next_node_idx,
+                            "is_last": is_last_node,
+                            "has_bc_target": used_bc_target,
+                            "bc_target_action": bc_target_action,
+                        })
                         global_step += 1
                 
                 # -------------------------------------------------------------
@@ -1583,6 +1725,10 @@ def run_hybrid_sac_microservice(
                 total_access_latency += details['access_latency']
                 total_communication_cost += details['communication_cost']
                 total_migration_cost += details['migration_cost']
+                total_cost_ms_sum += details['total_cost_ms']
+                total_sla_penalty_ms += details.get('sla_penalty_ms', 0.0)
+                total_tearing_penalty_ms += details.get('tearing_penalty_ms', details.get('tearing_penalty', 0.0))
+                total_future_penalty_ms += details.get('future_penalty_ms', details.get('future_penalty', 0.0))
                 
                 nodes_migrated = sum(
                     1 for n in sorted_nodes
@@ -1599,41 +1745,25 @@ def run_hybrid_sac_microservice(
                     dag_migration_stats[dag_type]["proactive_decisions"] += 1
                     dag_migration_stats[dag_type]["migrated_nodes"] += nodes_migrated
                 
-                # -------------------------------------------------------------
-                # Phase E: Build Next State and Store Transitions
-                # -------------------------------------------------------------
-                next_graph_state = build_graph_state(
-                    taxi_id, dag_info,
-                    taxi_dag_assignments[taxi_id],
-                    servers_info, trigger_type,
-                    sa_proposal, candidates,
-                    current_lat, current_lon,
-                )
-                
-                # Store transitions in replay buffer
-                # =====================================================
-                # DENSE REWARD FIX (v2.0):
-                # All nodes in the DAG share the same total reward.
-                # This solves the credit assignment problem where only
-                # the last node received reward while others got 0.
-                # "一荣俱荣，一损俱损" - shared fate for all nodes
-                # =====================================================
-                num_nodes = len(node_transitions)
-                per_node_reward = reward / num_nodes  # Fair share of total reward
-                
+                # Sparse DAG reward: only terminal node receives the placement reward.
+                # Intermediate node transitions bootstrap with gamma=1 in optimize_sac.
                 if not is_eval_epoch:
                     mask_cpu = action_mask_phy.detach().cpu().clone()
-                    for i, (node_idx, action) in enumerate(node_transitions):
-                        is_last = (i == len(node_transitions) - 1)
+                    for transition in node_transitions:
+                        is_last = transition["is_last"]
+                        step_reward = reward if is_last else 0.0
                         
                         memory.append((
-                            graph_state,
-                            node_idx,
-                            action,
-                            per_node_reward,  # Dense reward: each node gets fair share
-                            next_graph_state,
-                            is_last,  # Only mark last node as done
+                            transition["graph_state"],
+                            transition["node_idx"],
+                            transition["action"],
+                            step_reward,
+                            transition["next_graph_state"],
+                            is_last,
                             mask_cpu,
+                            transition["next_node_idx"],
+                            transition["has_bc_target"],
+                            transition["bc_target_action"],
                         ))
                     
                     # -------------------------------------------------------------
@@ -1661,6 +1791,7 @@ def run_hybrid_sac_microservice(
                         loss_history.append(train_info['critic_loss'] + train_info['actor_loss'])
                         entropy_history.append(train_info['entropy'])
                         alpha_history.append(train_info['alpha'])
+                        imitation_loss_history.append(train_info.get('imitation_loss', 0.0))
                     
                     # -------------------------------------------------------------
                     # Phase G: Soft Update Target Critic (Every Step)
@@ -1698,6 +1829,17 @@ def run_hybrid_sac_microservice(
     print(f"    - PROACTIVE triggers: {_debug_proactive_triggers}")
     print(f"    - No triggers (skipped): {_debug_no_triggers}")
     print(f"    - Total decisions: {decision_count}")
+    print(
+        "    - Eval actions [STAY, FOLLOW_SA, NEAREST]: "
+        f"{eval_action_counts.astype(int).tolist()}"
+    )
+    print(
+        "    - Eval action-caused migrations [STAY, FOLLOW_SA, NEAREST]: "
+        f"{eval_action_migration_counts.astype(int).tolist()}"
+    )
+    print(f"    - Eval FOLLOW_SA but SA_STAY: {int(eval_follow_sa_stay)}")
+    if imitation_loss_history:
+        print(f"    - Mean imitation loss: {float(np.mean(imitation_loss_history)):.6f}")
     
     # v3.0: Print final GAT attention weights to verify physics-aware learning
     gat_network.debug_print_attention(prefix="  ")
@@ -1723,10 +1865,15 @@ def run_hybrid_sac_microservice(
         'total_access_latency': total_access_latency,
         'total_communication_cost': total_communication_cost,
         'total_migration_cost': total_migration_cost,
+        'total_cost_ms_sum': total_cost_ms_sum,
+        'total_sla_penalty_ms': total_sla_penalty_ms,
+        'total_tearing_penalty_ms': total_tearing_penalty_ms,
+        'total_future_penalty_ms': total_future_penalty_ms,
         'loss_history': loss_history,
         'reward_history': reward_history,
         'entropy_history': entropy_history,
         'alpha_history': alpha_history,
+        'imitation_loss_history': imitation_loss_history,
         # 时延信息
         'total_decision_time': total_decision_time,
         'decision_count_for_latency': decision_count_for_latency,
@@ -1863,6 +2010,10 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 current_lat, current_lon, gw_lat, gw_lon,
                 predicted_locations=predicted_locations,
                 proactive_enabled=proactive_gate,
+                estimated_migration_time_s=estimate_dag_migration_time_s(
+                    dag_info, gateway_dist_km=gateway_dist, trigger_type=TRIGGER_PROACTIVE
+                ),
+                forecast_step_dt_sec=pf_kw.get("forecast_step_dt_sec"),
             )
             
             if trigger_type is None:
@@ -1881,6 +2032,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 previous_assignments=old_assignments,
                 predicted_locations=predicted_locations,
                 trigger_type=trigger_type,
+                max_iter=15,
             )
             
             graph_state = build_graph_state(
@@ -1935,7 +2087,7 @@ def evaluate_sac_policy(df, servers_df, gat_network, actor, predictor=None, proa
                 trigger_type=trigger_type,
             )
             total_reward_sum += reward
-            if trigger_type == "Proactive":
+            if trigger_type == TRIGGER_PROACTIVE:
                 migration_lock[taxi_id] = sim_step + 2
             
             nodes_migrated = sum(

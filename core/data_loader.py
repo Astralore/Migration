@@ -9,11 +9,12 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 DEFAULT_TAXI_PATH = os.path.join(DATA_DIR, "taxi_with_health_info.csv")
 DEFAULT_SERVER_PATH = os.path.join(DATA_DIR, "edge_server_locations.csv")
 
-# 与论文主协议一致：清洗 + Top100 + min100 + episode；生成后供全项目直接读取，避免每次全量清洗
+# 与论文主协议一致：清洗 + Top100 + min100 + episode + 服务覆盖过滤；
+# 生成后供全项目直接读取，避免每次全量清洗。
 PROCESSED_DATA_DIR = os.path.join(DATA_DIR, "processed")
 DEFAULT_PROCESSED_TAXI_PATH = os.path.join(
     PROCESSED_DATA_DIR,
-    "taxi_cleaned_active100_min100_eps2h.csv",
+    "taxi_cleaned_active100_min100_eps2h_cov50.csv",
 )
 
 CORE_COLUMNS = ["taxi_id", "date_time", "latitude", "longitude"]

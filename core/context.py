@@ -17,9 +17,11 @@ USER_SLA_TOLERANCE_MS = calc_access_latency_ms(DISTANCE_THRESHOLD_KM) * 0.99
 # 旧版距离缓冲（仅供 check_proactive_sla_violation 等兼容；get_trigger_type 已改 TTV）
 PROACTIVE_WARNING_KM = 5.0
 
-# C3：前瞻时间步长（秒）与保守迁移耗时兜底（秒），不扩展 get_trigger_type 形参
+# C3：前瞻时间步长（秒）与保守迁移耗时兜底（秒）
 _DEFAULT_FORECAST_STEP_DT_SEC = 60.0
-_ESTIMATED_MIGRATION_TIME_S_FALLBACK = 2.0
+# 旧 2s 兜底小于预测粒度(60s)，会让 proactive 永远触发不到。
+# 这里用两个预测步长作为无法精算时的保守窗口。
+_ESTIMATED_MIGRATION_TIME_S_FALLBACK = 120.0
 
 # Trigger type constants
 TRIGGER_REACTIVE = "REACTIVE"
@@ -81,12 +83,15 @@ def check_proactive_sla_violation(
 
 
 def _ttv_seconds_to_sla_breach(fd, step_dt_sec):
-    """首次达到 SLA 空间阈值的预测时间（秒）；达不到则 +inf。fd 为前瞻到 gateway 距离 (H,)。"""
+    """首次达到 SLA（空间 OR QoS）阈值的预测时间（秒）；达不到则 +inf。fd 为前瞻到 gateway 距离 (H,)。"""
     if fd.size == 0:
         return float("inf")
     dt = float(step_dt_sec) if float(step_dt_sec) > 0 else _DEFAULT_FORECAST_STEP_DT_SEC
     for h in range(fd.size):
-        if fd[h] >= DISTANCE_THRESHOLD_KM:
+        dist_km = float(fd[h])
+        future_spatial_violation = dist_km >= DISTANCE_THRESHOLD_KM
+        future_qos_violation = calc_access_latency_ms(dist_km) > USER_SLA_TOLERANCE_MS
+        if future_spatial_violation or future_qos_violation:
             return (h + 1) * dt
     return float("inf")
 
@@ -96,6 +101,8 @@ def get_trigger_type(
     gateway_server_lat, gateway_server_lon,
     predicted_locations=None,
     proactive_enabled=False,
+    estimated_migration_time_s=None,
+    forecast_step_dt_sec=None,
 ):
     """
     Determine the trigger type for migration decision.
@@ -119,9 +126,21 @@ def get_trigger_type(
         fd = _future_distances_km_to_gateway(
             predicted_locations, gateway_server_lat, gateway_server_lon,
         )
-        ttv_s = _ttv_seconds_to_sla_breach(fd, _DEFAULT_FORECAST_STEP_DT_SEC)
-        est_mig_s = _ESTIMATED_MIGRATION_TIME_S_FALLBACK
-        if np.isfinite(ttv_s) and ttv_s <= est_mig_s + 1.0:
+        step_dt_s = (
+            float(forecast_step_dt_sec)
+            if forecast_step_dt_sec is not None and float(forecast_step_dt_sec) > 0
+            else _DEFAULT_FORECAST_STEP_DT_SEC
+        )
+        ttv_s = _ttv_seconds_to_sla_breach(fd, step_dt_s)
+        est_mig_s = (
+            float(estimated_migration_time_s)
+            if estimated_migration_time_s is not None and float(estimated_migration_time_s) > 0
+            else _ESTIMATED_MIGRATION_TIME_S_FALLBACK
+        )
+        # 仿真只在离散预测步上观察未来；窗口必须和 GPS 采样步长对齐，
+        # 否则首个预测点已违规时，下一次观测会直接变成 Reactive。
+        dynamic_window_s = est_mig_s + max(1.0, step_dt_s)
+        if np.isfinite(ttv_s) and ttv_s <= dynamic_window_s:
             return TRIGGER_PROACTIVE
 
     return None

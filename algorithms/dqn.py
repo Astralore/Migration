@@ -22,7 +22,7 @@ from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
 from core.context import get_trigger_type, TRIGGER_PROACTIVE, check_sla_violation
 from core.dag_utils import get_entry_nodes, topological_sort, assign_dag_type, initialize_dag_assignment
-from core.reward import build_servers_info, calculate_microservice_reward
+from core.reward import build_servers_info, calculate_microservice_reward, estimate_dag_migration_time_s
 from core.state_builder import build_node_state
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
@@ -129,6 +129,10 @@ def run_dqn_microservice_fair(
     total_access_latency = 0.0
     total_communication_cost = 0.0
     total_migration_cost = 0.0
+    total_cost_ms_sum = 0.0
+    total_sla_penalty_ms = 0.0
+    total_tearing_penalty_ms = 0.0
+    total_future_penalty_ms = 0.0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}  |  Proactive: {use_proactive}")
@@ -216,6 +220,10 @@ def run_dqn_microservice_fair(
                 current_lat, current_lon, gw_lat, gw_lon,
                 predicted_locations=predicted_locations,
                 proactive_enabled=use_proactive,
+                estimated_migration_time_s=estimate_dag_migration_time_s(
+                    dag_info, gateway_dist_km=gateway_dist, trigger_type=TRIGGER_PROACTIVE
+                ),
+                forecast_step_dt_sec=pf_kw.get("forecast_step_dt_sec"),
             )
 
             if trigger_type is None:
@@ -282,6 +290,10 @@ def run_dqn_microservice_fair(
             total_access_latency += details['access_latency']
             total_communication_cost += details['communication_cost']
             total_migration_cost += details['migration_cost']
+            total_cost_ms_sum += details['total_cost_ms']
+            total_sla_penalty_ms += details.get('sla_penalty_ms', 0.0)
+            total_tearing_penalty_ms += details.get('tearing_penalty_ms', details.get('tearing_penalty', 0.0))
+            total_future_penalty_ms += details.get('future_penalty_ms', details.get('future_penalty', 0.0))
 
             nodes_migrated = sum(
                 1 for n in sorted_nodes
@@ -336,6 +348,10 @@ def run_dqn_microservice_fair(
         'total_access_latency': total_access_latency,
         'total_communication_cost': total_communication_cost,
         'total_migration_cost': total_migration_cost,
+        'total_cost_ms_sum': total_cost_ms_sum,
+        'total_sla_penalty_ms': total_sla_penalty_ms,
+        'total_tearing_penalty_ms': total_tearing_penalty_ms,
+        'total_future_penalty_ms': total_future_penalty_ms,
         'loss_history': loss_history,
         'reward_history': reward_history,
         'epsilon_history': epsilon_history,

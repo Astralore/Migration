@@ -66,13 +66,17 @@ def _split_train_test_taxis(df_active):
 
 
 def _avg_total_cost_ms(res):
-    """单次触发决策的平均总代价（接入 + 通信 + 迁移），单位 ms。"""
+    """单次触发决策的平均真实总代价（优先用 reward.details['total_cost_ms'] 聚合），单位 ms。"""
+    dc = int(res.get("decision_count") or 0)
+    if dc <= 0:
+        return 0.0
+    if "total_cost_ms_sum" in res:
+        return float(res.get("total_cost_ms_sum") or 0.0) / dc
     lat = float(res.get("total_access_latency") or 0)
     comm = float(res.get("total_communication_cost") or 0)
     mig = float(res.get("total_migration_cost") or 0)
     total_ms = lat + comm + mig
-    dc = int(res.get("decision_count") or 0)
-    return (total_ms / dc) if dc > 0 else 0.0
+    return total_ms / dc
 
 
 def _data_protocol_line(train_df, test_df, phase_label):
