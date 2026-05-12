@@ -1,0 +1,460 @@
+{
+  "config": {
+    "active_users": 100,
+    "split_seed": 42,
+    "forecast_horizon": 15,
+    "sac_epochs_proactive": 6,
+    "sac_epochs_reactive": 2,
+    "processed_taxi_path": "data\\processed\\taxi_cleaned_active100_min100_eps2h_cov50.csv",
+    "checkpoint_dir": "experiments\\full_pipeline_20260511_1711_cov50_predictor_v2_full\\checkpoints",
+    "started_at": "2026-05-11T17:19:40.253998"
+  },
+  "data": {
+    "rows": 205936,
+    "taxis": 100,
+    "train_rows": 148153,
+    "train_taxis": 80,
+    "test_rows": 57783,
+    "test_taxis": 20,
+    "train_ids": {
+      "len": 80,
+      "head": [
+        "10252",
+        "10299",
+        "10337",
+        "1074",
+        "1111"
+      ],
+      "tail": [
+        "3859",
+        "3878",
+        "3879",
+        "3881",
+        "3974"
+      ]
+    },
+    "test_ids": [
+      "1015",
+      "1059",
+      "1359",
+      "1403",
+      "1683",
+      "1688",
+      "2120",
+      "2263",
+      "2783",
+      "2832",
+      "2881",
+      "3250",
+      "3318",
+      "3365",
+      "366",
+      "3702",
+      "3933",
+      "3939",
+      "3942",
+      "3948"
+    ],
+    "split": {
+      "method": "greedy_balanced_by_nearest_server_exposure",
+      "target_test_ratio": 0.2,
+      "test_taxi_ratio": 0.2,
+      "test_row_ratio": 0.28058717271385286,
+      "test_risk_ratio": 0.27512939615129395,
+      "taxi_exposure": {
+        "len": 100,
+        "head": [
+          {
+            "taxi_id": 118,
+            "rows": 2110,
+            "risk_score": 45.5,
+            "nearest_over_15": 45,
+            "nearest_10_to_15": 2,
+            "nearest_p50": 0.345757836806603,
+            "nearest_p95": 1.9850281949275588
+          },
+          {
+            "taxi_id": 273,
+            "rows": 1700,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 2.012442044776782,
+            "nearest_p95": 2.0400810415893957
+          },
+          {
+            "taxi_id": 315,
+            "rows": 1664,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 4.67756942668555,
+            "nearest_p95": 7.857207957802579
+          },
+          {
+            "taxi_id": 341,
+            "rows": 1686,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.29607342316664864,
+            "nearest_p95": 0.6165805355196505
+          },
+          {
+            "taxi_id": 350,
+            "rows": 1681,
+            "risk_score": 538.75,
+            "nearest_over_15": 523,
+            "nearest_10_to_15": 63,
+            "nearest_p50": 0.5625203821614045,
+            "nearest_p95": 17.19479160524607
+          }
+        ],
+        "tail": [
+          {
+            "taxi_id": 3948,
+            "rows": 4333,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.4870063378499732,
+            "nearest_p95": 4.185732671765144
+          },
+          {
+            "taxi_id": 3974,
+            "rows": 2281,
+            "risk_score": 24.75,
+            "nearest_over_15": 24,
+            "nearest_10_to_15": 3,
+            "nearest_p50": 0.4238458603219313,
+            "nearest_p95": 2.1111554401230426
+          },
+          {
+            "taxi_id": 10252,
+            "rows": 2569,
+            "risk_score": 826.75,
+            "nearest_over_15": 778,
+            "nearest_10_to_15": 195,
+            "nearest_p50": 0.5165136559039818,
+            "nearest_p95": 46.97635801103906
+          },
+          {
+            "taxi_id": 10299,
+            "rows": 1707,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.47380484445719956,
+            "nearest_p95": 1.303285048159676
+          },
+          {
+            "taxi_id": 10337,
+            "rows": 2049,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.3552529784844649,
+            "nearest_p95": 1.0300540744506894
+          }
+        ]
+      }
+    }
+  },
+  "train": {
+    "proactive": {
+      "SA": {
+        "total_migrations": 6530,
+        "total_violations": 15974,
+        "proactive_decisions": 2381,
+        "decision_count": 18355,
+        "total_reward": -44889.48213440345,
+        "avg_decision_time_ms": 17.254923480567683,
+        "total_cost_ms_sum": 432643157.4662572,
+        "total_sla_penalty_ms": 272240000.0,
+        "total_tearing_penalty_ms": 584979.4249999992,
+        "total_future_penalty_ms": 1113.8630833033862,
+        "total_access_latency": 38753.985837721615,
+        "total_communication_cost": 35279.82703762984,
+        "total_migration_cost": 159743030.36529922,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 23570.861207641363
+      },
+      "DQN": {
+        "total_migrations": 21746,
+        "total_violations": 17021,
+        "proactive_decisions": 2171,
+        "decision_count": 19192,
+        "total_reward": -52505.933089268045,
+        "avg_decision_time_ms": 1.2334125514895153,
+        "total_cost_ms_sum": 443663102.93405855,
+        "total_sla_penalty_ms": 316360000.0,
+        "total_tearing_penalty_ms": 594302.0950000475,
+        "total_future_penalty_ms": 1342.9433765806225,
+        "total_access_latency": 40730.031538820454,
+        "total_communication_cost": 42674.92857447926,
+        "total_migration_cost": 126624052.93557145,
+        "avg_total_cost_ms": 23117.085396730854
+      },
+      "Hybrid SAC": {
+        "total_migrations": 6740,
+        "total_violations": 16014,
+        "proactive_decisions": 2391,
+        "decision_count": 18405,
+        "total_reward": -44940.99421429638,
+        "avg_decision_time_ms": 3.2552556255192204,
+        "total_cost_ms_sum": 420372545.4860841,
+        "total_sla_penalty_ms": 274280000.0,
+        "total_tearing_penalty_ms": 831414.6200000602,
+        "total_future_penalty_ms": 1108.4748923182017,
+        "total_access_latency": 38854.26123456908,
+        "total_communication_cost": 42655.37180402288,
+        "total_migration_cost": 145178512.75815582,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 22840.12743744005
+      }
+    },
+    "reactive": {
+      "SA": {
+        "total_migrations": 6581,
+        "total_violations": 16038,
+        "proactive_decisions": 0,
+        "decision_count": 16038,
+        "total_reward": -45272.11688119547,
+        "avg_decision_time_ms": 25.55643088797049,
+        "total_cost_ms_sum": 458494146.07311124,
+        "total_sla_penalty_ms": 273080000.0,
+        "total_tearing_penalty_ms": 708750.8250000486,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 34004.520013429326,
+        "total_communication_cost": 27022.574921931056,
+        "total_migration_cost": 184644368.15319127,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 28587.987658879614
+      },
+      "DQN": {
+        "total_migrations": 21715,
+        "total_violations": 16718,
+        "proactive_decisions": 0,
+        "decision_count": 16718,
+        "total_reward": -47272.53525135469,
+        "avg_decision_time_ms": 1.141335816946064,
+        "total_cost_ms_sum": 472771232.6223244,
+        "total_sla_penalty_ms": 289440000.0,
+        "total_tearing_penalty_ms": 729354.7400000527,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 35713.926468727856,
+        "total_communication_cost": 30219.758377708342,
+        "total_migration_cost": 182535944.19747874,
+        "avg_total_cost_ms": 28279.174101108052
+      },
+      "Hybrid SAC": {
+        "total_migrations": 6704,
+        "total_violations": 16104,
+        "proactive_decisions": 0,
+        "decision_count": 16104,
+        "total_reward": -44895.14679173483,
+        "avg_decision_time_ms": 3.2544736776448198,
+        "total_cost_ms_sum": 420527577.74165946,
+        "total_sla_penalty_ms": 274580000.0,
+        "total_tearing_penalty_ms": 432915.5600000195,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 34148.65313342515,
+        "total_communication_cost": 35769.26595225582,
+        "total_migration_cost": 145444744.26257753,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 26113.237564683273
+      }
+    }
+  },
+  "inference": {
+    "proactive": {
+      "SA": {
+        "total_migrations": 1626,
+        "total_violations": 5736,
+        "proactive_decisions": 617,
+        "decision_count": 6353,
+        "total_reward": -16764.319651050657,
+        "avg_decision_time_ms": 37.58228860412736,
+        "total_cost_ms_sum": 146547615.4024195,
+        "total_sla_penalty_ms": 104280000.0,
+        "total_tearing_penalty_ms": 20212.040000001984,
+        "total_future_penalty_ms": 292.507511637871,
+        "total_access_latency": 13380.250177400405,
+        "total_communication_cost": 18957.611280422636,
+        "total_migration_cost": 42214772.993449874,
+        "dag_proactive_migration_stats": {
+          "Data_Heavy_DAG": {
+            "proactive_decisions": 27,
+            "migrated_nodes": 0
+          },
+          "FanOut_Broadcaster_3": {
+            "proactive_decisions": 52,
+            "migrated_nodes": 0
+          },
+          "FanOut_Broadcaster_1": {
+            "proactive_decisions": 11,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_2": {
+            "proactive_decisions": 84,
+            "migrated_nodes": 77
+          },
+          "Diamond_DAG_1": {
+            "proactive_decisions": 24,
+            "migrated_nodes": 0
+          },
+          "Compute_Heavy_DAG": {
+            "proactive_decisions": 125,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_3": {
+            "proactive_decisions": 57,
+            "migrated_nodes": 34
+          },
+          "IoT_Lightweight_DAG": {
+            "proactive_decisions": 66,
+            "migrated_nodes": 0
+          },
+          "FanOut_Broadcaster_2": {
+            "proactive_decisions": 133,
+            "migrated_nodes": 0
+          },
+          "Diamond_DAG_2": {
+            "proactive_decisions": 30,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_1": {
+            "proactive_decisions": 8,
+            "migrated_nodes": 0
+          }
+        },
+        "avg_total_cost_ms": 23067.46661457886
+      },
+      "DQN": {
+        "total_migrations": 3701,
+        "total_violations": 8553,
+        "proactive_decisions": 556,
+        "decision_count": 9109,
+        "total_reward": -26325.052445703623,
+        "avg_decision_time_ms": 2.585302252194224,
+        "total_cost_ms_sum": 187012139.52176452,
+        "total_sla_penalty_ms": 166320000.0,
+        "total_tearing_penalty_ms": 511035.54500001,
+        "total_future_penalty_ms": 304.11255857574747,
+        "total_access_latency": 19091.794322926835,
+        "total_communication_cost": 23445.917028799144,
+        "total_migration_cost": 20138262.15285174,
+        "avg_total_cost_ms": 20530.479692805413
+      },
+      "Hybrid SAC": {
+        "total_migrations": 1543,
+        "total_violations": 5764,
+        "proactive_decisions": 585,
+        "decision_count": 6349,
+        "total_reward": -16623.32866531595,
+        "avg_decision_time_ms": 3.4182039371142006,
+        "total_cost_ms_sum": 133498780.94922572,
+        "total_sla_penalty_ms": 104740000.0,
+        "total_tearing_penalty_ms": 31155.32000000298,
+        "total_future_penalty_ms": 291.3029225189843,
+        "total_access_latency": 13370.911099371242,
+        "total_communication_cost": 25292.22976130959,
+        "total_migration_cost": 28688671.18544218,
+        "dag_proactive_migration_stats": {
+          "Diamond_DAG_2": {
+            "proactive_decisions": 15,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_1": {
+            "proactive_decisions": 71,
+            "migrated_nodes": 54
+          },
+          "IoT_Lightweight_DAG": {
+            "proactive_decisions": 95,
+            "migrated_nodes": 0
+          },
+          "Diamond_DAG_1": {
+            "proactive_decisions": 11,
+            "migrated_nodes": 0
+          },
+          "FanOut_Broadcaster_3": {
+            "proactive_decisions": 88,
+            "migrated_nodes": 0
+          },
+          "FanOut_Broadcaster_2": {
+            "proactive_decisions": 149,
+            "migrated_nodes": 0
+          },
+          "FanOut_Broadcaster_1": {
+            "proactive_decisions": 53,
+            "migrated_nodes": 0
+          },
+          "Diamond_DAG_3": {
+            "proactive_decisions": 91,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_2": {
+            "proactive_decisions": 12,
+            "migrated_nodes": 4
+          }
+        },
+        "avg_total_cost_ms": 21026.74136859753
+      }
+    },
+    "reactive": {
+      "SA": {
+        "total_migrations": 1573,
+        "total_violations": 5749,
+        "proactive_decisions": 0,
+        "decision_count": 5749,
+        "total_reward": -16802.106629253467,
+        "avg_decision_time_ms": 26.374531307314896,
+        "total_cost_ms_sum": 150922731.52386826,
+        "total_sla_penalty_ms": 104340000.0,
+        "total_tearing_penalty_ms": 156666.41999997644,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 12131.339854457343,
+        "total_communication_cost": 5512.019139140486,
+        "total_migration_cost": 46408421.744876616,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 26251.997134087364
+      },
+      "DQN": {
+        "total_migrations": 4260,
+        "total_violations": 7273,
+        "proactive_decisions": 0,
+        "decision_count": 7273,
+        "total_reward": -21582.928319990177,
+        "avg_decision_time_ms": 1.7118936598712748,
+        "total_cost_ms_sum": 176120847.1044312,
+        "total_sla_penalty_ms": 135680000.0,
+        "total_tearing_penalty_ms": 16148.179999997916,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 15644.721479336771,
+        "total_communication_cost": 14133.296544294159,
+        "total_migration_cost": 40394920.90640386,
+        "avg_total_cost_ms": 24215.708387794748
+      },
+      "Hybrid SAC": {
+        "total_migrations": 1359,
+        "total_violations": 5767,
+        "proactive_decisions": 0,
+        "decision_count": 5767,
+        "total_reward": -16444.645098591696,
+        "avg_decision_time_ms": 3.441460986355378,
+        "total_cost_ms_sum": 130008768.26411615,
+        "total_sla_penalty_ms": 104480000.0,
+        "total_tearing_penalty_ms": 17998.599999998914,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 12168.449982281854,
+        "total_communication_cost": 22897.579597298445,
+        "total_migration_cost": 25475703.634535644,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 22543.57001285177
+      }
+    }
+  },
+  "elapsed_seconds_so_far": 40465.05547237396,
+  "completed_at": "2026-05-12T04:33:58.236516",
+  "elapsed_seconds": 40465.05763411522
+}
