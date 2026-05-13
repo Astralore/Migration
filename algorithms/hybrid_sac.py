@@ -74,15 +74,31 @@ def build_microservice_action_mask(candidates, device: torch.device) -> torch.Te
     return m
 
 
+def build_node_action_mask(
+    base_action_mask: torch.Tensor,
+    *,
+    sa_proposed_server,
+    current_node_server,
+) -> torch.Tensor:
+    """Per-node mask: FOLLOW_SA is illegal when SA proposes staying."""
+    node_mask = base_action_mask.clone()
+    if sa_proposed_server == current_node_server:
+        node_mask[ACTION_FOLLOW_SA] = False
+    if not bool(node_mask.any()):
+        # STAY should always be legal; if not, recover safely without re-enabling FOLLOW_SA.
+        node_mask[ACTION_STAY] = True
+    return node_mask
+
+
 def apply_action_mask_to_logits(
     logits: torch.Tensor,
     action_mask: Optional[torch.Tensor],
     *,
-    fallback_action_index: int = ACTION_FOLLOW_SA,
+    fallback_action_index: int = ACTION_STAY,
     fill_value: float = -1e9,
 ) -> torch.Tensor:
     """
-    对 logits 应用掩码；全非法行回退 FOLLOW_SA，避免 softmax NaN。
+    对 logits 应用掩码；全非法行回退 STAY，避免 softmax NaN。
     logits: (action_dim,) 或 (batch, action_dim)
     action_mask: 同形状尾部维；None 表示全合法。
     """
@@ -784,6 +800,11 @@ def optimize_sac(
     log_alpha=None,
     alpha_optimizer=None,
     bc_loss_weight=1.0,
+    follow_sa_bc_scale=10.0,
+    stay_bc_scale=1.0,
+    q_filter_enabled=False,
+    q_filter_margin=0.5,
+    nearest_reg_weight=0.0,
 ):
     """
     Discrete SAC Optimization Step.
@@ -901,6 +922,10 @@ def optimize_sac(
     entropies = []
     alpha_losses = []
     imitation_losses = []
+    nearest_reg_losses = []
+    q_filter_checked = 0
+    q_filter_passed = 0
+    q_filter_blocked = 0
     
     # Zero gradients
     gat_optimizer.zero_grad()
@@ -917,7 +942,46 @@ def optimize_sac(
         next_node_idx = None
         has_bc_target = False
         bc_target_action = ACTION_FOLLOW_SA
-        if len(transition) >= 10:
+        nearest_reg_eligible = False
+        bc_target_scale = None
+        next_action_mask_stored = None
+        if len(transition) >= 13:
+            (
+                graph_state,
+                node_idx,
+                action,
+                reward,
+                next_graph_state,
+                done,
+                action_mask_stored,
+                next_node_idx,
+                has_bc_target,
+                bc_target_action,
+                next_action_mask_stored,
+                nearest_reg_eligible,
+                bc_target_scale,
+            ) = transition
+            cur_action_mask = torch.as_tensor(
+                action_mask_stored, device=device, dtype=torch.bool
+            )
+        elif len(transition) >= 11:
+            (
+                graph_state,
+                node_idx,
+                action,
+                reward,
+                next_graph_state,
+                done,
+                action_mask_stored,
+                next_node_idx,
+                has_bc_target,
+                bc_target_action,
+                next_action_mask_stored,
+            ) = transition
+            cur_action_mask = torch.as_tensor(
+                action_mask_stored, device=device, dtype=torch.bool
+            )
+        elif len(transition) >= 10:
             (
                 graph_state,
                 node_idx,
@@ -988,9 +1052,14 @@ def optimize_sac(
                 next_node_emb = next_embeddings[bootstrap_node_idx]
                 next_node_sa_prior = next_sa_prior[bootstrap_node_idx]
                 
-                # Get next action probabilities from current actor（下一状态无存储 mask 时用全合法）
+                next_action_mask = (
+                    torch.as_tensor(next_action_mask_stored, device=device, dtype=torch.bool)
+                    if next_action_mask_stored is not None
+                    else mask_all
+                )
+                # Get next action probabilities from current actor（优先使用逐节点 next mask）
                 next_action_probs, next_log_probs = actor(
-                    next_node_emb, next_node_sa_prior, mask_all
+                    next_node_emb, next_node_sa_prior, next_action_mask
                 )
                 
                 # Get target Q-values
@@ -1036,7 +1105,17 @@ def optimize_sac(
         # Actor loss: Σ_a π(a|s) [α log π(a|s) - Q(s,a)]
         # We want to MINIMIZE this, which MAXIMIZES Q - α log π (i.e., reward + entropy)
         actor_loss = (action_probs * (alpha * log_probs - q_min)).sum()
-        if has_bc_target:
+        if (
+            nearest_reg_weight > 0.0
+            and nearest_reg_eligible
+            and bool(cur_action_mask[ACTION_FOLLOW_SA].item())
+            and bool(cur_action_mask[ACTION_NEAREST].item())
+        ):
+            # Keep gradient attached so the regularizer really updates the actor.
+            nearest_reg_loss = nearest_reg_weight * action_probs[ACTION_NEAREST]
+            actor_loss = actor_loss + nearest_reg_loss
+            nearest_reg_losses.append(float(nearest_reg_loss.detach().item()))
+        if has_bc_target and bool(cur_action_mask[int(bc_target_action)].item()):
             _, logits_for_bc, _ = actor._forward_logits_core(
                 node_emb, node_sa_prior, cur_action_mask
             )
@@ -1045,9 +1124,32 @@ def optimize_sac(
             bc_target = torch.tensor(
                 [int(bc_target_action)], device=device, dtype=torch.long
             )
-            imitation_loss = F.cross_entropy(logits_for_bc, bc_target)
-            actor_loss = actor_loss + (bc_loss_weight * imitation_loss)
-            imitation_losses.append(imitation_loss.item())
+            apply_imitation = True
+            if q_filter_enabled:
+                q_filter_checked += 1
+                preferred_action = int(torch.argmax(action_probs.detach()).item())
+                bc_q = q_min[int(bc_target_action)]
+                preferred_q = q_min[preferred_action]
+                # Early critics are noisy; only block imitation on a clear Q disadvantage.
+                apply_imitation = bool((bc_q + q_filter_margin >= preferred_q).item())
+                if apply_imitation:
+                    q_filter_passed += 1
+                else:
+                    q_filter_blocked += 1
+            if apply_imitation and bc_loss_weight > 0:
+                imitation_loss = F.cross_entropy(logits_for_bc, bc_target)
+                if bc_target_scale is None:
+                    target_scale = (
+                        follow_sa_bc_scale
+                        if int(bc_target_action) == ACTION_FOLLOW_SA
+                        else stay_bc_scale
+                    )
+                else:
+                    target_scale = float(bc_target_scale)
+                actor_loss = actor_loss + (bc_loss_weight * target_scale * imitation_loss)
+                imitation_losses.append(imitation_loss.item())
+            else:
+                imitation_loss = torch.tensor(0.0, device=device)
             if _hybrid_sac_dbg_transition_remaining > 0:
                 _hybrid_sac_dbg_transition_remaining -= 1
                 print(
@@ -1055,6 +1157,10 @@ def optimize_sac(
                     int(bc_target_action),
                     " loss=",
                     float(imitation_loss.item()),
+                    " q_filter_enabled=",
+                    bool(q_filter_enabled),
+                    " applied=",
+                    bool(apply_imitation),
                     sep="",
                 )
         total_actor_loss = total_actor_loss + actor_loss
@@ -1111,6 +1217,10 @@ def optimize_sac(
         'alpha': current_alpha,
         'entropy': np.mean(entropies),
         'imitation_loss': float(np.mean(imitation_losses)) if imitation_losses else 0.0,
+        'nearest_reg_loss': float(np.mean(nearest_reg_losses)) if nearest_reg_losses else 0.0,
+        'q_filter_checked': q_filter_checked,
+        'q_filter_passed': q_filter_passed,
+        'q_filter_blocked': q_filter_blocked,
     }
 
 
@@ -1253,16 +1363,33 @@ def run_hybrid_sac_microservice(
         bc_prob_schedule = [0.95, 0.85, 0.65, 0.35, 0.10]  # Proactive: 原有 schedule
     else:
         bc_prob_schedule = [0.98, 0.90, 0.75, 0.55, 0.30]  # Reactive: 更慢衰减
+    train_epoch_count = max(1, num_epochs - 1)
+    follow_sa_bc_scale = 10.0
+    stay_bc_scale = 1.0
+    q_filter_margin = 0.5
+    nearest_reg_weight = 0.03 if proactive else 0.02
+    bc_loss_weight_schedule = [
+        max(0.0, 1.0 - (e / max(1.0, train_epoch_count * 0.5)))
+        for e in range(train_epoch_count)
+    ]
     
     print(f"  [v3.7] JIT Migration + 3D Trigger Context (risk_ratio):")
     print(f"    - Train epochs: {num_epochs - 1}  |  Eval epoch: 1 (last)")
     print(f"    - BC probability schedule (training): {bc_prob_schedule}")
+    print(f"    - BC loss weight schedule (training): {bc_loss_weight_schedule}")
+    print(f"    - follow_sa_bc_scale: {follow_sa_bc_scale}")
+    print(f"    - stay_bc_scale: {stay_bc_scale}")
+    print(f"    - nearest_reg_weight: {nearest_reg_weight}")
+    print(f"    - q_filter_margin: {q_filter_margin}")
     print(f"    - Eval: BC=0, argmax policy, no memory / no optimize_sac / no soft-update")
     print(f"    - v3.7 NEW: trigger_context now 3D [proactive, reactive, risk_ratio]")
     print(f"    - v3.7 NEW: Dynamic migration discount based on risk_ratio")
     
     bc_actions_taken = 0       # Counter for BC (SA imitation) actions
     explore_actions_taken = 0  # Counter for exploration actions
+    q_filter_checked_total = 0
+    q_filter_passed_total = 0
+    q_filter_blocked_total = 0
     
     # Debug counters for proactive trigger analysis
     _debug_reactive_triggers = 0
@@ -1272,6 +1399,11 @@ def run_hybrid_sac_microservice(
     eval_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
     eval_action_migration_counts = np.zeros(ACTION_DIM, dtype=np.int64)
     eval_follow_sa_stay = 0
+    eval_action_prob_sums = np.zeros(ACTION_DIM, dtype=np.float64)
+    eval_q_sums = np.zeros(ACTION_DIM, dtype=np.float64)
+    eval_prob_q_count = 0
+    eval_sa_migrate_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
+    eval_sa_stay_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
 
     # 旁路：仅推理实验（inference_mode）建表；训练阶段不分配、不写入
     dag_migration_stats = (
@@ -1357,6 +1489,7 @@ def run_hybrid_sac_microservice(
     entropy_history = []
     alpha_history = []
     imitation_loss_history = []
+    nearest_reg_loss_history = []
     
     # 时延探针初始化
     total_decision_time = 0.0
@@ -1395,6 +1528,33 @@ def run_hybrid_sac_microservice(
             taxi_dag_type.clear()
         taxi_last = {}
         print(f"\n  === Epoch {epoch + 1}/{num_epochs} ===")
+        if is_eval_epoch or inference_mode:
+            epoch_bc_prob = 0.0
+            current_bc_loss_weight = 0.0
+            effective_bc_loss_weight = 0.0
+            q_filter_enabled = False
+        else:
+            epoch_bc_prob = (
+                bc_prob_schedule[epoch] if epoch < len(bc_prob_schedule) else 0.0
+            )
+            current_bc_loss_weight = (
+                bc_loss_weight_schedule[epoch]
+                if epoch < len(bc_loss_weight_schedule)
+                else 0.0
+            )
+            effective_bc_loss_weight = current_bc_loss_weight
+            q_filter_enabled = (
+                epoch >= 3
+                and 0.0 < current_bc_loss_weight < 0.8
+                and len(memory) >= 5 * batch_size
+            )
+        print(
+            "  [BC] prob="
+            f"{epoch_bc_prob:.3f} loss_weight={current_bc_loss_weight:.3f} "
+            f"follow_scale={follow_sa_bc_scale:.1f} stay_scale={stay_bc_scale:.1f} "
+            f"nearest_reg={nearest_reg_weight:.3f} effective={effective_bc_loss_weight:.3f} "
+            f"q_filter={q_filter_enabled}"
+        )
         
         if is_eval_epoch:
             print("  [EVAL] Pure evaluation epoch — reset reported metrics; "
@@ -1414,6 +1574,11 @@ def run_hybrid_sac_microservice(
             eval_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
             eval_action_migration_counts = np.zeros(ACTION_DIM, dtype=np.int64)
             eval_follow_sa_stay = 0
+            eval_action_prob_sums = np.zeros(ACTION_DIM, dtype=np.float64)
+            eval_q_sums = np.zeros(ACTION_DIM, dtype=np.float64)
+            eval_prob_q_count = 0
+            eval_sa_migrate_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
+            eval_sa_stay_action_counts = np.zeros(ACTION_DIM, dtype=np.int64)
             gat_network.eval()
             actor.eval()
             critic.eval()
@@ -1568,12 +1733,7 @@ def run_hybrid_sac_microservice(
                 action_mask_phy = build_microservice_action_mask(candidates, device)
                 
                 # BC probability: training uses schedule; eval/inference forces 0 (no imitation)
-                if is_eval_epoch or inference_mode:
-                    current_bc_prob = 0.0
-                else:
-                    current_bc_prob = (
-                        bc_prob_schedule[epoch] if epoch < len(bc_prob_schedule) else 0.0
-                    )
+                current_bc_prob = epoch_bc_prob
                 
                 # ⚠️ 评估/推理模式：使用时延探针包裹整个决策过程
                 if is_eval_epoch or inference_mode:
@@ -1590,14 +1750,22 @@ def run_hybrid_sac_microservice(
                             node_emb = embeddings[node_idx]
                             node_sa_prior = sa_prior_t[node_idx]
                             sa_proposed_server = sa_proposal[ms_node]
-                            
-                            # 使用 deterministic 动作（argmax）+ 合法动作掩码
-                            action = actor.get_action_deterministic(
-                                node_emb, node_sa_prior, action_mask_phy
+                            current_node_server = taxi_dag_assignments[taxi_id][ms_node]
+                            node_action_mask = build_node_action_mask(
+                                action_mask_phy,
+                                sa_proposed_server=sa_proposed_server,
+                                current_node_server=current_node_server,
                             )
                             
+                            # 使用 deterministic 动作（argmax）+ 合法动作掩码，同时记录概率/Q 诊断
+                            action_probs_eval, _ = actor(
+                                node_emb, node_sa_prior, node_action_mask
+                            )
+                            q1_eval, q2_eval = critic(node_emb, node_sa_prior)
+                            q_eval = torch.min(q1_eval, q2_eval)
+                            action = int(torch.argmax(action_probs_eval).item())
+                            
                             # 执行动作（更新 taxi_dag_assignments）
-                            current_node_server = taxi_dag_assignments[taxi_id][ms_node]
                             if action == 0:  # STAY
                                 target_server = current_node_server
                             elif action == 1:  # FOLLOW SA
@@ -1606,6 +1774,13 @@ def run_hybrid_sac_microservice(
                                 target_server = nearest_server_id
                             
                             eval_action_counts[action] += 1
+                            eval_action_prob_sums += action_probs_eval.detach().cpu().numpy()
+                            eval_q_sums += q_eval.detach().cpu().numpy()
+                            eval_prob_q_count += 1
+                            if sa_proposed_server != current_node_server:
+                                eval_sa_migrate_action_counts[action] += 1
+                            else:
+                                eval_sa_stay_action_counts[action] += 1
                             if action == ACTION_FOLLOW_SA and sa_proposed_server == current_node_server:
                                 eval_follow_sa_stay += 1
                             if target_server != current_node_server:
@@ -1651,10 +1826,37 @@ def run_hybrid_sac_microservice(
                         node_emb = embeddings_step[node_idx]
                         node_sa_prior = sa_prior_step[node_idx]
                         current_node_server = taxi_dag_assignments[taxi_id][ms_node]
+                        node_action_mask = build_node_action_mask(
+                            action_mask_phy,
+                            sa_proposed_server=sa_proposed_server,
+                            current_node_server=current_node_server,
+                        )
                         bc_target_action = (
                             ACTION_FOLLOW_SA
                             if sa_proposed_server != current_node_server
                             else ACTION_STAY
+                        )
+                        risk_ratio = (
+                            float(cur_graph_state['trigger_context'][2])
+                            if len(cur_graph_state.get('trigger_context', [])) >= 3
+                            else 1.0
+                        )
+                        has_bc_target = bc_target_action == ACTION_FOLLOW_SA
+                        if (
+                            bc_target_action == ACTION_STAY
+                            and (trigger_type == TRIGGER_REACTIVE or risk_ratio < 0.5)
+                            and bool(node_action_mask[ACTION_STAY].item())
+                        ):
+                            has_bc_target = True
+                        bc_target_scale = (
+                            follow_sa_bc_scale
+                            if bc_target_action == ACTION_FOLLOW_SA
+                            else stay_bc_scale
+                        )
+                        nearest_reg_eligible = (
+                            bc_target_action == ACTION_FOLLOW_SA
+                            and bool(node_action_mask[ACTION_FOLLOW_SA].item())
+                            and bool(node_action_mask[ACTION_NEAREST].item())
                         )
                         used_bc_target = False
 
@@ -1672,7 +1874,7 @@ def run_hybrid_sac_microservice(
                             else:
                                 # Exploration: Sample from learned policy（带掩码）
                                 action, _ = actor.sample_action(
-                                    node_emb, node_sa_prior, action_mask_phy
+                                    node_emb, node_sa_prior, node_action_mask
                                 )
                                 explore_actions_taken += 1
                         
@@ -1697,6 +1899,19 @@ def run_hybrid_sac_microservice(
                             if is_last_node
                             else cur_node_to_idx[sorted_nodes[pos + 1]]
                         )
+                        if is_last_node:
+                            next_action_mask = torch.ones(
+                                ACTION_DIM, dtype=torch.bool, device=device
+                            )
+                        else:
+                            next_ms_node = sorted_nodes[pos + 1]
+                            next_sa_proposed_server = sa_proposal[next_ms_node]
+                            next_current_server = taxi_dag_assignments[taxi_id][next_ms_node]
+                            next_action_mask = build_node_action_mask(
+                                action_mask_phy,
+                                sa_proposed_server=next_sa_proposed_server,
+                                current_node_server=next_current_server,
+                            )
                         node_transitions.append({
                             "graph_state": cur_graph_state,
                             "node_idx": node_idx,
@@ -1704,8 +1919,13 @@ def run_hybrid_sac_microservice(
                             "next_graph_state": next_graph_state_step,
                             "next_node_idx": next_node_idx,
                             "is_last": is_last_node,
-                            "has_bc_target": used_bc_target,
+                            "action_mask": node_action_mask.detach().cpu().clone(),
+                            "next_action_mask": next_action_mask.detach().cpu().clone(),
+                            "used_bc_action": used_bc_target,
+                            "has_bc_target": has_bc_target,
                             "bc_target_action": bc_target_action,
+                            "bc_target_scale": bc_target_scale,
+                            "nearest_reg_eligible": nearest_reg_eligible,
                         })
                         global_step += 1
                 
@@ -1748,7 +1968,6 @@ def run_hybrid_sac_microservice(
                 # Sparse DAG reward: only terminal node receives the placement reward.
                 # Intermediate node transitions bootstrap with gamma=1 in optimize_sac.
                 if not is_eval_epoch:
-                    mask_cpu = action_mask_phy.detach().cpu().clone()
                     for transition in node_transitions:
                         is_last = transition["is_last"]
                         step_reward = reward if is_last else 0.0
@@ -1760,10 +1979,13 @@ def run_hybrid_sac_microservice(
                             step_reward,
                             transition["next_graph_state"],
                             is_last,
-                            mask_cpu,
+                            transition["action_mask"],
                             transition["next_node_idx"],
                             transition["has_bc_target"],
                             transition["bc_target_action"],
+                            transition["next_action_mask"],
+                            transition["nearest_reg_eligible"],
+                            transition["bc_target_scale"],
                         ))
                     
                     # -------------------------------------------------------------
@@ -1785,6 +2007,12 @@ def run_hybrid_sac_microservice(
                         target_entropy=target_entropy,
                         log_alpha=log_alpha,
                         alpha_optimizer=alpha_optimizer,
+                        bc_loss_weight=effective_bc_loss_weight,
+                        follow_sa_bc_scale=follow_sa_bc_scale,
+                        stay_bc_scale=stay_bc_scale,
+                        q_filter_enabled=q_filter_enabled,
+                        q_filter_margin=q_filter_margin,
+                        nearest_reg_weight=nearest_reg_weight,
                     )
                     
                     if train_info is not None:
@@ -1792,6 +2020,10 @@ def run_hybrid_sac_microservice(
                         entropy_history.append(train_info['entropy'])
                         alpha_history.append(train_info['alpha'])
                         imitation_loss_history.append(train_info.get('imitation_loss', 0.0))
+                        nearest_reg_loss_history.append(train_info.get('nearest_reg_loss', 0.0))
+                        q_filter_checked_total += int(train_info.get('q_filter_checked', 0))
+                        q_filter_passed_total += int(train_info.get('q_filter_passed', 0))
+                        q_filter_blocked_total += int(train_info.get('q_filter_blocked', 0))
                     
                     # -------------------------------------------------------------
                     # Phase G: Soft Update Target Critic (Every Step)
@@ -1821,6 +2053,20 @@ def run_hybrid_sac_microservice(
     print(f"\n  [DEBUG] Summary (after {num_epochs} epochs = {num_epochs - 1} train + 1 eval):")
     print(f"    - Total epochs: {num_epochs} (last epoch = deterministic eval only)")
     print(f"    - BC prob schedule (training only): {bc_prob_schedule}")
+    print(f"    - BC loss weight schedule (training only): {bc_loss_weight_schedule}")
+    print(f"    - follow_sa_bc_scale: {follow_sa_bc_scale}")
+    print(f"    - stay_bc_scale: {stay_bc_scale}")
+    print(f"    - nearest_reg_weight: {nearest_reg_weight}")
+    print(f"    - q_filter_margin: {q_filter_margin}")
+    q_filter_total = q_filter_passed_total + q_filter_blocked_total
+    q_filter_blocked_ratio = (
+        q_filter_blocked_total / q_filter_total if q_filter_total > 0 else 0.0
+    )
+    print(
+        "    - Q-filter [checked, passed, blocked]: "
+        f"[{q_filter_checked_total}, {q_filter_passed_total}, {q_filter_blocked_total}]"
+    )
+    print(f"    - Q-filter blocked ratio: {q_filter_blocked_ratio:.4f}")
     print(f"    - BC actions (SA imitation): {bc_actions_taken}")
     print(f"    - Explore actions (Actor sampling): {explore_actions_taken}")
     print(f"    - Total global steps: {global_step}")
@@ -1838,8 +2084,18 @@ def run_hybrid_sac_microservice(
         f"{eval_action_migration_counts.astype(int).tolist()}"
     )
     print(f"    - Eval FOLLOW_SA but SA_STAY: {int(eval_follow_sa_stay)}")
+    print(
+        "    - Eval actions when SA migrates [STAY, FOLLOW_SA, NEAREST]: "
+        f"{eval_sa_migrate_action_counts.astype(int).tolist()}"
+    )
+    print(
+        "    - Eval actions when SA stays [STAY, FOLLOW_SA, NEAREST]: "
+        f"{eval_sa_stay_action_counts.astype(int).tolist()}"
+    )
     if imitation_loss_history:
         print(f"    - Mean imitation loss: {float(np.mean(imitation_loss_history)):.6f}")
+    if nearest_reg_loss_history:
+        print(f"    - Mean nearest regularization loss: {float(np.mean(nearest_reg_loss_history)):.6f}")
     
     # v3.0: Print final GAT attention weights to verify physics-aware learning
     gat_network.debug_print_attention(prefix="  ")
@@ -1874,6 +2130,28 @@ def run_hybrid_sac_microservice(
         'entropy_history': entropy_history,
         'alpha_history': alpha_history,
         'imitation_loss_history': imitation_loss_history,
+        'nearest_reg_loss_history': nearest_reg_loss_history,
+        'q_filter_checked': int(q_filter_checked_total),
+        'q_filter_passed': int(q_filter_passed_total),
+        'q_filter_blocked': int(q_filter_blocked_total),
+        'q_filter_blocked_ratio': float(q_filter_blocked_ratio),
+        'eval_action_counts': eval_action_counts.astype(int).tolist(),
+        'eval_action_migration_counts': eval_action_migration_counts.astype(int).tolist(),
+        'eval_follow_sa_stay': int(eval_follow_sa_stay),
+        'eval_action_prob_sums': eval_action_prob_sums.tolist(),
+        'eval_action_prob_means': (
+            (eval_action_prob_sums / eval_prob_q_count).tolist()
+            if eval_prob_q_count > 0
+            else [0.0] * ACTION_DIM
+        ),
+        'eval_q_sums': eval_q_sums.tolist(),
+        'eval_q_means': (
+            (eval_q_sums / eval_prob_q_count).tolist()
+            if eval_prob_q_count > 0
+            else [0.0] * ACTION_DIM
+        ),
+        'eval_sa_migrate_action_counts': eval_sa_migrate_action_counts.astype(int).tolist(),
+        'eval_sa_stay_action_counts': eval_sa_stay_action_counts.astype(int).tolist(),
         # 时延信息
         'total_decision_time': total_decision_time,
         'decision_count_for_latency': decision_count_for_latency,

@@ -18,7 +18,10 @@ from prediction.simple_predictor import SimpleTrajectoryPredictor
 from run_comparison import _avg_total_cost_ms
 
 
-STAMP = "20260511_1610_cov50_predictor_v2"
+STAMP = os.environ.get(
+    "MEDIUM_VALIDATION_STAMP",
+    datetime.now().strftime("%Y%m%d_%H%M%S_cov50_stage8"),
+)
 OUT_DIR = os.path.join("experiments", f"medium_validation_{STAMP}")
 CHECKPOINT_DIR = os.path.join(OUT_DIR, "checkpoints")
 PROCESSED_TAXI_PATH = os.path.join(
@@ -28,7 +31,7 @@ PROCESSED_TAXI_PATH = os.path.join(
 )
 ACTIVE_USERS = 12
 SPLIT_SEED = 42
-SAC_EPOCHS = 2
+SAC_EPOCHS = int(os.environ.get("MEDIUM_VALIDATION_SAC_EPOCHS", "6"))
 FORECAST_HORIZON = 15
 
 
@@ -73,6 +76,16 @@ def _summarize_result(res):
         "eval_action_counts",
         "eval_action_migration_counts",
         "eval_follow_sa_stay",
+        "q_filter_checked",
+        "q_filter_passed",
+        "q_filter_blocked",
+        "q_filter_blocked_ratio",
+        "eval_action_prob_sums",
+        "eval_action_prob_means",
+        "eval_q_sums",
+        "eval_q_means",
+        "eval_sa_migrate_action_counts",
+        "eval_sa_stay_action_counts",
     ]
     out = {k: _to_jsonable(res.get(k)) for k in keys if k in res}
     out["avg_total_cost_ms"] = _avg_total_cost_ms(res)

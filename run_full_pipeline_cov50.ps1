@@ -1,8 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$LogDir = Join-Path $Root "experiments\full_pipeline_20260511_1711_cov50_predictor_v2_full"
-$LogPath = Join-Path $LogDir "full_pipeline_20260511_1711_cov50_predictor_v2_full.log"
+$Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$ExperimentStamp = "${Stamp}_cov50_stage7_full"
+$LogDir = Join-Path $Root "experiments\full_pipeline_$ExperimentStamp"
+$LogPath = Join-Path $LogDir "full_pipeline_$ExperimentStamp.log"
 $ExitCodePath = Join-Path $LogDir "exit_code.txt"
 $RunnerPath = Join-Path $LogDir "run_detached.ps1"
 
@@ -12,6 +14,7 @@ Remove-Item -Force -ErrorAction SilentlyContinue $ExitCodePath
 $runner = @"
 `$ErrorActionPreference = "Continue"
 Set-Location "$Root"
+`$env:FULL_PIPELINE_STAMP = "$ExperimentStamp"
 python -u "run_full_pipeline_cov50.py" > "$LogPath" 2>&1
 `$code = `$LASTEXITCODE
 if (`$null -eq `$code) { `$code = 0 }

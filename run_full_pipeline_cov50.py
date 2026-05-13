@@ -17,7 +17,10 @@ from prediction.simple_predictor import SimpleTrajectoryPredictor
 from run_comparison import _avg_total_cost_ms, build_dag_adaptive_dual_appendix
 
 
-STAMP = "20260511_1711_cov50_predictor_v2_full"
+STAMP = os.environ.get(
+    "FULL_PIPELINE_STAMP",
+    datetime.now().strftime("%Y%m%d_%H%M%S_cov50_stage7_full"),
+)
 OUT_DIR = os.path.join("experiments", f"full_pipeline_{STAMP}")
 CHECKPOINT_DIR = os.path.join(OUT_DIR, "checkpoints")
 PROCESSED_TAXI_PATH = os.path.join(
@@ -84,6 +87,16 @@ def _summarize_result(res):
         "eval_action_counts",
         "eval_action_migration_counts",
         "eval_follow_sa_stay",
+        "q_filter_checked",
+        "q_filter_passed",
+        "q_filter_blocked",
+        "q_filter_blocked_ratio",
+        "eval_action_prob_sums",
+        "eval_action_prob_means",
+        "eval_q_sums",
+        "eval_q_means",
+        "eval_sa_migrate_action_counts",
+        "eval_sa_stay_action_counts",
     ]
     out = {k: _to_jsonable(res.get(k)) for k in keys if k in res}
     out["avg_total_cost_ms"] = _avg_total_cost_ms(res)
