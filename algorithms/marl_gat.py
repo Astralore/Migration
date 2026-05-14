@@ -20,7 +20,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from core.context import TRIGGER_PROACTIVE, get_trigger_type, check_sla_violation
+from core.context import (
+    DISTANCE_THRESHOLD_KM,
+    TRIGGER_PROACTIVE,
+    get_trigger_type,
+    check_sla_violation,
+)
 from core.dag_utils import (
     assign_dag_type,
     get_service_entry_nodes,
@@ -239,6 +244,93 @@ def _dag_complexity_key(dag_info):
     return "simple"
 
 
+def _server_distance_to_user(server_id, user_lat, user_lon, servers_info):
+    srv_lat, srv_lon = servers_info[server_id]
+    return float(haversine_distance(user_lat, user_lon, srv_lat, srv_lon))
+
+
+def _apply_proactive_distance_bias(
+    masked_logits,
+    sorted_nodes,
+    node_to_idx,
+    action_masks,
+    assignments,
+    candidates,
+    user_lat,
+    user_lon,
+    servers_info,
+    *,
+    bias_scale=3.0,
+    max_bias=2.5,
+):
+    """Add a small logit prior for candidate actions that move closer to the user."""
+    biased_logits = masked_logits.clone()
+    positive_bias_count = 0
+    best_action_counts = defaultdict(int)
+
+    for node in sorted_nodes:
+        if is_external_node(node):
+            continue
+        node_idx = node_to_idx[node]
+        current_server = assignments[node]
+        current_dist = _server_distance_to_user(current_server, user_lat, user_lon, servers_info)
+        best_action = 0
+        best_improvement = 0.0
+        for action in range(1, MARL_ACTION_DIM):
+            if not bool(action_masks[node_idx, action].item()):
+                continue
+            target_server = action_to_server(action, candidates, current_server)
+            target_dist = _server_distance_to_user(target_server, user_lat, user_lon, servers_info)
+            improvement = max(0.0, current_dist - target_dist)
+            if improvement <= 1e-6:
+                continue
+            bias = min(max_bias, bias_scale * improvement / max(DISTANCE_THRESHOLD_KM, 1e-6))
+            biased_logits[node_idx, action] = biased_logits[node_idx, action] + float(bias)
+            positive_bias_count += 1
+            if improvement > best_improvement:
+                best_improvement = improvement
+                best_action = action
+        best_action_counts[str(best_action)] += 1
+
+    return biased_logits, positive_bias_count, dict(best_action_counts)
+
+
+def _clip_reactive_actions(
+    actions,
+    sorted_nodes,
+    assignments,
+    candidates,
+    user_lat,
+    user_lon,
+    servers_info,
+    *,
+    max_migrations=2,
+):
+    """Keep only the top-k reactive migrations by immediate distance improvement."""
+    scored = []
+    for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
+        if is_external_node(node) or int(action) == 0:
+            continue
+        current_server = assignments[node]
+        target_server = action_to_server(action, candidates, current_server)
+        current_dist = _server_distance_to_user(current_server, user_lat, user_lon, servers_info)
+        target_dist = _server_distance_to_user(target_server, user_lat, user_lon, servers_info)
+        improvement = current_dist - target_dist
+        if improvement > 1e-6:
+            scored.append((improvement, idx))
+
+    keep = {idx for _, idx in sorted(scored, reverse=True)[:max_migrations]}
+    clipped = 0
+    clipped_actions = list(actions)
+    for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
+        if is_external_node(node) or int(action) == 0:
+            continue
+        if idx not in keep:
+            clipped_actions[idx] = 0
+            clipped += 1
+    return clipped_actions, clipped
+
+
 def run_marl_gat_microservice(
     df,
     servers_df,
@@ -256,9 +348,10 @@ def run_marl_gat_microservice(
     servers_info = build_servers_info(servers_df)
     use_proactive = proactive and predictor is not None
     if max_lambda_migration is None:
-        max_lambda_migration = 0.15 if use_proactive else 0.25  # 硬调 Reactive 到 0.25
+        # Proactive 由动作前 distance bias 引导迁移，lambda 只负责轻度成本约束。
+        max_lambda_migration = 0.05 if use_proactive else 0.3
     if max_lambda_split is None:
-        max_lambda_split = 0.05 if use_proactive else 0.10  # 硬调 Reactive 到 0.10
+        max_lambda_split = 0.02 if use_proactive else 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  Lambda: migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}")
 
@@ -306,6 +399,9 @@ def run_marl_gat_microservice(
     total_future_penalty_ms = 0.0
     local_migration_cost_sum = 0.0
     edge_split_cost_sum = 0.0
+    proactive_logit_bias_count = 0
+    proactive_best_bias_action_counts = {str(i): 0 for i in range(MARL_ACTION_DIM)}
+    reactive_action_clipped_count = 0
     invalid_action_masked_count = 0
     action_mask_fallback_count = 0
     agent_decision_count = 0
@@ -359,6 +455,9 @@ def run_marl_gat_microservice(
             local_migration_cost_sum = 0.0
             edge_split_cost_sum = 0.0
             dense_distance_bonus_sum = 0.0
+            proactive_logit_bias_count = 0
+            proactive_best_bias_action_counts = {str(i): 0 for i in range(MARL_ACTION_DIM)}
+            reactive_action_clipped_count = 0
             invalid_action_masked_count = 0
             action_mask_fallback_count = 0
             agent_decision_count = 0
@@ -495,6 +594,23 @@ def run_marl_gat_microservice(
                     masked_logits, masked_count, fallback_count = _apply_action_mask(
                         logits, tensors["action_masks"]
                     )
+                    if use_proactive and trigger_type == TRIGGER_PROACTIVE:
+                        masked_logits, bias_count, best_bias_actions = _apply_proactive_distance_bias(
+                            masked_logits,
+                            sorted_nodes,
+                            node_to_idx,
+                            tensors["action_masks"],
+                            taxi_dag_assignments[taxi_id],
+                            candidates,
+                            current_lat,
+                            current_lon,
+                            servers_info,
+                        )
+                        proactive_logit_bias_count += bias_count
+                        for key, value in best_bias_actions.items():
+                            proactive_best_bias_action_counts[key] = (
+                                proactive_best_bias_action_counts.get(key, 0) + value
+                            )
                     invalid_action_masked_count += masked_count
                     action_mask_fallback_count += fallback_count
                     probs = F.softmax(masked_logits, dim=-1)
@@ -509,12 +625,25 @@ def run_marl_gat_microservice(
                         else:
                             action = int(torch.argmax(probs[node_idx]).item())
                         actions.append(action)
-                        current_server = taxi_dag_assignments[taxi_id][ms_node]
-                        target_server = (
-                            current_server
-                            if is_external_node(ms_node)
-                            else action_to_server(action, candidates, current_server)
+
+                    if trigger_type != TRIGGER_PROACTIVE:
+                        actions, clipped_count = _clip_reactive_actions(
+                            actions,
+                            sorted_nodes,
+                            taxi_dag_assignments[taxi_id],
+                            candidates,
+                            current_lat,
+                            current_lon,
+                            servers_info,
                         )
+                        reactive_action_clipped_count += clipped_count
+
+                    for ms_node, action in zip(sorted_nodes, actions):
+                        current_server = taxi_dag_assignments[taxi_id][ms_node]
+                        if is_external_node(ms_node):
+                            target_server = current_server
+                        else:
+                            target_server = action_to_server(action, candidates, current_server)
                         taxi_dag_assignments[taxi_id][ms_node] = target_server
 
                 total_decision_time += time.perf_counter() - t0
@@ -541,7 +670,7 @@ def run_marl_gat_microservice(
                     trigger_type=trigger_type,
                     lambda_migration=lm,
                     lambda_split=ls,
-                    dense_distance_bonus_max=8.0 if use_proactive else 0.0,  # 增加 Proactive 激励
+                    # dense_distance_bonus_max 参数已废弃，新逻辑基于真实物理距离计算
                 )
                 del agent_rewards
                 total_reward_sum += shared_reward
@@ -613,6 +742,11 @@ def run_marl_gat_microservice(
             pbar.update(1)
         pbar.close()
 
+        # 按 epoch 保存检查点，避免一次崩溃导致全部丢失
+        if (not inference_mode) and save_checkpoint_path and epoch < num_epochs - 1:
+            epoch_ckpt_path = save_checkpoint_path.replace(".pth", f"_epoch_{epoch}.pth")
+            _save_marl_checkpoint(epoch_ckpt_path, encoder, actor, critic)
+
     if (not inference_mode) and save_checkpoint_path:
         _save_marl_checkpoint(save_checkpoint_path, encoder, actor, critic)
 
@@ -673,6 +807,9 @@ def run_marl_gat_microservice(
         "local_migration_cost_sum": local_migration_cost_sum,
         "edge_split_cost_sum": edge_split_cost_sum,
         "dense_distance_bonus_sum": dense_distance_bonus_sum,
+        "proactive_logit_bias_count": proactive_logit_bias_count,
+        "proactive_best_bias_action_counts": dict(proactive_best_bias_action_counts),
+        "reactive_action_clipped_count": reactive_action_clipped_count,
         "cost_by_dag_complexity": {
             k: {
                 **v,

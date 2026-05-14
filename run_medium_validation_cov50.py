@@ -32,7 +32,7 @@ PROCESSED_TAXI_PATH = os.path.join(
 )
 ACTIVE_USERS = 12
 SPLIT_SEED = 42
-MARL_EPOCHS = int(os.environ.get("MEDIUM_VALIDATION_MARL_EPOCHS", "4"))
+MARL_EPOCHS = int(os.environ.get("MEDIUM_VALIDATION_MARL_EPOCHS", "8"))
 FORECAST_HORIZON = 15
 
 
@@ -103,6 +103,9 @@ def _summarize_result(res):
         "local_migration_cost_sum",
         "edge_split_cost_sum",
         "dense_distance_bonus_sum",
+        "proactive_logit_bias_count",
+        "proactive_best_bias_action_counts",
+        "reactive_action_clipped_count",
         "cost_by_dag_complexity",
         "cost_by_dag_type",
         "migrations_by_dag_type",
@@ -258,7 +261,7 @@ def _write_report(payload):
 
 - 验证脚本显式使用 cov50 覆盖过滤数据，不再读取旧 cleaned CSV。
 - train/test 按最近服务器距离风险暴露平衡切分，减少 proactive opportunity 偏斜。
-- Avg Total Cost 使用 `total_cost_ms_sum / decision_count`，包含 SLA / future / tearing。
+- Avg Total Cost 使用 `total_cost_ms_sum / decision_count`，包含 SLA / future / tearing.
 
 """
     with open(os.path.join(OUT_DIR, "result.md"), "w", encoding="utf-8") as f:

@@ -20,7 +20,7 @@ from run_comparison import _avg_total_cost_ms, build_dag_adaptive_dual_appendix
 
 STAMP = os.environ.get(
     "FULL_PIPELINE_STAMP",
-    datetime.now().strftime("%Y%m%d_%H%M%S_cov50_stage7_full"),
+    datetime.now().strftime("%Y%m%d_%H%M%S_cov50_stage9_full"),
 )
 OUT_DIR = os.path.join("experiments", f"full_pipeline_{STAMP}")
 CHECKPOINT_DIR = os.path.join(OUT_DIR, "checkpoints")
@@ -33,8 +33,8 @@ PROCESSED_TAXI_PATH = os.path.join(
 ACTIVE_USERS = 100
 SPLIT_SEED = 42
 FORECAST_HORIZON = 15
-MARL_EPOCHS_PROACTIVE = 4
-MARL_EPOCHS_REACTIVE = 4
+MARL_EPOCHS_PROACTIVE = 8  # 与中等规模实验保持一致
+MARL_EPOCHS_REACTIVE = 8   # 与中等规模实验保持一致
 
 
 def _prepare_dirs():
@@ -114,6 +114,9 @@ def _summarize_result(res):
         "local_migration_cost_sum",
         "edge_split_cost_sum",
         "dense_distance_bonus_sum",
+        "proactive_logit_bias_count",
+        "proactive_best_bias_action_counts",
+        "reactive_action_clipped_count",
         "cost_by_dag_complexity",
         "cost_by_dag_type",
         "migrations_by_dag_type",

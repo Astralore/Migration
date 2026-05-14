@@ -1,224 +1,198 @@
-# MARL 阶段四：结合 DAG 数据特性的物理语义修复
+# MARL 阶段五：策略坍缩与过度迁移最终修复
 
-## 一、本轮实验与 DAG 数据的共同结论
+## 一、当前暴露的问题
 
-最新中等规模实验目录：`experiments\medium_validation_20260513_203241_cov50_stage8`
+最新中等规模 8 epoch 实验说明，单纯增加训练轮数没有解决核心问题：
 
-本轮阶段三修复后，训练段已经明显缓解“全员迁移”：
+- Proactive：训练和推理都出现 `stay_action_ratio = 1.0`、`total_migrations = 0`，说明策略坍缩为全 STAY。
+- Reactive：仍出现 `controlled_all_agents_migrated_ratio = 1.0`，说明策略在触发后倾向把所有可控微服务一起迁移。
+- `dense_distance_bonus_sum` 很大，但没有带来 Proactive 迁移，说明它作为“动作后奖励”不能直接解决探索阶段看不到迁移动作的问题。
+- 继续提高 lambda 不是稳健方案，之前已经出现过从“全搬”直接翻到“全不搬”的敏感振荡。
 
-- Proactive 训练：`all_agents_migrated_ratio = 2.08%`，`stay_action_ratio = 55.69%`
-- Reactive 训练：`all_agents_migrated_ratio = 3.39%`，`stay_action_ratio = 46.36%`
+结论：这次必须同时修三类问题：Proactive 的动作前引导、Reactive 的 joint action 约束、以及 dense reward 的尺度失控。
 
-但测试推理仍然存在泛化坍缩：
+## 二、本次已实施的修复
 
-- Proactive 推理：`all_agents_migrated_ratio = 79.84%`
-- Reactive 推理：`all_agents_migrated_ratio = 83.91%`
-- Reactive 推理平均成本仍高达 `49769.77ms`
+### 1. Proactive：降低默认 lambda，避免成本项压死探索
 
-这说明问题不只是 lambda 或 dense reward，而是当前 `MICROSERVICE_DAGS` 的数据语义和算法环境之间存在不一致。
-
-## 二、DAG 数据特性对当前算法的影响
-
-### 1. `USER` / `UNKNOWN` / `UNAVAILABLE` 不是可迁移微服务
-
-`core/microservice_dags.py` 中确实存在外部节点：
-
-- `Data_Heavy_DAG`：`USER`、`UNKNOWN`
-- `Compute_Heavy_DAG`：`UNKNOWN`
-- `FanOut_Broadcaster_2`：`UNAVAILABLE`
-- `Diamond_DAG_1`：`USER`、`UNKNOWN`
-
-当前代码的问题是：
-
-- `initialize_dag_assignment(...)` 会把所有 DAG 节点都部署到边缘服务器。
-- `build_marl_graph_state(...)` 默认所有节点 `node_movable=True`。
-- `marl_gat.py` 会对 `topological_sort(dag_info)` 的所有节点采样动作。
-- `calculate_microservice_reward(...)` 会把所有发生 assignment 变化的节点都计入迁移成本。
-
-因此当前算法确实可能“迁移 USER / UNKNOWN / UNAVAILABLE”。这不是策略问题，而是环境建模漏洞。
-
-### 2. 许多 DAG 本身非常轻量，部分全迁移并非必然错误
-
-例如：
-
-- `FanOut_Broadcaster_2` 全部节点 `state_mb = 0`，大多是 `50MB` 镜像。
-- `Compute_Heavy_DAG` 全部节点 `state_mb = 0`，大多是 `200MB` 镜像。
-
-这类 DAG 中，如果只看 SLA 惩罚与单节点迁移成本，全迁移可能确实是短期最优。因此不能把所有全员迁移都视为算法错误。
-
-真正的问题是：当前系统没有模拟“同一时刻多个节点迁往同一目标服务器时的带宽竞争”，导致集体迁移过于便宜。
-
-### 3. 高状态节点的异构性存在，但梯度尺度仍可能不足
-
-数据中已有明显异构：
-
-- `FanIn_Aggregator_2.MS_27421`：`state_mb = 512`
-- `FanOut_Broadcaster_3.MS_13448`：`state_mb = 512`
-- `Diamond_DAG_1.UNKNOWN`：`state_mb = 512`，但它应被视为外部节点，不应迁移
-
-当前 `core/marl_reward.py` 已按 `image_mb + state_mb` 计算 local migration cost，因此“没有异构迁移成本”这个判断不成立。
-
-但当前 reward 是 log-scaled shared reward + normalized local penalty。仅靠继续把 `lambda_migration` 拉到 `1.0/1.5` 风险很大，之前小样本已出现过从“过度迁移”翻到“全 STAY”的现象。
-
-## 三、对原修改方案的修正
-
-### 原方案 1：Pinned Nodes，方向正确，但必须同时修 reward / entry 语义
-
-只在 action mask 中把外部节点锁为 `STAY` 还不够，因为当前 reward 和 entry 计算仍会把它们当成可部署服务。
-
-必须新增统一节点分类：
+目标文件：`algorithms/marl_gat.py`
 
 ```python
-EXTERNAL_NODE_NAMES = {"USER", "UNKNOWN", "UNAVAILABLE"}
-
-def is_external_node(node_name):
-    return node_name in EXTERNAL_NODE_NAMES
-
-def get_deployable_nodes(dag_info):
-    return [n for n in dag_info["nodes"] if not is_external_node(n)]
+if max_lambda_migration is None:
+    # Proactive 由动作前 distance bias 引导迁移，lambda 只负责轻度成本约束。
+    max_lambda_migration = 0.05 if use_proactive else 0.3
+if max_lambda_split is None:
+    max_lambda_split = 0.02 if use_proactive else 0.1
 ```
 
-后续所有“迁移控制”和“迁移成本”只作用于 deployable nodes；GAT message passing 仍保留 external nodes。
+Proactive 的默认成本权重从偏大的 `0.5 / 0.2` 改为 `0.05 / 0.02`。迁移动作由候选距离 bias 负责引导，lambda 只保留轻度成本约束。
 
-### 原方案 2：并发带宽竞争，方向正确，但目标文件不是只改 `core/reward.py`
+### 2. Proactive：加入动作前 counterfactual distance logit bias
 
-当前 GAT-MARL 训练使用：
+目标文件：`algorithms/marl_gat.py`
 
-- shared reward：`core/reward.py::calculate_microservice_reward(...)`
-- local reward：`core/marl_reward.py::calculate_marl_rewards(...)`
-
-因此并发惩罚必须至少进入 `core/marl_reward.py` 的 `_local_migration_costs(...)`，否则 Actor 学不到“同一目标服务器拥塞”的局部代价。
-
-为了评估指标一致，最好也同步修改 `core/reward.py` 中的 total migration cost；否则训练成本与报告成本会不一致。
-
-### 原方案 3：lambda 提到 `1.0/1.5`，不建议作为默认
-
-当前最新实验中 lambda 已经正确生效：
-
-- Proactive：`lambda_migration = 0.15`，`lambda_split = 0.05`
-- Reactive：`lambda_migration = 0.20`，`lambda_split = 0.08`
-
-Reactive 推理仍过度迁移，说明确实需要更强约束；但直接改到 `1.0/1.5` 会极大增加全 STAY 风险。
-
-正确做法是先修物理建模漏洞，再做小步 lambda 消融，例如：
-
-- Reactive：`0.20 / 0.08` → `0.25 / 0.10` → `0.30 / 0.12`
-- Proactive：先保持 `0.15 / 0.05`
-
-## 四、必须修改的代码方案
-
-### 任务 1：新增 DAG 节点语义工具
-
-目标文件：建议新增 `core/microservice_node_types.py`，或放入 `core/dag_utils.py`。
-
-需要提供：
+核心思想：在 Actor softmax 前，对每个候选动作做反事实距离评估。如果候选服务器比当前服务器更接近用户，就给该候选动作增加一个小的 logit bias。
 
 ```python
-EXTERNAL_NODE_NAMES = {"USER", "UNKNOWN", "UNAVAILABLE"}
+def _apply_proactive_distance_bias(
+    masked_logits,
+    sorted_nodes,
+    node_to_idx,
+    action_masks,
+    assignments,
+    candidates,
+    user_lat,
+    user_lon,
+    servers_info,
+    *,
+    bias_scale=3.0,
+    max_bias=2.5,
+):
+    biased_logits = masked_logits.clone()
+    positive_bias_count = 0
+    best_action_counts = defaultdict(int)
 
-def is_external_node(node_name):
-    return node_name in EXTERNAL_NODE_NAMES
+    for node in sorted_nodes:
+        if is_external_node(node):
+            continue
+        node_idx = node_to_idx[node]
+        current_server = assignments[node]
+        current_dist = _server_distance_to_user(current_server, user_lat, user_lon, servers_info)
+        best_action = 0
+        best_improvement = 0.0
+        for action in range(1, MARL_ACTION_DIM):
+            if not bool(action_masks[node_idx, action].item()):
+                continue
+            target_server = action_to_server(action, candidates, current_server)
+            target_dist = _server_distance_to_user(target_server, user_lat, user_lon, servers_info)
+            improvement = max(0.0, current_dist - target_dist)
+            if improvement <= 1e-6:
+                continue
+            bias = min(max_bias, bias_scale * improvement / max(DISTANCE_THRESHOLD_KM, 1e-6))
+            biased_logits[node_idx, action] = biased_logits[node_idx, action] + float(bias)
+            positive_bias_count += 1
+            if improvement > best_improvement:
+                best_improvement = improvement
+                best_action = action
+        best_action_counts[str(best_action)] += 1
 
-def get_deployable_nodes(dag_info):
-    return [n for n in dag_info["nodes"] if not is_external_node(n)]
-
-def get_service_entry_nodes(dag_info):
-    # 返回真正的可部署入口服务：
-    # 1. deployable 子图中没有 deployable 入边的节点
-    # 2. 或直接由 USER / UNKNOWN / UNAVAILABLE 指向的 deployable 节点
+    return biased_logits, positive_bias_count, dict(best_action_counts)
 ```
 
-`get_service_entry_nodes(...)` 很关键，因为原 `get_entry_nodes(...)` 会把 `USER/UNKNOWN` 当入口，从而污染 SLA 距离和 proactive trigger。
+这解决的是 Proactive “奖励存在但动作采样阶段仍全 STAY”的问题。它不是替代 Actor，而是在合法 action mask 之后、softmax 之前提供物理先验。
 
-### 任务 2：Pinned Nodes 只参与图编码，不参与动作控制
+### 3. Dense distance bonus：从毫秒级巨额奖励改为 reward 同尺度
 
-目标文件：`core/marl_state_builder.py`、`algorithms/marl_gat.py`
-
-修改要求：
-
-- `build_marl_graph_state(...)` 中 external nodes 的 action mask 强制为 `[STAY=True, 其他=False]`。
-- node feature 增加 `is_external` 一维，因此 `GraphEncoder(node_feat_dim=14, ...)`。
-- `marl_gat.py` 执行动作时，external nodes 即使 Actor 输出非 STAY，也必须强制保留原 assignment。
-- 统计指标新增：
-  - `controlled_agents_per_decision`
-  - `pinned_agents_per_decision`
-  - `controlled_migrations`
-  - `controlled_all_agents_migrated_ratio`
-
-注意：原 `avg_agents_per_decision` 包含 external nodes 后会失真，后续判断过度迁移应看 controlled 指标。
-
-### 任务 3：reward / trigger 只对可部署入口服务计算 SLA
-
-目标文件：`core/reward.py`、`core/marl_reward.py`，可能还包括 proactive trigger 前的 gateway 选择逻辑。
-
-修改要求：
-
-- `_entry_access_profile(...)` 不应再用原始 `get_entry_nodes(...)`，应改用 `get_service_entry_nodes(...)`。
-- `estimate_dag_migration_time_s(...)` 默认只估计 deployable nodes。
-- `calculate_microservice_reward(...)` 的 migration cost 只统计 deployable nodes。
-- `calculate_marl_rewards(...)` 的 local migration / split penalty 只对 deployable nodes 产生有效惩罚，external nodes 的 agent reward 只作为图上下文，不应驱动动作学习。
-
-如果某个 DAG 的 service entry 为空，回退到 deployable nodes 中拓扑最靠前的节点，不能回退到 `USER/UNKNOWN`。
-
-### 任务 4：加入并发带宽竞争惩罚
-
-目标文件：`core/marl_reward.py`，建议同步 `core/reward.py`。
-
-对当前 step 中迁移到同一 target server 的 deployable nodes 计数：
+目标文件：`core/marl_reward.py`
 
 ```python
-target_counts[target_server] += 1
+def _dense_distance_bonuses(
+    dag_info,
+    current_assignments,
+    previous_assignments,
+    user_location,
+    servers_info,
+    trigger_type,
+    *,
+    proactive_bonus_per_km=0.4,
+    proactive_bonus_max=6.0,
+):
+    ...
+    if trigger_type == TRIGGER_PROACTIVE:
+        risk_factor = 1.0 + risk_ratio
+        bonus_value = min(
+            proactive_bonus_max,
+            distance_reduction_km * proactive_bonus_per_km * risk_factor,
+        )
+    else:
+        bonus_value = 0.0
 ```
 
-迁移成本改为：
+原来的 `1000.0 / km` 会让 dense bonus 达到几十万级别，和 log-scaled shared reward 不在同一尺度。本次改为单节点最多 `6.0` reward units，避免训练不稳定。
+
+### 4. Reactive：加入基于距离收益的 joint action top-k 裁剪
+
+目标文件：`algorithms/marl_gat.py`
+
+核心思想：Reactive 不能只靠 lambda 抑制全员迁移。Actor 先给出动作，然后只保留本 step 中“距离收益最高”的前 `2` 个迁移动作，其余迁移动作强制改为 STAY。
 
 ```python
-effective_node_bandwidth = effective_bandwidth / target_counts[target_server]
-cost_ms = ((image_mb + state_mb) * MB_TO_MBIT / effective_node_bandwidth) * 1000 + BASE_MIGRATION_OVERHEAD_MS
+def _clip_reactive_actions(
+    actions,
+    sorted_nodes,
+    assignments,
+    candidates,
+    user_lat,
+    user_lon,
+    servers_info,
+    *,
+    max_migrations=2,
+):
+    scored = []
+    for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
+        if is_external_node(node) or int(action) == 0:
+            continue
+        current_server = assignments[node]
+        target_server = action_to_server(action, candidates, current_server)
+        current_dist = _server_distance_to_user(current_server, user_lat, user_lon, servers_info)
+        target_dist = _server_distance_to_user(target_server, user_lat, user_lon, servers_info)
+        improvement = current_dist - target_dist
+        if improvement > 1e-6:
+            scored.append((improvement, idx))
+
+    keep = {idx for _, idx in sorted(scored, reverse=True)[:max_migrations]}
+    clipped = 0
+    clipped_actions = list(actions)
+    for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
+        if is_external_node(node) or int(action) == 0:
+            continue
+        if idx not in keep:
+            clipped_actions[idx] = 0
+            clipped += 1
+    return clipped_actions, clipped
 ```
 
-这比单纯增大 lambda 更合理，因为它只惩罚“同一时刻挤到同一个目标服务器”的集体迁移，而不会无差别压制所有迁移。
+这会直接打断 Reactive 的 `controlled_all_agents_migrated_ratio = 1.0` 问题，同时保留最有物理收益的迁移动作。
 
-### 任务 5：按 DAG 类型输出诊断，不要只看 overall
+### 5. 新增诊断指标
 
-当前 `cost_by_dag_complexity` 只有 simple / medium，不足以判断问题是否集中在某些 DAG。
+目标文件：`algorithms/marl_gat.py`、`run_medium_validation_cov50.py`、`run_full_pipeline_cov50.py`
 
-需要新增：
+新增结果字段：
 
-- `cost_by_dag_type`
-- `migrations_by_dag_type`
-- `all_agents_migrated_ratio_by_dag_type`
-- `controlled_migrations_by_dag_type`
+- `proactive_logit_bias_count`：Proactive 中被正向 bias 的候选动作次数。
+- `proactive_best_bias_action_counts`：反事实距离最优候选动作分布。
+- `reactive_action_clipped_count`：Reactive 被 top-k 约束裁剪掉的迁移动作次数。
 
-重点观察：
+这些指标必须和原有 `controlled_migrations`、`controlled_all_agents_migrated_ratio`、`stay_action_ratio` 一起看。
 
-- `FanOut_Broadcaster_2`
-- `Compute_Heavy_DAG`
-- `Data_Heavy_DAG`
-- `Diamond_DAG_1`
+## 三、已有阶段四修复仍保留
 
-如果全迁移主要集中在无状态轻量 DAG，不应过度惩罚；如果集中在含 512MB stateful 节点 DAG，则说明 local migration cost 仍不足。
+以下修复仍是必要基础，不应回退：
 
-## 五、验证顺序
+- `USER / UNKNOWN / UNAVAILABLE` 作为 external nodes：保留图编码，但不参与迁移动作。
+- `get_service_entry_nodes(...)` 用于 SLA / trigger，避免 external nodes 污染入口判断。
+- `GraphEncoder(node_feat_dim=14)` 保留 `is_external` 特征。
+- shared reward 和 local reward 只对 deployable nodes 计算迁移成本。
+- 并发带宽竞争惩罚保留，用来惩罚多个节点同时迁往同一目标服务器。
+- `controlled_*` 指标作为主要迁移行为判断依据。
 
-1. 先跑单 DAG smoke：
-   - `FanOut_Broadcaster_2`
-   - `Compute_Heavy_DAG`
-   - `Data_Heavy_DAG`
-   - `Diamond_DAG_1`
-2. 检查 external nodes：
-   - action mask 只能 STAY
-   - assignment 不发生变化
-   - migration cost 不包含 external nodes
-3. 检查并发惩罚：
-   - 同一目标服务器迁移 1 个、2 个、5 个节点时，单节点迁移成本应递增
-4. 再跑小样本 Proactive / Reactive smoke。
-5. 最后再跑中等规模验证，并删除旧 `marl_gat_*.pth`。
+## 四、验证要求
 
-## 六、禁止事项
+1. 先运行编译检查，确认 `marl_gat.py`、`marl_reward.py`、中等规模脚本、全流程脚本无语法错误。
+2. 跑小样本 Proactive smoke：
+   - 预期 `proactive_logit_bias_count > 0`
+   - 预期 `total_migrations > 0`
+   - 预期 `stay_action_ratio < 1.0`
+3. 跑小样本 Reactive smoke：
+   - 预期 `reactive_action_clipped_count > 0`
+   - 预期 `controlled_all_agents_migrated_ratio < 1.0`
+4. 再跑中等规模验证，并删除旧的 `marl_gat_*.pth`，因为 `node_feat_dim=14` 与旧 checkpoint 不兼容。
 
-- 不要把 `USER/UNKNOWN/UNAVAILABLE` 从图中删除；它们仍然是拓扑上下文。
-- 不要让 external nodes 参与迁移动作、迁移成本或 deployable entry SLA。
-- 不要只通过提高 lambda 解决过度迁移；必须先修正节点语义和并发带宽。
-- 不要把 `lambda_migration` 默认直接调到 `1.0/1.5`。
-- 不要再用包含 external nodes 的 `avg_agents_per_decision` 判断是否全员迁移，必须使用 controlled 指标。
+## 五、禁止回退事项
+
+- 不要再把 Proactive 默认 lambda 提回 `0.5 / 0.2`。
+- 不要恢复 `proactive_bonus_per_km=1000.0` 这类毫秒级 dense bonus。
+- 不要只靠增加 epoch 解决全 STAY。
+- 不要只靠提高 lambda 解决 Reactive 全员迁移。
+- 不要让 external nodes 参与迁移、迁移成本或 deployable entry SLA。

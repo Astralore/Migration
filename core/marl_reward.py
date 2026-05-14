@@ -143,36 +143,71 @@ def _dense_distance_bonuses(
     servers_info,
     trigger_type,
     *,
-    proactive_bonus_max=4.0,
-    reactive_bonus_max=0.0,
+    proactive_bonus_per_km=0.4,
+    proactive_bonus_max=6.0,
 ):
     """
-    Dense local bonus for moving a node closer to the mobile user.
+    Reward-scale dense bonus for moving closer to the user.
 
-    The project reward is log-scaled, so the bonus is also kept in single-digit
-    reward units instead of raw millisecond units.
+    The shared reward is log-scaled, so this bonus must stay in single-digit
+    reward units.  Action-time logit bias handles exploration; this post-action
+    bonus reinforces successful proactive moves without dominating training.
     """
     user_lat, user_lon = user_location
-    max_bonus = proactive_bonus_max if trigger_type == TRIGGER_PROACTIVE else reactive_bonus_max
     bonuses = {}
+    
     for node in dag_info["nodes"]:
         if is_external_node(node):
             bonuses[node] = 0.0
             continue
+        
         old_server = previous_assignments[node]
         new_server = current_assignments[node]
+        
+        # No migration = no bonus
         if old_server == new_server:
             bonuses[node] = 0.0
             continue
+        
+        # Calculate distance to user before and after migration
         old_lat, old_lon = servers_info[old_server]
         new_lat, new_lon = servers_info[new_server]
-        old_dist = float(haversine_distance(user_lat, user_lon, old_lat, old_lon))
-        new_dist = float(haversine_distance(user_lat, user_lon, new_lat, new_lon))
-        if old_dist <= 1e-6 or new_dist >= old_dist:
+        old_dist_km = float(haversine_distance(user_lat, user_lon, old_lat, old_lon))
+        new_dist_km = float(haversine_distance(user_lat, user_lon, new_lat, new_lon))
+        
+        # Only reward if actually getting closer
+        distance_reduction_km = max(0.0, old_dist_km - new_dist_km)
+        if distance_reduction_km <= 1e-6:
             bonuses[node] = 0.0
             continue
-        improvement_ratio = min((old_dist - new_dist) / old_dist, 1.0)
-        bonuses[node] = float(max_bonus * improvement_ratio)
+        
+        # Get risk_ratio from effective bandwidth calculation
+        # This reflects how close the entry nodes are to SLA violation threshold
+        risk_ratio = 0.0
+        entry_nodes = get_service_entry_nodes(dag_info)
+        if entry_nodes:
+            entry_dists = [
+                haversine_distance(
+                    user_lat, user_lon,
+                    servers_info[current_assignments[n]][0],
+                    servers_info[current_assignments[n]][1],
+                )
+                for n in entry_nodes
+            ]
+            max_entry_dist_km = float(max(entry_dists)) if entry_dists else 0.0
+            risk_ratio = min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD, 1.0) if SLA_DISTANCE_THRESHOLD > 0 else 0.0
+        
+        if trigger_type == TRIGGER_PROACTIVE:
+            risk_factor = 1.0 + risk_ratio
+            bonus_value = min(
+                proactive_bonus_max,
+                distance_reduction_km * proactive_bonus_per_km * risk_factor,
+            )
+        else:
+            bonus_value = 0.0
+            
+        bonuses[node] = float(bonus_value)
+    
     return bonuses
 
 
@@ -190,7 +225,6 @@ def calculate_marl_rewards(
     lambda_split=0.0,
     local_cost_scale_ms=1000.0,
     dense_distance_bonus=True,
-    dense_distance_bonus_max=None,  # 新增参数，支持自定义 bonus 上限
 ):
     """
     Return shared DAG reward plus per-agent rewards and decomposition details.
@@ -198,10 +232,10 @@ def calculate_marl_rewards(
     The shared reward is exactly the existing reward function's scalar reward.
     Local penalties are normalized by ``local_cost_scale_ms`` so their weights
     are comparable to the log-scaled shared reward.
-    """
-    if dense_distance_bonus_max is None:
-        dense_distance_bonus_max = 8.0 if trigger_type == TRIGGER_PROACTIVE else 0.0  # 增加 Proactive bonus 到 8.0
     
+    Distance bonus is reward-scale; proactive exploration is handled by actor
+    logit bias before action selection.
+    """
     shared_reward, details = calculate_microservice_reward(
         taxi_id,
         dag_info,
@@ -234,8 +268,6 @@ def calculate_marl_rewards(
             user_location,
             servers_info,
             trigger_type,
-            proactive_bonus_max=dense_distance_bonus_max if trigger_type == TRIGGER_PROACTIVE else 4.0,
-            reactive_bonus_max=dense_distance_bonus_max if trigger_type != TRIGGER_PROACTIVE else 0.0,
         )
         if dense_distance_bonus else {node: 0.0 for node in dag_info["nodes"]}
     )
