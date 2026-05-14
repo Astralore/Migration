@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 
 from algorithms.dqn import run_dqn_microservice_fair
-from algorithms.hybrid_sac import run_hybrid_sac_microservice
+from algorithms.marl_gat import run_marl_gat_microservice
+from algorithms.nearest import run_nearest_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
 from core.context import DISTANCE_THRESHOLD_KM
 from core.data_loader import DEFAULT_SERVER_PATH, DEFAULT_TAXI_PATH, load_data
@@ -31,7 +32,7 @@ PROCESSED_TAXI_PATH = os.path.join(
 )
 ACTIVE_USERS = 12
 SPLIT_SEED = 42
-SAC_EPOCHS = int(os.environ.get("MEDIUM_VALIDATION_SAC_EPOCHS", "6"))
+MARL_EPOCHS = int(os.environ.get("MEDIUM_VALIDATION_MARL_EPOCHS", "4"))
 FORECAST_HORIZON = 15
 
 
@@ -86,6 +87,30 @@ def _summarize_result(res):
         "eval_q_means",
         "eval_sa_migrate_action_counts",
         "eval_sa_stay_action_counts",
+        "avg_agents_per_decision",
+        "controlled_agents_per_decision",
+        "pinned_agents_per_decision",
+        "avg_migrated_agents_per_decision",
+        "avg_controlled_migrated_agents_per_decision",
+        "controlled_migrations",
+        "all_agents_migrated_decisions",
+        "all_agents_migrated_ratio",
+        "controlled_all_agents_migrated_decisions",
+        "controlled_all_agents_migrated_ratio",
+        "stay_action_ratio",
+        "candidate_action_counts",
+        "joint_action_distribution",
+        "local_migration_cost_sum",
+        "edge_split_cost_sum",
+        "dense_distance_bonus_sum",
+        "cost_by_dag_complexity",
+        "cost_by_dag_type",
+        "migrations_by_dag_type",
+        "controlled_migrations_by_dag_type",
+        "invalid_action_masked_count",
+        "action_mask_fallback_count",
+        "lambda_migration",
+        "lambda_split",
     ]
     out = {k: _to_jsonable(res.get(k)) for k in keys if k in res}
     out["avg_total_cost_ms"] = _avg_total_cost_ms(res)
@@ -198,14 +223,14 @@ def _write_report(payload):
     def table(pro, rea):
         s = "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Avg Total Cost (ms) |\n"
         s += "|-----------|------------|------------|---------------------|------------------|---------------------|\n"
-        for name in ["SA", "DQN", "Hybrid SAC"]:
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in pro:
                 s += _row(name, pro[name], proactive=True)
             else:
                 s += f"| {name} | — | — | — | — | — |\n"
         s += "\n| Algorithm | Migrations | Violations | Avg Latency (ms) | Avg Total Cost (ms) |\n"
         s += "|-----------|------------|------------|------------------|---------------------|\n"
-        for name in ["SA", "DQN", "Hybrid SAC"]:
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in rea:
                 s += _row(name, rea[name], proactive=False)
             else:
@@ -219,7 +244,7 @@ def _write_report(payload):
 **数据文件**：`{payload['config']['processed_taxi_path']}`  
 **数据规模**：Top-{ACTIVE_USERS} active taxis；train={payload['data']['train_rows']} rows/{payload['data']['train_taxis']} taxis；test={payload['data']['test_rows']} rows/{payload['data']['test_taxis']} taxis  
 **切分方式**：{payload['data']['split']['method']}；test row ratio={payload['data']['split']['test_row_ratio']:.3f}；test risk ratio={payload['data']['split']['test_risk_ratio']:.3f}  
-**SAC epochs**：Proactive={SAC_EPOCHS}，Reactive={SAC_EPOCHS}
+**GAT-MARL epochs**：Proactive={MARL_EPOCHS}，Reactive={MARL_EPOCHS}
 
 ## 训练段
 
@@ -263,7 +288,7 @@ def main():
             "config": {
                 "active_users": ACTIVE_USERS,
                 "split_seed": SPLIT_SEED,
-                "sac_epochs": SAC_EPOCHS,
+                "marl_epochs": MARL_EPOCHS,
                 "forecast_horizon": FORECAST_HORIZON,
                 "processed_taxi_path": PROCESSED_TAXI_PATH,
                 "started_at": datetime.now().isoformat(),
@@ -291,7 +316,7 @@ def main():
     ]
 
     for stage, mode, data, proactive, inference in phases:
-        if all(name in payload[stage][mode] for name in ["SA", "DQN", "Hybrid SAC"]):
+        if all(name in payload[stage][mode] for name in ["SA", "Nearest", "DQN", "GAT-MARL"]):
             print(f"\n=== SKIP {stage.upper()} {mode.upper()} (already complete) ===", flush=True)
             continue
 
@@ -300,6 +325,12 @@ def main():
             if "SA" not in payload[stage][mode]:
                 sa_res = run_sa_microservice_fair(data, servers_df, predictor=predictor, proactive=proactive)
                 payload[stage][mode]["SA"] = _summarize_result(sa_res)
+
+            if "Nearest" not in payload[stage][mode]:
+                nearest_res = run_nearest_microservice_fair(
+                    data, servers_df, predictor=predictor, proactive=proactive
+                )
+                payload[stage][mode]["Nearest"] = _summarize_result(nearest_res)
 
             dqn_ckpt = os.path.join(CHECKPOINT_DIR, f"dqn_{mode}.pth")
             if "DQN" not in payload[stage][mode]:
@@ -312,17 +343,17 @@ def main():
                 )
                 payload[stage][mode]["DQN"] = _summarize_result(dqn_res)
 
-            sac_ckpt = os.path.join(CHECKPOINT_DIR, f"sac_{mode}.pth")
-            if "Hybrid SAC" not in payload[stage][mode]:
-                sac_res = run_hybrid_sac_microservice(
+            marl_ckpt = os.path.join(CHECKPOINT_DIR, f"marl_gat_{mode}.pth")
+            if "GAT-MARL" not in payload[stage][mode]:
+                marl_res = run_marl_gat_microservice(
                     data,
                     servers_df,
                     predictor=predictor,
                     proactive=proactive,
-                    num_epochs=SAC_EPOCHS,
-                    save_checkpoint_path=sac_ckpt,
+                    num_epochs=MARL_EPOCHS,
+                    save_checkpoint_path=marl_ckpt,
                 )
-                payload[stage][mode]["Hybrid SAC"] = _summarize_result(sac_res)
+                payload[stage][mode]["GAT-MARL"] = _summarize_result(marl_res)
         else:
             if "SA" not in payload[stage][mode]:
                 sa_res = run_sa_microservice_fair(
@@ -333,6 +364,16 @@ def main():
                     collect_dag_proactive_stats=proactive,
                 )
                 payload[stage][mode]["SA"] = _summarize_result(sa_res)
+
+            if "Nearest" not in payload[stage][mode]:
+                nearest_res = run_nearest_microservice_fair(
+                    data,
+                    servers_df,
+                    predictor=predictor,
+                    proactive=proactive,
+                    collect_dag_proactive_stats=proactive,
+                )
+                payload[stage][mode]["Nearest"] = _summarize_result(nearest_res)
 
             if "DQN" not in payload[stage][mode]:
                 dqn_res = run_dqn_microservice_fair(
@@ -345,16 +386,17 @@ def main():
                 )
                 payload[stage][mode]["DQN"] = _summarize_result(dqn_res)
 
-            if "Hybrid SAC" not in payload[stage][mode]:
-                sac_res = run_hybrid_sac_microservice(
+            if "GAT-MARL" not in payload[stage][mode]:
+                marl_res = run_marl_gat_microservice(
                     data,
                     servers_df,
                     predictor=predictor,
                     proactive=proactive,
                     inference_mode=True,
-                    checkpoint_path=os.path.join(CHECKPOINT_DIR, f"sac_{mode}.pth"),
+                    checkpoint_path=os.path.join(CHECKPOINT_DIR, f"marl_gat_{mode}.pth"),
+                    collect_dag_proactive_stats=proactive,
                 )
-                payload[stage][mode]["Hybrid SAC"] = _summarize_result(sac_res)
+                payload[stage][mode]["GAT-MARL"] = _summarize_result(marl_res)
 
         payload["elapsed_seconds_so_far"] = time.time() - start
         with open(payload_path, "w", encoding="utf-8") as f:

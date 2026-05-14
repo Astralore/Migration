@@ -1,256 +1,224 @@
-# 第八阶段：修复 Hybrid SAC 的 NEAREST 坍缩与 SA 引导断裂
+# MARL 阶段四：结合 DAG 数据特性的物理语义修复
 
-## 一、当前全量实验结论
+## 一、本轮实验与 DAG 数据的共同结论
 
-最新全量实验目录：`experiments/full_pipeline_20260512_111740_cov50_stage7_full`。
+最新中等规模实验目录：`experiments\medium_validation_20260513_203241_cov50_stage8`
 
-实验已经正常完成，`exit_code=0`，不是训练中断，也不是旧权重污染。本轮权重与结果均保存在独立目录。
+本轮阶段三修复后，训练段已经明显缓解“全员迁移”：
 
-第七阶段的 `SA_STAY` 动态 mask 实际已经生效：
+- Proactive 训练：`all_agents_migrated_ratio = 2.08%`，`stay_action_ratio = 55.69%`
+- Reactive 训练：`all_agents_migrated_ratio = 3.39%`，`stay_action_ratio = 46.36%`
 
-- Proactive 训练评估：`eval_follow_sa_stay = 0`
-- Proactive 推理：`eval_follow_sa_stay = 0`
-- Reactive 训练/推理：`eval_follow_sa_stay = 0`
+但测试推理仍然存在泛化坍缩：
 
-因此，当前问题不是“FOLLOW_SA but SA_STAY 仍然很高”，而是相反：`FOLLOW_SA` 被过度削弱，Hybrid SAC 坍缩到 `NEAREST` 动作。
+- Proactive 推理：`all_agents_migrated_ratio = 79.84%`
+- Reactive 推理：`all_agents_migrated_ratio = 83.91%`
+- Reactive 推理平均成本仍高达 `49769.77ms`
 
-关键证据：
+这说明问题不只是 lambda 或 dense reward，而是当前 `MICROSERVICE_DAGS` 的数据语义和算法环境之间存在不一致。
 
-- Proactive 训练评估动作分布：`[STAY=28777, FOLLOW_SA=0, NEAREST=82664]`
-- Proactive 推理动作分布：`[STAY=7958, FOLLOW_SA=0, NEAREST=37228]`
-- Proactive 推理中 Hybrid SAC 迁移 `4820`，违规 `10041`，平均成本 `23239.26`
-- 同一阶段 DQN 违规 `5542`，平均成本 `20445.27`
-- 同一阶段 SA 违规 `5734`，平均成本 `23181.02`
+## 二、DAG 数据特性对当前算法的影响
 
-结论：第七阶段修复成功剥离了无效 `FOLLOW_SA`，但引入了新的动作坍缩：Actor 几乎不再使用 SA 建议迁移，转而大量选择 `NEAREST`，导致过激迁移、DAG 多节点迁移和违规上升。
+### 1. `USER` / `UNKNOWN` / `UNAVAILABLE` 不是可迁移微服务
 
-## 二、根因判断
+`core/microservice_dags.py` 中确实存在外部节点：
 
-### 1. BC 监督样本被错误限制
+- `Data_Heavy_DAG`：`USER`、`UNKNOWN`
+- `Compute_Heavy_DAG`：`UNKNOWN`
+- `FanOut_Broadcaster_2`：`UNAVAILABLE`
+- `Diamond_DAG_1`：`USER`、`UNKNOWN`
 
-当前代码中 `has_bc_target = used_bc_target`，只有当训练阶段通过概率强制执行 `FOLLOW_SA` 时，replay transition 才带 BC loss。
+当前代码的问题是：
 
-这会导致一个严重问题：Actor 只在“被强制模仿”的少量样本上学习 `FOLLOW_SA`，而不是在所有“SA 确实建议迁移”的样本上学习 `FOLLOW_SA`。随着 `bc_prob_schedule` 衰减，BC 样本迅速减少，Actor 很容易把 `FOLLOW_SA` 丢掉。
+- `initialize_dag_assignment(...)` 会把所有 DAG 节点都部署到边缘服务器。
+- `build_marl_graph_state(...)` 默认所有节点 `node_movable=True`。
+- `marl_gat.py` 会对 `topological_sort(dag_info)` 的所有节点采样动作。
+- `calculate_microservice_reward(...)` 会把所有发生 assignment 变化的节点都计入迁移成本。
 
-应改为：
+因此当前算法确实可能“迁移 USER / UNKNOWN / UNAVAILABLE”。这不是策略问题，而是环境建模漏洞。
 
-- `bc_target_action = FOLLOW_SA` 当且仅当 `sa_proposed_server != current_node_server`
-- `has_bc_target = (bc_target_action == ACTION_FOLLOW_SA)`
-- `used_bc_target` 只表示本次行为动作是否被 BC 强制，不应决定是否写入监督目标
+### 2. 许多 DAG 本身非常轻量，部分全迁移并非必然错误
 
-### 2. `NEAREST` 没有动作级约束
+例如：
 
-当前 `NEAREST` 只要存在候选服务器就合法，且在 `SA_STAY` 时 `FOLLOW_SA` 被 mask 后，动作空间经常变成 `[STAY, NEAREST]`。如果 critic 早期高估 `NEAREST`，Actor 会快速偏向最近服务器。
+- `FanOut_Broadcaster_2` 全部节点 `state_mb = 0`，大多是 `50MB` 镜像。
+- `Compute_Heavy_DAG` 全部节点 `state_mb = 0`，大多是 `200MB` 镜像。
 
-这在 Proactive 推理中已经出现：
+这类 DAG 中，如果只看 SLA 惩罚与单节点迁移成本，全迁移可能确实是短期最优。因此不能把所有全员迁移都视为算法错误。
 
-- `FOLLOW_SA=0`
-- 所有迁移都由 `NEAREST` 导致
-- 多个 DAG 的 proactive 平均迁移节点数达到 `3-5`
+真正的问题是：当前系统没有模拟“同一时刻多个节点迁往同一目标服务器时的带宽竞争”，导致集体迁移过于便宜。
 
-这说明 `NEAREST` 已从“兜底候选动作”变成了主策略。
+### 3. 高状态节点的异构性存在，但梯度尺度仍可能不足
 
-### 3. Q-Filter 对 SA 引导仍偏激进
+数据中已有明显异构：
 
-Proactive 训练中：
+- `FanIn_Aggregator_2.MS_27421`：`state_mb = 512`
+- `FanOut_Broadcaster_3.MS_13448`：`state_mb = 512`
+- `Diamond_DAG_1.UNKNOWN`：`state_mb = 512`，但它应被视为外部节点，不应迁移
 
-- `q_filter_checked = 24448`
-- `q_filter_blocked = 6248`
+当前 `core/marl_reward.py` 已按 `image_mb + state_mb` 计算 local migration cost，因此“没有异构迁移成本”这个判断不成立。
 
-Q-Filter 已经阻断了约 25.6% 的 BC 目标。考虑到 critic 在早期和 sparse DAG reward 下仍有噪声，这会进一步削弱 `FOLLOW_SA` 学习。
+但当前 reward 是 log-scaled shared reward + normalized local penalty。仅靠继续把 `lambda_migration` 拉到 `1.0/1.5` 风险很大，之前小样本已出现过从“过度迁移”翻到“全 STAY”的现象。
 
-### 4. `STAY` 监督不足
+## 三、对原修改方案的修正
 
-第七阶段为避免过度模仿 SA_STAY，屏蔽了 `FOLLOW_SA` when SA_STAY，这是正确的。但当前没有补充 `STAY` 的轻量监督，导致 Reactive 训练/推理中也几乎没有 `STAY`：
+### 原方案 1：Pinned Nodes，方向正确，但必须同时修 reward / entry 语义
 
-- Reactive 训练评估：`[STAY=0, FOLLOW_SA=6209, NEAREST=61748]`
-- Reactive 推理：`[STAY=0, FOLLOW_SA=1184, NEAREST=26645]`
+只在 action mask 中把外部节点锁为 `STAY` 还不够，因为当前 reward 和 entry 计算仍会把它们当成可部署服务。
 
-这说明 actor 对“什么情况下不迁移”仍然没有学好。
-
-## 三、必须修改的代码方案
-
-目标文件：`algorithms/hybrid_sac.py`
-
-### 任务 1：修复 replay 中 BC target 的写入条件
-
-当前训练节点 transition 中不要再用 `used_bc_target` 作为 `has_bc_target`。
-
-应调整为：
+必须新增统一节点分类：
 
 ```python
-has_bc_target = (bc_target_action == ACTION_FOLLOW_SA)
+EXTERNAL_NODE_NAMES = {"USER", "UNKNOWN", "UNAVAILABLE"}
+
+def is_external_node(node_name):
+    return node_name in EXTERNAL_NODE_NAMES
+
+def get_deployable_nodes(dag_info):
+    return [n for n in dag_info["nodes"] if not is_external_node(n)]
 ```
 
-并在 transition 中写入：
+后续所有“迁移控制”和“迁移成本”只作用于 deployable nodes；GAT message passing 仍保留 external nodes。
+
+### 原方案 2：并发带宽竞争，方向正确，但目标文件不是只改 `core/reward.py`
+
+当前 GAT-MARL 训练使用：
+
+- shared reward：`core/reward.py::calculate_microservice_reward(...)`
+- local reward：`core/marl_reward.py::calculate_marl_rewards(...)`
+
+因此并发惩罚必须至少进入 `core/marl_reward.py` 的 `_local_migration_costs(...)`，否则 Actor 学不到“同一目标服务器拥塞”的局部代价。
+
+为了评估指标一致，最好也同步修改 `core/reward.py` 中的 total migration cost；否则训练成本与报告成本会不一致。
+
+### 原方案 3：lambda 提到 `1.0/1.5`，不建议作为默认
+
+当前最新实验中 lambda 已经正确生效：
+
+- Proactive：`lambda_migration = 0.15`，`lambda_split = 0.05`
+- Reactive：`lambda_migration = 0.20`，`lambda_split = 0.08`
+
+Reactive 推理仍过度迁移，说明确实需要更强约束；但直接改到 `1.0/1.5` 会极大增加全 STAY 风险。
+
+正确做法是先修物理建模漏洞，再做小步 lambda 消融，例如：
+
+- Reactive：`0.20 / 0.08` → `0.25 / 0.10` → `0.30 / 0.12`
+- Proactive：先保持 `0.15 / 0.05`
+
+## 四、必须修改的代码方案
+
+### 任务 1：新增 DAG 节点语义工具
+
+目标文件：建议新增 `core/microservice_node_types.py`，或放入 `core/dag_utils.py`。
+
+需要提供：
 
 ```python
-"used_bc_action": used_bc_target,
-"has_bc_target": has_bc_target,
-"bc_target_action": bc_target_action,
+EXTERNAL_NODE_NAMES = {"USER", "UNKNOWN", "UNAVAILABLE"}
+
+def is_external_node(node_name):
+    return node_name in EXTERNAL_NODE_NAMES
+
+def get_deployable_nodes(dag_info):
+    return [n for n in dag_info["nodes"] if not is_external_node(n)]
+
+def get_service_entry_nodes(dag_info):
+    # 返回真正的可部署入口服务：
+    # 1. deployable 子图中没有 deployable 入边的节点
+    # 2. 或直接由 USER / UNKNOWN / UNAVAILABLE 指向的 deployable 节点
 ```
 
-说明：
+`get_service_entry_nodes(...)` 很关键，因为原 `get_entry_nodes(...)` 会把 `USER/UNKNOWN` 当入口，从而污染 SLA 距离和 proactive trigger。
 
-- `used_bc_action` 只用于日志统计：实际动作是否由 BC 强制产生
-- `has_bc_target` 用于 loss：只要 SA 建议迁移，就给 actor 一个 `FOLLOW_SA` 监督信号
-- 不要对 `SA_STAY` 写入 `FOLLOW_SA` 监督
+### 任务 2：Pinned Nodes 只参与图编码，不参与动作控制
 
-预期效果：
+目标文件：`core/marl_state_builder.py`、`algorithms/marl_gat.py`
 
-- `FOLLOW_SA` 不应再长期为 0
-- Proactive 推理中 `FOLLOW_SA` 应恢复到非零比例
-- `NEAREST` 占比应下降
+修改要求：
 
-### 任务 2：增加轻量 STAY 稳定监督，但不能恢复 FOLLOW_SA 过模仿
+- `build_marl_graph_state(...)` 中 external nodes 的 action mask 强制为 `[STAY=True, 其他=False]`。
+- node feature 增加 `is_external` 一维，因此 `GraphEncoder(node_feat_dim=14, ...)`。
+- `marl_gat.py` 执行动作时，external nodes 即使 Actor 输出非 STAY，也必须强制保留原 assignment。
+- 统计指标新增：
+  - `controlled_agents_per_decision`
+  - `pinned_agents_per_decision`
+  - `controlled_migrations`
+  - `controlled_all_agents_migrated_ratio`
 
-当前 `SA_STAY` 时已经把 `FOLLOW_SA` mask 掉，这是正确的，必须保留。
+注意：原 `avg_agents_per_decision` 包含 external nodes 后会失真，后续判断过度迁移应看 controlled 指标。
 
-建议增加一个可选的轻量 `STAY` 监督：
+### 任务 3：reward / trigger 只对可部署入口服务计算 SLA
 
-- 当 `sa_proposed_server == current_node_server`
-- 且 `trigger_type == TRIGGER_REACTIVE` 或 risk_ratio 较低
-- 且当前 action mask 中 `ACTION_STAY` 合法
+目标文件：`core/reward.py`、`core/marl_reward.py`，可能还包括 proactive trigger 前的 gateway 选择逻辑。
 
-则可设置：
+修改要求：
+
+- `_entry_access_profile(...)` 不应再用原始 `get_entry_nodes(...)`，应改用 `get_service_entry_nodes(...)`。
+- `estimate_dag_migration_time_s(...)` 默认只估计 deployable nodes。
+- `calculate_microservice_reward(...)` 的 migration cost 只统计 deployable nodes。
+- `calculate_marl_rewards(...)` 的 local migration / split penalty 只对 deployable nodes 产生有效惩罚，external nodes 的 agent reward 只作为图上下文，不应驱动动作学习。
+
+如果某个 DAG 的 service entry 为空，回退到 deployable nodes 中拓扑最靠前的节点，不能回退到 `USER/UNKNOWN`。
+
+### 任务 4：加入并发带宽竞争惩罚
+
+目标文件：`core/marl_reward.py`，建议同步 `core/reward.py`。
+
+对当前 step 中迁移到同一 target server 的 deployable nodes 计数：
 
 ```python
-has_stay_bc_target = True
-bc_target_action = ACTION_STAY
+target_counts[target_server] += 1
 ```
 
-但 STAY BC 权重要显著低于 FOLLOW_SA，例如：
-
-- `follow_sa_bc_scale = 10.0`
-- `stay_bc_scale = 1.0` 或 `2.0`
-
-避免重新形成“永远不迁移”的坍缩。
-
-实现约束：
-
-- 如果 `optimize_sac` 继续沿用当前逐 transition 累加 loss 的写法，可以在单条 transition 内按 `bc_target_action` 选择对应 scale。
-- 如果后续将 `optimize_sac` 改成 batch 张量化实现，不能用单个 `if/else` 给整个 batch 套同一个 BC 权重。必须构造逐样本权重张量，例如使用 `torch.where(bc_targets == ACTION_FOLLOW_SA, follow_sa_bc_scale, stay_bc_scale)`，再与 per-sample cross entropy 相乘。
-- Cross entropy 必须使用 `reduction="none"` 得到逐样本 loss，再乘以逐样本 scale，最后再求均值或求和。
-- 这样才能保证同一个 batch 内 `FOLLOW_SA` 与 `STAY` 两类监督各自使用正确权重，同时避免低效或错误的 Python batch 级分支。
-
-### 任务 3：给 NEAREST 增加动作级诊断与软约束
-
-不要直接硬禁用 `NEAREST`，否则会丢失兜底能力。应先加软约束和诊断。
-
-在 `optimize_sac` 中增加可选 actor regularization：
+迁移成本改为：
 
 ```python
-nearest_prob = action_probs[ACTION_NEAREST]
-nearest_reg_loss = nearest_reg_weight * nearest_prob
+effective_node_bandwidth = effective_bandwidth / target_counts[target_server]
+cost_ms = ((image_mb + state_mb) * MB_TO_MBIT / effective_node_bandwidth) * 1000 + BASE_MIGRATION_OVERHEAD_MS
 ```
 
-建议初始：
+这比单纯增大 lambda 更合理，因为它只惩罚“同一时刻挤到同一个目标服务器”的集体迁移，而不会无差别压制所有迁移。
 
-- Proactive：`nearest_reg_weight = 0.02 ~ 0.05`
-- Reactive：`nearest_reg_weight = 0.01 ~ 0.03`
+### 任务 5：按 DAG 类型输出诊断，不要只看 overall
 
-仅在以下条件施加：
+当前 `cost_by_dag_complexity` 只有 simple / medium，不足以判断问题是否集中在某些 DAG。
 
-- `FOLLOW_SA` 当前合法
-- `sa_proposed_server != current_node_server`
-- 即 SA 已经给出迁移建议时，不鼓励 Actor 无脑绕过 SA 直接选 NEAREST
+需要新增：
 
-不要在 `FOLLOW_SA` 被 mask 的 SA_STAY 场景下惩罚 NEAREST，否则 `[STAY, NEAREST]` 的兜底选择会被破坏。
+- `cost_by_dag_type`
+- `migrations_by_dag_type`
+- `all_agents_migrated_ratio_by_dag_type`
+- `controlled_migrations_by_dag_type`
 
-实现约束：
+重点观察：
 
-- `nearest_prob` 必须来自 Actor 当前前向传播得到的 `action_probs[ACTION_NEAREST]`，并保留计算图。
-- 计算 `nearest_reg_loss` 时严禁对 `action_probs` 或 `nearest_prob` 使用 `.detach()`。
-- 该正则项必须加入 `actor_loss`，并通过 actor 的反向传播真实更新 Actor 参数。
-- 只允许在日志统计或 Q-Filter 比较中使用 detached 概率；用于正则训练的概率不能 detached。
+- `FanOut_Broadcaster_2`
+- `Compute_Heavy_DAG`
+- `Data_Heavy_DAG`
+- `Diamond_DAG_1`
 
-### 任务 4：推迟或收紧 Q-Filter
+如果全迁移主要集中在无状态轻量 DAG，不应过度惩罚；如果集中在含 512MB stateful 节点 DAG，则说明 local migration cost 仍不足。
 
-当前 Q-Filter 在第 3 个训练 epoch 就会启动，且已经阻断大量 BC。
+## 五、验证顺序
 
-应调整为更保守：
+1. 先跑单 DAG smoke：
+   - `FanOut_Broadcaster_2`
+   - `Compute_Heavy_DAG`
+   - `Data_Heavy_DAG`
+   - `Diamond_DAG_1`
+2. 检查 external nodes：
+   - action mask 只能 STAY
+   - assignment 不发生变化
+   - migration cost 不包含 external nodes
+3. 检查并发惩罚：
+   - 同一目标服务器迁移 1 个、2 个、5 个节点时，单节点迁移成本应递增
+4. 再跑小样本 Proactive / Reactive smoke。
+5. 最后再跑中等规模验证，并删除旧 `marl_gat_*.pth`。
 
-```python
-q_filter_enabled = (
-    epoch >= 3
-    and 0.0 < current_bc_loss_weight < 0.8
-    and len(memory) >= 5 * batch_size
-)
-```
+## 六、禁止事项
 
-并将 `q_filter_margin` 从 `0.25` 提高到 `0.5` 或 `1.0`。
-
-含义：只有 critic 明显认为 BC 目标差时才阻断，否则继续保留 SA 引导。
-
-必须继续记录：
-
-- `q_filter_checked`
-- `q_filter_passed`
-- `q_filter_blocked`
-- `q_filter_blocked_ratio`
-
-若 `q_filter_blocked_ratio > 0.2` 且 `FOLLOW_SA` 低于 5%，说明 Q-Filter 仍过强，需要继续推迟或关闭。
-
-### 任务 5：增加动作概率与 Q 值诊断
-
-当前只有最终动作计数，不足以判断是 actor logits 坍缩还是 critic Q 高估。
-
-需要增加以下统计，至少在 eval/inference 返回：
-
-- `eval_action_prob_sums`
-- `eval_action_prob_means`
-- `eval_q_sums`
-- `eval_q_means`
-- `eval_sa_migrate_action_counts`
-- `eval_sa_stay_action_counts`
-
-其中：
-
-- `eval_sa_migrate_action_counts`：只统计 `sa_proposed_server != current_node_server` 时的动作分布
-- `eval_sa_stay_action_counts`：只统计 `sa_proposed_server == current_node_server` 时的动作分布
-
-这两个指标是判断修复是否成功的关键：
-
-- SA 建议迁移时，`FOLLOW_SA` 应恢复为主要候选之一
-- SA 建议不迁移时，`FOLLOW_SA` 必须保持 0
-- `NEAREST` 不应在两类场景中同时占绝对多数
-
-## 四、建议的验证标准
-
-先做小规模 smoke，再做中等规模验证，最后再全量。
-
-### Smoke 验证
-
-使用 cov50 数据抽取 3-6 辆车，训练 `num_epochs=6`。
-
-必须检查：
-
-- `eval_follow_sa_stay == 0`
-- `eval_action_counts` 中 `FOLLOW_SA > 0`
-- `eval_sa_migrate_action_counts` 中 `FOLLOW_SA > 0`
-- `NEAREST` 不再超过 80%
-- `q_filter_blocked_ratio` 不超过 20%
-
-### 中等规模验证
-
-复用 cov50 validation 脚本，结果单独保存。
-
-重点看 Proactive 推理：
-
-- Hybrid SAC 违规不应显著高于 SA/DQN
-- Hybrid SAC 平均成本不应高于 SA 10% 以上
-- `FOLLOW_SA` 必须非零
-- `FOLLOW_SA but SA_STAY` 必须继续为 0
-- DAG proactive 平均迁移节点数不应普遍达到 `3-5`
-
-### 全量验证
-
-只有中等规模通过后再运行全量。不得覆盖旧实验目录和旧权重。
-
-## 五、禁止事项
-
-- 不要取消 `SA_STAY` 动态 mask。
-- 不要让 `FOLLOW_SA` 在 `sa_proposed_server == current_node_server` 时重新合法。
-- 不要简单通过硬禁用 `NEAREST` 解决坍缩。
-- 不要让 Q-Filter 在 warmup 早期启用。
-- 不要复用上一轮 checkpoint 做本轮验证。
+- 不要把 `USER/UNKNOWN/UNAVAILABLE` 从图中删除；它们仍然是拓扑上下文。
+- 不要让 external nodes 参与迁移动作、迁移成本或 deployable entry SLA。
+- 不要只通过提高 lambda 解决过度迁移；必须先修正节点语义和并发带宽。
+- 不要把 `lambda_migration` 默认直接调到 `1.0/1.5`。
+- 不要再用包含 external nodes 的 `avg_agents_per_decision` 判断是否全员迁移，必须使用 controlled 指标。

@@ -23,8 +23,9 @@ from core.data_loader import (
 )
 from prediction.simple_predictor import SimpleTrajectoryPredictor
 from algorithms.dqn import run_dqn_microservice_fair
+from algorithms.marl_gat import run_marl_gat_microservice
+from algorithms.nearest import run_nearest_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
-from algorithms.hybrid_sac import run_hybrid_sac_microservice
 from evaluation.metrics import print_proactive_analysis, print_ranking_with_latency
 from evaluation.plot import plot_training_curves, plot_cost_breakdown, plot_performance_metrics
 
@@ -42,10 +43,10 @@ MIN_VEHICLE_POINTS = 100
 
 # 权重保存路径
 CHECKPOINT_DIR = "checkpoints"
-SAC_CHECKPOINT_PROACTIVE = "checkpoints/sac_proactive.pth"
-SAC_CHECKPOINT_REACTIVE = "checkpoints/sac_reactive.pth"
 DQN_CHECKPOINT_PROACTIVE = "checkpoints/dqn_proactive.pth"
 DQN_CHECKPOINT_REACTIVE = "checkpoints/dqn_reactive.pth"
+MARL_CHECKPOINT_PROACTIVE = "checkpoints/marl_gat_proactive.pth"
+MARL_CHECKPOINT_REACTIVE = "checkpoints/marl_gat_reactive.pth"
 
 PROACTIVE = True
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
@@ -107,31 +108,33 @@ def _dag_stats_markdown_table(stats):
 
 def build_dag_adaptive_dual_appendix(proactive_results, section_heading="## 五、"):
     """
-    SA 与 Hybrid SAC 的 Proactive 按 DAG 统计（与 hybrid_sac / sa 源码旁路条件一致）。
+    SA / Nearest / GAT-MARL 的 Proactive 按 DAG 统计。
     section_heading: 单文件推理报告建议用 ``## 四、``；流水线合并报告用 ``## 五、``。
     """
     sa_stats = (proactive_results.get("SA") or {}).get("dag_proactive_migration_stats") or {}
-    sac_stats = (proactive_results.get("Hybrid SAC") or {}).get("dag_proactive_migration_stats") or {}
+    nearest_stats = (proactive_results.get("Nearest") or {}).get("dag_proactive_migration_stats") or {}
+    marl_stats = (proactive_results.get("GAT-MARL") or {}).get("dag_proactive_migration_stats") or {}
     return (
-        f"\n{section_heading}Proactive 按 DAG 自适应迁移统计（SA 与 Hybrid SAC 同口径）\n\n"
+        f"\n{section_heading}Proactive 按 DAG 自适应迁移统计（SA / Nearest / GAT-MARL 同口径）\n\n"
         "**统一条件**：已启用前瞻（`use_proactive`）；`get_trigger_type(...) == PROACTIVE`；"
         "单次决策内在 **同一拓扑序 `sorted_nodes`** 上比较 `previous_assignments` 与决策后节点放置，"
         "统计发生变更的节点数 `migrated_nodes_count`；按 **DAG Name**（`dag_type`）聚合 "
         "`proactive_decisions` 与 `migrated_nodes`；**Avg = migrated / proactive_decisions**（保留两位小数）。\n\n"
-        "**开关对齐（仅推理实验）**：Hybrid SAC 仅在 `inference_mode=True` 时分配并写入；"
-        "SA 仅在 `run_inference_phase` 的 Proactive 分支传入 `collect_dag_proactive_stats=True`。"
-        "**训练阶段**两种算法均不采集本统计。\n\n"
+        "**开关对齐（仅推理实验）**：仅在推理实验的 Proactive 分支采集本统计。"
+        "**训练阶段**不采集本统计。\n\n"
         "### SA（Simulated Annealing）\n\n"
         + _dag_stats_markdown_table(sa_stats)
-        + "\n### Hybrid SAC\n\n"
-        + _dag_stats_markdown_table(sac_stats)
+        + "\n### Nearest\n\n"
+        + _dag_stats_markdown_table(nearest_stats)
+        + "\n### GAT-MARL\n\n"
+        + _dag_stats_markdown_table(marl_stats)
     )
 
 
-def _remove_sac_checkpoints_for_fresh_train():
-    """删除本次流水线使用的 SAC 权重，避免旧 checkpoint 影响训练后推理。"""
+def _remove_marl_checkpoints_for_fresh_train():
+    """删除本次流水线使用的 MARL 权重，避免旧 checkpoint 影响训练后推理。"""
     removed = []
-    for path in (SAC_CHECKPOINT_PROACTIVE, SAC_CHECKPOINT_REACTIVE):
+    for path in (MARL_CHECKPOINT_PROACTIVE, MARL_CHECKPOINT_REACTIVE):
         try:
             if os.path.isfile(path):
                 os.remove(path)
@@ -139,9 +142,9 @@ def _remove_sac_checkpoints_for_fresh_train():
         except OSError as e:
             print(f"  [WARN] Could not remove {path}: {e}")
     if removed:
-        print(f"  [PIPELINE] Removed old SAC checkpoints: {removed}")
+        print(f"  [PIPELINE] Removed old GAT-MARL checkpoints: {removed}")
     else:
-        print("  [PIPELINE] No existing SAC checkpoints to remove (fresh train).")
+        print("  [PIPELINE] No existing GAT-MARL checkpoints to remove (fresh train).")
 
 
 def generate_experiment_report(
@@ -206,15 +209,15 @@ def generate_experiment_report(
 
 """
 
-    if 'Hybrid SAC' in proactive_results and 'SA' in proactive_results:
-        sac_latency = proactive_results['Hybrid SAC'].get('avg_decision_time_ms', 0)
+    if 'GAT-MARL' in proactive_results and 'SA' in proactive_results:
+        sac_latency = proactive_results['GAT-MARL'].get('avg_decision_time_ms', 0)
         sa_latency = proactive_results['SA'].get('avg_decision_time_ms', 0)
 
         if sa_latency > 0:
             speedup = sa_latency / sac_latency if sac_latency > 0 else float('inf')
-            report += f"- **Hybrid SAC 平均决策时延**: {sac_latency:.2f} ms\n"
+            report += f"- **GAT-MARL 平均决策时延**: {sac_latency:.2f} ms\n"
             report += f"- **SA 平均决策时延**: {sa_latency:.2f} ms\n"
-            report += f"- **加速比**: SAC 比 SA 快 **{speedup:.1f}x**\n"
+            report += f"- **加速比**: GAT-MARL 比 SA 快 **{speedup:.1f}x**\n"
 
     if is_inference_mode:
         report += build_dag_adaptive_dual_appendix(proactive_results, section_heading="## 四、")
@@ -260,20 +263,20 @@ def generate_full_pipeline_report(
         s = f"### {title}\n\n"
         s += "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Avg Total Cost (ms) |\n"
         s += "|-----------|------------|------------|---------------------|------------------|---------------------|\n"
-        for name in ["SA", "DQN", "Hybrid SAC"]:
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in pro:
                 s += _metrics_row(name, pro[name], proactive_table=True)
         s += "\n| Algorithm | Migrations | Violations | Avg Latency (ms) | Avg Total Cost (ms) |\n"
         s += "|-----------|------------|------------|------------------|---------------------|\n"
-        for name in ["SA", "DQN", "Hybrid SAC"]:
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in rea:
                 s += _metrics_row(name, rea[name], proactive_table=False)
         return s
 
-    sac_tr_p = train_proactive.get("Hybrid SAC", {})
-    sac_tr_r = train_reactive.get("Hybrid SAC", {})
-    sac_if_p = infer_proactive.get("Hybrid SAC", {})
-    sac_if_r = infer_reactive.get("Hybrid SAC", {})
+    marl_tr_p = train_proactive.get("GAT-MARL", {})
+    marl_tr_r = train_reactive.get("GAT-MARL", {})
+    marl_if_p = infer_proactive.get("GAT-MARL", {})
+    marl_if_r = infer_reactive.get("GAT-MARL", {})
 
     def delta_line(label, tr, inf, key):
         a = tr.get(key, 0)
@@ -285,14 +288,14 @@ def generate_full_pipeline_report(
     report = f"""# 微服务迁移算法对比实验报告（全量流水线）
 
 **生成时间**：{ts}  
-**流程**：启动前已删除 `sac_proactive.pth` / `sac_reactive.pth`（若存在）→ **训练**（仅 `train_df`）→ 保存新权重 → **推理**（仅 `test_df`，同一划分）加载新权重评测 Hybrid SAC。
+**流程**：启动前已删除 `marl_gat_proactive.pth` / `marl_gat_reactive.pth`（若存在）→ **训练**（仅 `train_df`）→ 保存新权重 → **推理**（仅 `test_df`，同一划分）加载新权重评测 GAT-MARL。
 
 **数据协议（Strategy B）**：{proto}
 
 **工程上下文（与指标相关）**：
 
 - **物理与奖励**：`total_cost_ms`（接入/迁移/tearing/通信/future/SLA）与 `context` 触发解耦（Reactive 空间 + QoS）。
-- **Hybrid SAC**：离散 Actor **Logits 动作掩码**（合法 NEAREST、全非法回退 FOLLOW_SA），训练 `num_epochs=6`。
+- **GAT-MARL**：无 SA 先验、共享节点 Actor + 集中 Critic、动态 action mask、joint transition replay。
 - **性能路径**：`core/geo.py`、`context.py`、`reward.py`、`state_builder.py` **NumPy 向量化**（Haversine 批量、近邻 `argpartition` 等），降低仿真墙钟时间但不改变公式。
 
 **墙钟时间**：训练阶段约 **{wall_train_s:.0f} s**，推理阶段约 **{wall_infer_s:.0f} s**。
@@ -307,35 +310,40 @@ def generate_full_pipeline_report(
 
 ## 二、测试段推理结果（test_df）
 
-*Hybrid SAC 与 DQN 在测试段加载训练段保存的 checkpoint；SA 无磁盘权重，在测试段按既有脚本逻辑运行。*
+*GAT-MARL 与 DQN 在测试段加载训练段保存的 checkpoint；SA/Nearest 无磁盘权重，在测试段按既有脚本逻辑运行。*
 
 {table_pro(infer_proactive, infer_reactive, "Proactive（上表）/ Reactive（下表）")}
 
 ---
 
-## 三、Hybrid SAC 泛化对比（训练 → 测试）
+## 三、GAT-MARL 泛化对比（训练 → 测试）
 
-{delta_line("Proactive Violations", sac_tr_p, sac_if_p, "total_violations")}
-{delta_line("Proactive Migrations", sac_tr_p, sac_if_p, "total_migrations")}
-{delta_line("Reactive Violations", sac_tr_r, sac_if_r, "total_violations")}
-{delta_line("Reactive Migrations", sac_tr_r, sac_if_r, "total_migrations")}
+{delta_line("Proactive Violations", marl_tr_p, marl_if_p, "total_violations")}
+{delta_line("Proactive Migrations", marl_tr_p, marl_if_p, "total_migrations")}
+{delta_line("Reactive Violations", marl_tr_r, marl_if_r, "total_violations")}
+{delta_line("Reactive Migrations", marl_tr_r, marl_if_r, "total_migrations")}
 
-**测试段决策时延（Hybrid SAC）**：
+**测试段多智能体迁移诊断**：
 
-- Proactive：**{sac_if_p.get("avg_decision_time_ms", 0):.2f} ms**（训练段末次 eval 统计：**{sac_tr_p.get("avg_decision_time_ms", 0):.2f} ms**）
-- Reactive：**{sac_if_r.get("avg_decision_time_ms", 0):.2f} ms**（训练段：**{sac_tr_r.get("avg_decision_time_ms", 0):.2f} ms**）
+- Proactive：可控平均迁移节点/决策 **{marl_if_p.get("avg_controlled_migrated_agents_per_decision", marl_if_p.get("avg_migrated_agents_per_decision", 0)):.2f}**，可控全员迁移比例 **{marl_if_p.get("controlled_all_agents_migrated_ratio", marl_if_p.get("all_agents_migrated_ratio", 0)):.2%}**，STAY 动作比例 **{marl_if_p.get("stay_action_ratio", 0):.2%}**
+- Reactive：可控平均迁移节点/决策 **{marl_if_r.get("avg_controlled_migrated_agents_per_decision", marl_if_r.get("avg_migrated_agents_per_decision", 0)):.2f}**，可控全员迁移比例 **{marl_if_r.get("controlled_all_agents_migrated_ratio", marl_if_r.get("all_agents_migrated_ratio", 0)):.2%}**，STAY 动作比例 **{marl_if_r.get("stay_action_ratio", 0):.2%}**
+
+**测试段决策时延（GAT-MARL）**：
+
+- Proactive：**{marl_if_p.get("avg_decision_time_ms", 0):.2f} ms**（训练段末次 eval 统计：**{marl_tr_p.get("avg_decision_time_ms", 0):.2f} ms**）
+- Reactive：**{marl_if_r.get("avg_decision_time_ms", 0):.2f} ms**（训练段：**{marl_tr_r.get("avg_decision_time_ms", 0):.2f} ms**）
 
 ---
 
-## 四、时延对比（测试段 Proactive：SAC vs SA）
+## 四、时延对比（测试段 Proactive：GAT-MARL vs SA）
 
 """
 
-    if 'Hybrid SAC' in infer_proactive and 'SA' in infer_proactive:
-        sac_l = infer_proactive['Hybrid SAC'].get('avg_decision_time_ms', 0)
+    if 'GAT-MARL' in infer_proactive and 'SA' in infer_proactive:
+        sac_l = infer_proactive['GAT-MARL'].get('avg_decision_time_ms', 0)
         sa_l = infer_proactive['SA'].get('avg_decision_time_ms', 0)
         if sa_l > 0 and sac_l > 0:
-            report += f"- Hybrid SAC: **{sac_l:.2f} ms**；SA: **{sa_l:.2f} ms**；比值 SA/SAC ≈ **{sa_l/sac_l:.1f}x**\n"
+            report += f"- GAT-MARL: **{sac_l:.2f} ms**；SA: **{sa_l:.2f} ms**；比值 SA/MARL ≈ **{sa_l/sac_l:.1f}x**\n"
         else:
             report += "- （时延数据不足，略）\n"
     else:
@@ -380,6 +388,12 @@ def run_training_phase(servers_df):
     print(f"  SA done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
+    proactive_results["Nearest"] = run_nearest_microservice_fair(
+        train_df, servers_df, predictor=predictor, proactive=True,
+    )
+    print(f"  Nearest done in {time.time() - t0:.1f}s")
+
+    t0 = time.time()
     proactive_results["DQN"] = run_dqn_microservice_fair(
         train_df, servers_df, predictor=predictor, proactive=True,
         save_checkpoint_path=DQN_CHECKPOINT_PROACTIVE,
@@ -387,12 +401,12 @@ def run_training_phase(servers_df):
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
-    proactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        train_df, servers_df, predictor=predictor, proactive=True, num_epochs=6,
+    proactive_results["GAT-MARL"] = run_marl_gat_microservice(
+        train_df, servers_df, predictor=predictor, proactive=True, num_epochs=4,
         inference_mode=False,
-        save_checkpoint_path=SAC_CHECKPOINT_PROACTIVE,
+        save_checkpoint_path=MARL_CHECKPOINT_PROACTIVE,
     )
-    print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
+    print(f"  GAT-MARL done in {time.time() - t0:.1f}s")
 
     reactive_results = {}
     print("\n" + "#" * 80)
@@ -406,6 +420,12 @@ def run_training_phase(servers_df):
     print(f"  SA done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
+    reactive_results["Nearest"] = run_nearest_microservice_fair(
+        train_df, servers_df, predictor=predictor, proactive=False,
+    )
+    print(f"  Nearest done in {time.time() - t0:.1f}s")
+
+    t0 = time.time()
     reactive_results["DQN"] = run_dqn_microservice_fair(
         train_df, servers_df, predictor=predictor, proactive=False,
         save_checkpoint_path=DQN_CHECKPOINT_REACTIVE,
@@ -413,12 +433,12 @@ def run_training_phase(servers_df):
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
-    reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        train_df, servers_df, predictor=predictor, proactive=False, num_epochs=2,
+    reactive_results["GAT-MARL"] = run_marl_gat_microservice(
+        train_df, servers_df, predictor=predictor, proactive=False, num_epochs=4,
         inference_mode=False,
-        save_checkpoint_path=SAC_CHECKPOINT_REACTIVE,
+        save_checkpoint_path=MARL_CHECKPOINT_REACTIVE,
     )
-    print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
+    print(f"  GAT-MARL done in {time.time() - t0:.1f}s")
 
     return proactive_results, reactive_results, predictor, train_df, test_df
 
@@ -459,6 +479,13 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
     print(f"  SA done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
+    proactive_results["Nearest"] = run_nearest_microservice_fair(
+        df, servers_df, predictor=predictor, proactive=True,
+        collect_dag_proactive_stats=True,
+    )
+    print(f"  Nearest done in {time.time() - t0:.1f}s")
+
+    t0 = time.time()
     proactive_results["DQN"] = run_dqn_microservice_fair(
         df, servers_df, predictor=predictor, proactive=True,
         inference_mode=True,
@@ -467,12 +494,13 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
-    proactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
+    proactive_results["GAT-MARL"] = run_marl_gat_microservice(
         df, servers_df, predictor=predictor, proactive=True,
         inference_mode=True,
-        checkpoint_path=SAC_CHECKPOINT_PROACTIVE,
+        checkpoint_path=MARL_CHECKPOINT_PROACTIVE,
+        collect_dag_proactive_stats=True,
     )
-    print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
+    print(f"  GAT-MARL done in {time.time() - t0:.1f}s")
 
     reactive_results = {}
     print("\n" + "#" * 80)
@@ -486,6 +514,12 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
     print(f"  SA done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
+    reactive_results["Nearest"] = run_nearest_microservice_fair(
+        df, servers_df, predictor=predictor, proactive=False,
+    )
+    print(f"  Nearest done in {time.time() - t0:.1f}s")
+
+    t0 = time.time()
     reactive_results["DQN"] = run_dqn_microservice_fair(
         df, servers_df, predictor=predictor, proactive=False,
         inference_mode=True,
@@ -494,18 +528,18 @@ def run_inference_phase(servers_df, train_df=None, test_df=None):
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
     t0 = time.time()
-    reactive_results["Hybrid SAC"] = run_hybrid_sac_microservice(
+    reactive_results["GAT-MARL"] = run_marl_gat_microservice(
         df, servers_df, predictor=predictor, proactive=False,
         inference_mode=True,
-        checkpoint_path=SAC_CHECKPOINT_REACTIVE,
+        checkpoint_path=MARL_CHECKPOINT_REACTIVE,
     )
-    print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
+    print(f"  GAT-MARL done in {time.time() - t0:.1f}s")
 
     return proactive_results, reactive_results, train_df, test_df
 
 
 def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
-    """Run SA, DQN, Hybrid and return results dict."""
+    """Run formal baselines and GAT-MARL."""
     results = {}
     mode_str = "Proactive" if proactive else "Reactive"
 
@@ -519,6 +553,15 @@ def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
     )
     print(f"  SA done in {time.time() - t0:.1f}s")
 
+    print(f"\n{'=' * 60}")
+    print(f"  [{label}] Running Nearest ({mode_str}) ...")
+    print(f"{'=' * 60}")
+    t0 = time.time()
+    results["Nearest"] = run_nearest_microservice_fair(
+        df, servers_df, predictor=predictor, proactive=proactive,
+    )
+    print(f"  Nearest done in {time.time() - t0:.1f}s")
+
     # DQN
     print(f"\n{'=' * 60}")
     print(f"  [{label}] Running DQN ({mode_str}) ...")
@@ -529,17 +572,15 @@ def run_all_algorithms(df, servers_df, predictor, proactive, label=""):
     )
     print(f"  DQN done in {time.time() - t0:.1f}s")
 
-    # Hybrid SAC (新的 Trigger-Conditioned GAT + Discrete SAC)
-    # v3.6: Train/Eval split — last epoch deterministic eval (fair vs SA)
     print(f"\n{'=' * 60}")
-    print(f"  [{label}] Running Hybrid SAC v3.6 ({mode_str}) ...")
-    print(f"  [v3.6: 5 train + 1 eval, argmax eval, no replay/optimize on eval]")
+    print(f"  [{label}] Running GAT-MARL ({mode_str}) ...")
+    print(f"  [CTDE: shared node actor + centralized critic, no SA prior]")
     print(f"{'=' * 60}")
     t0 = time.time()
-    results["Hybrid SAC"] = run_hybrid_sac_microservice(
-        df, servers_df, predictor=predictor, proactive=proactive, num_epochs=6,
+    results["GAT-MARL"] = run_marl_gat_microservice(
+        df, servers_df, predictor=predictor, proactive=proactive, num_epochs=4,
     )
-    print(f"  Hybrid SAC done in {time.time() - t0:.1f}s")
+    print(f"  GAT-MARL done in {time.time() - t0:.1f}s")
 
     return results
 
@@ -560,7 +601,9 @@ def _print_results_and_plots(proactive_results, reactive_results):
     print("\n" + "=" * 80)
     print("  PAPER SUMMARY")
     print("=" * 80)
-    for name in ["SA", "DQN", "Hybrid SAC"]:
+    for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
+        if name not in proactive_results or name not in reactive_results:
+            continue
         pro = proactive_results[name]
         rea = reactive_results[name]
         pro_v, rea_v = pro['total_violations'], rea['total_violations']
@@ -585,7 +628,7 @@ def _print_results_and_plots(proactive_results, reactive_results):
     print("  GENERATING VISUALIZATIONS")
     print("#" * 80)
 
-    for name, key in [("DQN", "DQN"), ("Hybrid_SAC", "Hybrid SAC")]:
+    for name, key in [("DQN", "DQN"), ("GAT_MARL", "GAT-MARL")]:
         for mode, results in [("proactive", proactive_results), ("reactive", reactive_results)]:
             res = results[key]
             if res.get('loss_history'):
@@ -627,7 +670,7 @@ def main():
         print("\n" + "#" * 80)
         print("  FULL PIPELINE: remove SAC weights → train → infer → result.md")
         print("#" * 80)
-        _remove_sac_checkpoints_for_fresh_train()
+        _remove_marl_checkpoints_for_fresh_train()
 
         t_train = time.time()
         train_pro, train_rea, _, train_df, test_df = run_training_phase(servers_df)
@@ -655,7 +698,7 @@ def main():
 
         # 曲线以训练段为准（含完整 loss_history）
         os.makedirs("outputs", exist_ok=True)
-        for name, key in [("DQN", "DQN"), ("Hybrid_SAC", "Hybrid SAC")]:
+        for name, key in [("DQN", "DQN"), ("GAT_MARL", "GAT-MARL")]:
             for mode, results in [("proactive", train_pro), ("reactive", train_rea)]:
                 res = results[key]
                 if res.get('loss_history'):

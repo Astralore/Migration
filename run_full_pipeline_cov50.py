@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 from algorithms.dqn import run_dqn_microservice_fair
-from algorithms.hybrid_sac import run_hybrid_sac_microservice
+from algorithms.marl_gat import run_marl_gat_microservice
+from algorithms.nearest import run_nearest_microservice_fair
 from algorithms.sa import run_sa_microservice_fair
 from core.context import DISTANCE_THRESHOLD_KM
 from core.data_loader import DEFAULT_SERVER_PATH, DEFAULT_TAXI_PATH, load_data
@@ -32,8 +33,8 @@ PROCESSED_TAXI_PATH = os.path.join(
 ACTIVE_USERS = 100
 SPLIT_SEED = 42
 FORECAST_HORIZON = 15
-SAC_EPOCHS_PROACTIVE = 6
-SAC_EPOCHS_REACTIVE = 2
+MARL_EPOCHS_PROACTIVE = 4
+MARL_EPOCHS_REACTIVE = 4
 
 
 def _prepare_dirs():
@@ -46,8 +47,8 @@ def _checkpoint_path(name):
 
 DQN_CHECKPOINT_PROACTIVE = _checkpoint_path("dqn_proactive.pth")
 DQN_CHECKPOINT_REACTIVE = _checkpoint_path("dqn_reactive.pth")
-SAC_CHECKPOINT_PROACTIVE = _checkpoint_path("sac_proactive.pth")
-SAC_CHECKPOINT_REACTIVE = _checkpoint_path("sac_reactive.pth")
+MARL_CHECKPOINT_PROACTIVE = _checkpoint_path("marl_gat_proactive.pth")
+MARL_CHECKPOINT_REACTIVE = _checkpoint_path("marl_gat_reactive.pth")
 
 
 def _to_jsonable(value):
@@ -97,6 +98,30 @@ def _summarize_result(res):
         "eval_q_means",
         "eval_sa_migrate_action_counts",
         "eval_sa_stay_action_counts",
+        "avg_agents_per_decision",
+        "controlled_agents_per_decision",
+        "pinned_agents_per_decision",
+        "avg_migrated_agents_per_decision",
+        "avg_controlled_migrated_agents_per_decision",
+        "controlled_migrations",
+        "all_agents_migrated_decisions",
+        "all_agents_migrated_ratio",
+        "controlled_all_agents_migrated_decisions",
+        "controlled_all_agents_migrated_ratio",
+        "stay_action_ratio",
+        "candidate_action_counts",
+        "joint_action_distribution",
+        "local_migration_cost_sum",
+        "edge_split_cost_sum",
+        "dense_distance_bonus_sum",
+        "cost_by_dag_complexity",
+        "cost_by_dag_type",
+        "migrations_by_dag_type",
+        "controlled_migrations_by_dag_type",
+        "invalid_action_masked_count",
+        "action_mask_fallback_count",
+        "lambda_migration",
+        "lambda_split",
     ]
     out = {k: _to_jsonable(res.get(k)) for k in keys if k in res}
     out["avg_total_cost_ms"] = _avg_total_cost_ms(res)
@@ -224,11 +249,11 @@ def _write_report(payload):
     def table(pro, rea):
         s = "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Avg Total Cost (ms) |\n"
         s += "|-----------|------------|------------|---------------------|------------------|---------------------|\n"
-        for name in ["SA", "DQN", "Hybrid SAC"]:
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             s += _row(name, pro[name], proactive=True) if name in pro else f"| {name} | — | — | — | — | — |\n"
         s += "\n| Algorithm | Migrations | Violations | Avg Latency (ms) | Avg Total Cost (ms) |\n"
         s += "|-----------|------------|------------|------------------|---------------------|\n"
-        for name in ["SA", "DQN", "Hybrid SAC"]:
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             s += _row(name, rea[name], proactive=False) if name in rea else f"| {name} | — | — | — | — |\n"
         return s
 
@@ -240,7 +265,7 @@ def _write_report(payload):
 **数据文件**：`{payload['config']['processed_taxi_path']}`  
 **数据规模**：Top-{ACTIVE_USERS} active taxis；train={payload['data']['train_rows']} rows/{payload['data']['train_taxis']} taxis；test={payload['data']['test_rows']} rows/{payload['data']['test_taxis']} taxis  
 **切分方式**：{split['method']}；test taxi ratio={split['test_taxi_ratio']:.3f}；test row ratio={split['test_row_ratio']:.3f}；test risk ratio={split['test_risk_ratio']:.3f}  
-**SAC epochs**：Proactive={SAC_EPOCHS_PROACTIVE}，Reactive={SAC_EPOCHS_REACTIVE}  
+**GAT-MARL epochs**：Proactive={MARL_EPOCHS_PROACTIVE}，Reactive={MARL_EPOCHS_REACTIVE}  
 **Checkpoint 目录**：`{CHECKPOINT_DIR}`
 
 ## 训练段
@@ -254,11 +279,11 @@ def _write_report(payload):
 ## 说明
 
 - 本轮显式使用 cov50 清洗数据，不读取旧 cleaned CSV。
-- DQN / Hybrid SAC checkpoint 均写入本实验目录，推理阶段只读取本轮新训练权重。
+- DQN / GAT-MARL checkpoint 均写入本实验目录，推理阶段只读取本轮新训练权重。
 - 结果会在每个算法完成后写入 `results.json` 和本报告，便于长任务中断后检查进度。
 
 """
-    if "SA" in infer_pro or "Hybrid SAC" in infer_pro:
+    if "SA" in infer_pro or "GAT-MARL" in infer_pro or "Nearest" in infer_pro:
         report += build_dag_adaptive_dual_appendix(infer_pro, section_heading="## DAG Proactive 迁移统计")
     with open(os.path.join(OUT_DIR, "result.md"), "w", encoding="utf-8") as f:
         f.write(report)
@@ -270,8 +295,8 @@ def _make_payload(df, train_df, test_df, train_ids, test_ids, split_meta):
             "active_users": ACTIVE_USERS,
             "split_seed": SPLIT_SEED,
             "forecast_horizon": FORECAST_HORIZON,
-            "sac_epochs_proactive": SAC_EPOCHS_PROACTIVE,
-            "sac_epochs_reactive": SAC_EPOCHS_REACTIVE,
+            "marl_epochs_proactive": MARL_EPOCHS_PROACTIVE,
+            "marl_epochs_reactive": MARL_EPOCHS_REACTIVE,
             "processed_taxi_path": PROCESSED_TAXI_PATH,
             "checkpoint_dir": CHECKPOINT_DIR,
             "started_at": datetime.now().isoformat(),
@@ -329,6 +354,11 @@ def main():
                 payload[stage][mode]["SA"] = _summarize_result(res)
                 _write_payload(payload)
 
+            if "Nearest" not in payload[stage][mode]:
+                res = run_nearest_microservice_fair(data, servers_df, predictor=predictor, proactive=proactive)
+                payload[stage][mode]["Nearest"] = _summarize_result(res)
+                _write_payload(payload)
+
             dqn_ckpt = DQN_CHECKPOINT_PROACTIVE if proactive else DQN_CHECKPOINT_REACTIVE
             if "DQN" not in payload[stage][mode]:
                 res = run_dqn_microservice_fair(
@@ -341,19 +371,18 @@ def main():
                 payload[stage][mode]["DQN"] = _summarize_result(res)
                 _write_payload(payload)
 
-            sac_ckpt = SAC_CHECKPOINT_PROACTIVE if proactive else SAC_CHECKPOINT_REACTIVE
-            sac_epochs = SAC_EPOCHS_PROACTIVE if proactive else SAC_EPOCHS_REACTIVE
-            if "Hybrid SAC" not in payload[stage][mode]:
-                res = run_hybrid_sac_microservice(
+            marl_ckpt = MARL_CHECKPOINT_PROACTIVE if proactive else MARL_CHECKPOINT_REACTIVE
+            if "GAT-MARL" not in payload[stage][mode]:
+                res = run_marl_gat_microservice(
                     data,
                     servers_df,
                     predictor=predictor,
                     proactive=proactive,
-                    num_epochs=sac_epochs,
+                    num_epochs=MARL_EPOCHS_PROACTIVE if proactive else MARL_EPOCHS_REACTIVE,
                     inference_mode=False,
-                    save_checkpoint_path=sac_ckpt,
+                    save_checkpoint_path=marl_ckpt,
                 )
-                payload[stage][mode]["Hybrid SAC"] = _summarize_result(res)
+                payload[stage][mode]["GAT-MARL"] = _summarize_result(res)
                 _write_payload(payload)
         else:
             if "SA" not in payload[stage][mode]:
@@ -365,6 +394,17 @@ def main():
                     collect_dag_proactive_stats=proactive,
                 )
                 payload[stage][mode]["SA"] = _summarize_result(res)
+                _write_payload(payload)
+
+            if "Nearest" not in payload[stage][mode]:
+                res = run_nearest_microservice_fair(
+                    data,
+                    servers_df,
+                    predictor=predictor,
+                    proactive=proactive,
+                    collect_dag_proactive_stats=proactive,
+                )
+                payload[stage][mode]["Nearest"] = _summarize_result(res)
                 _write_payload(payload)
 
             dqn_ckpt = DQN_CHECKPOINT_PROACTIVE if proactive else DQN_CHECKPOINT_REACTIVE
@@ -380,17 +420,18 @@ def main():
                 payload[stage][mode]["DQN"] = _summarize_result(res)
                 _write_payload(payload)
 
-            sac_ckpt = SAC_CHECKPOINT_PROACTIVE if proactive else SAC_CHECKPOINT_REACTIVE
-            if "Hybrid SAC" not in payload[stage][mode]:
-                res = run_hybrid_sac_microservice(
+            marl_ckpt = MARL_CHECKPOINT_PROACTIVE if proactive else MARL_CHECKPOINT_REACTIVE
+            if "GAT-MARL" not in payload[stage][mode]:
+                res = run_marl_gat_microservice(
                     data,
                     servers_df,
                     predictor=predictor,
                     proactive=proactive,
                     inference_mode=True,
-                    checkpoint_path=sac_ckpt,
+                    checkpoint_path=marl_ckpt,
+                    collect_dag_proactive_stats=proactive,
                 )
-                payload[stage][mode]["Hybrid SAC"] = _summarize_result(res)
+                payload[stage][mode]["GAT-MARL"] = _summarize_result(res)
                 _write_payload(payload)
 
         payload["elapsed_seconds_so_far"] = time.time() - start

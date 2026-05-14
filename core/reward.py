@@ -6,7 +6,7 @@ Reward calculation for microservice DAG placement (ms 量纲 total_cost_ms).
 import os
 
 from core.geo import haversine_distance
-from core.dag_utils import get_entry_nodes
+from core.dag_utils import get_deployable_nodes, get_service_entry_nodes
 from core.context import (
     TRIGGER_REACTIVE,
     TRIGGER_PROACTIVE,
@@ -60,7 +60,7 @@ def build_servers_info(servers_df):
 
 def _entry_access_profile(assignments, dag_info, user_lat, user_lon, servers_info):
     """Return (max_entry_dist_km, access_latency_ms) for a placement."""
-    entry_nodes = get_entry_nodes(dag_info)
+    entry_nodes = get_service_entry_nodes(dag_info)
     if not entry_nodes:
         return 0.0, 0.0
     srv_lats = np.array([servers_info[assignments[node]][0] for node in entry_nodes], dtype=np.float64)
@@ -90,7 +90,7 @@ def estimate_dag_migration_time_s(
         if SLA_DISTANCE_THRESHOLD > 0 else 0.0
     )
     effective_bandwidth = MIN_BW_MBPS + (MAX_BW_MBPS - MIN_BW_MBPS) * (risk_ratio ** 2)
-    node_names = list(nodes) if nodes is not None else list(dag_info["nodes"].keys())
+    node_names = list(nodes) if nodes is not None else get_deployable_nodes(dag_info)
     total_s = 0.0
     for node in node_names:
         props = dag_info["nodes"][node]
@@ -118,7 +118,7 @@ def calculate_microservice_reward(
 ):
     """Returns (reward, details). details["total_cost_ms"] 保留真实物理 ms。"""
     user_lat, user_lon = user_location
-    entry_nodes = get_entry_nodes(dag_info)
+    entry_nodes = get_service_entry_nodes(dag_info)
 
     max_entry_dist_km, access_latency_ms = _entry_access_profile(
         current_assignments, dag_info, user_lat, user_lon, servers_info
@@ -139,14 +139,24 @@ def calculate_microservice_reward(
     risk_ratio = min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD, 1.0) if SLA_DISTANCE_THRESHOLD > 0 else 0.0
     effective_bandwidth = MIN_BW_MBPS + (MAX_BW_MBPS - MIN_BW_MBPS) * (risk_ratio ** 2)
 
+    migrating_targets = {}
+    for node in get_deployable_nodes(dag_info):
+        if current_assignments[node] != previous_assignments[node]:
+            target = current_assignments[node]
+            migrating_targets[target] = migrating_targets.get(target, 0) + 1
+
     migration_delay_ms = 0.0
-    for node, node_props in dag_info["nodes"].items():
+    for node in get_deployable_nodes(dag_info):
+        node_props = dag_info["nodes"][node]
         if current_assignments[node] != previous_assignments[node]:
             image_mb = float(node_props["image_mb"])
             state_mb = float(node_props["state_mb"])
+            target_server = current_assignments[node]
+            target_concurrency = max(1, int(migrating_targets.get(target_server, 1)))
+            node_bandwidth = max(effective_bandwidth / target_concurrency, 1e-6)
             # C1：字节→比特 ×8；带宽按 Mbps；每迁移节点加容器启动底噪（ms）
             delta_ms = (
-                ((image_mb + state_mb) * MB_TO_MBIT / effective_bandwidth) * 1000.0
+                ((image_mb + state_mb) * MB_TO_MBIT / node_bandwidth) * 1000.0
                 + BASE_MIGRATION_OVERHEAD_MS
             )
             if trigger_type == TRIGGER_REACTIVE:
