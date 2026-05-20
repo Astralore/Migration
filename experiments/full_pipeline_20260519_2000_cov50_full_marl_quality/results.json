@@ -1,0 +1,1500 @@
+{
+  "config": {
+    "active_users": 100,
+    "split_seed": 42,
+    "forecast_horizon": 15,
+    "marl_epochs_proactive": 8,
+    "marl_epochs_reactive": 8,
+    "processed_taxi_path": "data\\processed\\taxi_cleaned_active100_min100_eps2h_cov50.csv",
+    "checkpoint_dir": "experiments\\full_pipeline_20260519_2000_cov50_full_marl_quality\\checkpoints",
+    "started_at": "2026-05-19T20:01:15.901602"
+  },
+  "data": {
+    "rows": 205936,
+    "taxis": 100,
+    "train_rows": 148153,
+    "train_taxis": 80,
+    "test_rows": 57783,
+    "test_taxis": 20,
+    "train_ids": {
+      "len": 80,
+      "head": [
+        "10252",
+        "10299",
+        "10337",
+        "1074",
+        "1111"
+      ],
+      "tail": [
+        "3859",
+        "3878",
+        "3879",
+        "3881",
+        "3974"
+      ]
+    },
+    "test_ids": [
+      "1015",
+      "1059",
+      "1359",
+      "1403",
+      "1683",
+      "1688",
+      "2120",
+      "2263",
+      "2783",
+      "2832",
+      "2881",
+      "3250",
+      "3318",
+      "3365",
+      "366",
+      "3702",
+      "3933",
+      "3939",
+      "3942",
+      "3948"
+    ],
+    "split": {
+      "method": "greedy_balanced_by_nearest_server_exposure",
+      "target_test_ratio": 0.2,
+      "test_taxi_ratio": 0.2,
+      "test_row_ratio": 0.28058717271385286,
+      "test_risk_ratio": 0.27512939615129395,
+      "taxi_exposure": {
+        "len": 100,
+        "head": [
+          {
+            "taxi_id": 118,
+            "rows": 2110,
+            "risk_score": 45.5,
+            "nearest_over_15": 45,
+            "nearest_10_to_15": 2,
+            "nearest_p50": 0.345757836806603,
+            "nearest_p95": 1.9850281949275588
+          },
+          {
+            "taxi_id": 273,
+            "rows": 1700,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 2.012442044776782,
+            "nearest_p95": 2.0400810415893957
+          },
+          {
+            "taxi_id": 315,
+            "rows": 1664,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 4.67756942668555,
+            "nearest_p95": 7.857207957802579
+          },
+          {
+            "taxi_id": 341,
+            "rows": 1686,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.29607342316664864,
+            "nearest_p95": 0.6165805355196505
+          },
+          {
+            "taxi_id": 350,
+            "rows": 1681,
+            "risk_score": 538.75,
+            "nearest_over_15": 523,
+            "nearest_10_to_15": 63,
+            "nearest_p50": 0.5625203821614045,
+            "nearest_p95": 17.19479160524607
+          }
+        ],
+        "tail": [
+          {
+            "taxi_id": 3948,
+            "rows": 4333,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.4870063378499732,
+            "nearest_p95": 4.185732671765144
+          },
+          {
+            "taxi_id": 3974,
+            "rows": 2281,
+            "risk_score": 24.75,
+            "nearest_over_15": 24,
+            "nearest_10_to_15": 3,
+            "nearest_p50": 0.4238458603219313,
+            "nearest_p95": 2.1111554401230426
+          },
+          {
+            "taxi_id": 10252,
+            "rows": 2569,
+            "risk_score": 826.75,
+            "nearest_over_15": 778,
+            "nearest_10_to_15": 195,
+            "nearest_p50": 0.5165136559039818,
+            "nearest_p95": 46.97635801103906
+          },
+          {
+            "taxi_id": 10299,
+            "rows": 1707,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.47380484445719956,
+            "nearest_p95": 1.303285048159676
+          },
+          {
+            "taxi_id": 10337,
+            "rows": 2049,
+            "risk_score": 0.0,
+            "nearest_over_15": 0,
+            "nearest_10_to_15": 0,
+            "nearest_p50": 0.3552529784844649,
+            "nearest_p95": 1.0300540744506894
+          }
+        ]
+      }
+    }
+  },
+  "train": {
+    "proactive": {
+      "SA": {
+        "total_migrations": 8339,
+        "total_violations": 17737,
+        "proactive_decisions": 2375,
+        "decision_count": 20112,
+        "total_reward": -45197.79987248854,
+        "avg_decision_time_ms": 6.342844216733435,
+        "total_cost_ms_sum": 436863314.11070883,
+        "total_sla_penalty_ms": 273820000.0,
+        "total_tearing_penalty_ms": 664943.3100000753,
+        "total_future_penalty_ms": 1128.835202385038,
+        "total_access_latency": 42334.24448096343,
+        "total_communication_cost": 36980.87340461929,
+        "total_migration_cost": 162297926.84762,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 21721.525164613606
+      },
+      "Nearest": {
+        "total_migrations": 14515,
+        "total_violations": 14573,
+        "proactive_decisions": 2220,
+        "decision_count": 16793,
+        "total_reward": -54191.22719205076,
+        "avg_decision_time_ms": 0.05301063014776134,
+        "total_cost_ms_sum": 1416291426.7052042,
+        "total_sla_penalty_ms": 271100000.0,
+        "total_tearing_penalty_ms": 0.0,
+        "total_future_penalty_ms": 1029.876335819899,
+        "total_access_latency": 35500.24947844395,
+        "total_communication_cost": 0.0,
+        "total_migration_cost": 1145154896.5793896,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 84338.20203091789
+      },
+      "DQN": {
+        "total_migrations": 23325,
+        "total_violations": 16940,
+        "proactive_decisions": 2186,
+        "decision_count": 19126,
+        "total_reward": -54059.43011634093,
+        "avg_decision_time_ms": 0.5880156115595764,
+        "total_cost_ms_sum": 604241301.028587,
+        "total_sla_penalty_ms": 317640000.0,
+        "total_tearing_penalty_ms": 503877.2850000519,
+        "total_future_penalty_ms": 1360.2323132888848,
+        "total_access_latency": 40620.94433913074,
+        "total_communication_cost": 39560.35082579406,
+        "total_migration_cost": 286015882.2161105,
+        "avg_total_cost_ms": 31592.664489626004
+      },
+      "GAT-MARL": {
+        "total_migrations": 4647,
+        "total_violations": 17847,
+        "primary_entry_violations": 15645,
+        "max_entry_violations": 17847,
+        "proactive_decisions": 2315,
+        "decision_count": 17960,
+        "total_reward": -45810.37605858893,
+        "avg_decision_time_ms": 0.9451617432715691,
+        "total_cost_ms_sum": 363969492.37838566,
+        "total_sla_penalty_ms": 281480000.0,
+        "total_tearing_penalty_ms": 843783.2099999414,
+        "total_future_penalty_ms": 1100.5745701397318,
+        "total_access_latency": 37948.703962360225,
+        "total_communication_cost": 42714.414069629944,
+        "total_migration_cost": 81563945.47578543,
+        "dag_proactive_migration_stats": {},
+        "avg_agents_per_decision": 4.429287305122495,
+        "controlled_agents_per_decision": 3.9256124721603562,
+        "pinned_agents_per_decision": 0.5036748329621381,
+        "avg_migrated_agents_per_decision": 0.25874164810690425,
+        "avg_controlled_migrated_agents_per_decision": 0.25874164810690425,
+        "controlled_migrations": 4647,
+        "all_agents_migrated_decisions": 0,
+        "all_agents_migrated_ratio": 0.0,
+        "controlled_all_agents_migrated_decisions": 113,
+        "controlled_all_agents_migrated_ratio": 0.006291759465478842,
+        "stay_action_ratio": 0.9415839094908862,
+        "candidate_action_counts": {
+          "0": 74903,
+          "1": 4619,
+          "2": 28,
+          "3": 0
+        },
+        "joint_action_distribution": {
+          "0-0-0-0-0": 6789,
+          "1-0-0-0": 624,
+          "0-0-0-0-1": 91,
+          "0-0-1-0-1": 29,
+          "0-1-0-1-0": 107,
+          "0-1-1-0": 89,
+          "0-1-0-0": 149,
+          "1-1-0-0-1": 28,
+          "1-0-1-0-0": 28,
+          "0-0-1-1-0": 80,
+          "1-0-0": 349,
+          "0-0-0": 2366,
+          "0-0-1-0-0-0": 166,
+          "0-0-0-1-0-0": 198,
+          "0-0-1-1": 101,
+          "1-0-0-0-1": 126,
+          "0-1-0-0-0": 40,
+          "1-0-0-0-0": 378,
+          "1-0-0-1": 95,
+          "0-0-0-0": 4793,
+          "0-0-1-0": 110,
+          "1-1-0-0-0": 71,
+          "0-0-0-0-0-0": 679,
+          "0-0-1-1-0-0": 81,
+          "0-0-0-1-1": 174,
+          "2-0-0-0": 8,
+          "1-2-0-0-1": 1,
+          "0-1-1-0-0": 104,
+          "0-1-1-1-1": 19,
+          "1-0-1-0-1": 16,
+          "0-0-1-0-0-1": 30,
+          "1-1-1-1-0": 5,
+          "0-0-2-0": 1,
+          "0-2-1-0": 5,
+          "0-0-2-2-0": 2,
+          "2-0-0-0-0": 4,
+          "1-0-1-1-0": 2,
+          "1-0-0-1-0": 1,
+          "1-1-1-0-0": 9,
+          "1-1-1-0-1": 1,
+          "0-0-0-1": 1,
+          "0-0-1-1-2": 1,
+          "0-0-0-0-0-1": 2,
+          "0-0-0-2-0-0": 2,
+          "0-1-1-1-0": 1,
+          "0-0-0-1-0": 1,
+          "0-2-0-0": 2,
+          "0-0-1-0-0": 1
+        },
+        "local_migration_cost_sum": 81563945.47578543,
+        "edge_split_cost_sum": 11498.744139864619,
+        "dense_distance_bonus_sum": 7108.4077422417795,
+        "entry_sla_bonus_sum": 1225.19509668195,
+        "proactive_logit_bias_count": 10535,
+        "proactive_best_bias_action_counts": {
+          "0": 5547,
+          "1": 3151,
+          "2": 238,
+          "3": 167
+        },
+        "reactive_action_clipped_count": 46494,
+        "counterfactual_score_sum": 146106.09337556135,
+        "entry_node_migration_count": 4209,
+        "sla_improving_action_count": 10958,
+        "cost_guard_blocked_count": 62894,
+        "non_entry_distance_only_blocked_count": 41502,
+        "cost_by_dag_complexity": {
+          "medium": {
+            "decision_count": 12480,
+            "total_cost_ms_sum": 249851850.1255159,
+            "migrations": 3574,
+            "avg_total_cost_ms": 20020.180298518902
+          },
+          "simple": {
+            "decision_count": 5480,
+            "total_cost_ms_sum": 114117642.25286853,
+            "migrations": 1073,
+            "avg_total_cost_ms": 20824.387272421267
+          }
+        },
+        "cost_by_dag_type": {
+          "FanOut_Broadcaster_2": {
+            "decision_count": 1879,
+            "total_cost_ms_sum": 38493993.64713292,
+            "migrations": 756,
+            "controlled_migrations": 756,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 19,
+            "avg_total_cost_ms": 20486.42557058697,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.010111761575306013
+          },
+          "Diamond_DAG_2": {
+            "decision_count": 787,
+            "total_cost_ms_sum": 16386446.699448876,
+            "migrations": 261,
+            "controlled_migrations": 261,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 20821.406225475064,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_2": {
+            "decision_count": 307,
+            "total_cost_ms_sum": 8112065.21411718,
+            "migrations": 463,
+            "controlled_migrations": 463,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 26423.6651925641,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_3": {
+            "decision_count": 237,
+            "total_cost_ms_sum": 3967439.48668639,
+            "migrations": 224,
+            "controlled_migrations": 224,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 16740.25099867675,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_1": {
+            "decision_count": 1555,
+            "total_cost_ms_sum": 28729041.406932667,
+            "migrations": 448,
+            "controlled_migrations": 448,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 94,
+            "avg_total_cost_ms": 18475.267785808788,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.06045016077170418
+          },
+          "FanIn_Aggregator_1": {
+            "decision_count": 115,
+            "total_cost_ms_sum": 3216786.2339719115,
+            "migrations": 228,
+            "controlled_migrations": 228,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 27972.054208451405,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "IoT_Lightweight_DAG": {
+            "decision_count": 2715,
+            "total_cost_ms_sum": 45588364.41116343,
+            "migrations": 349,
+            "controlled_migrations": 349,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 16791.294442417468,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_3": {
+            "decision_count": 1095,
+            "total_cost_ms_sum": 23833298.960421093,
+            "migrations": 449,
+            "controlled_migrations": 449,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 21765.569826868577,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_3": {
+            "decision_count": 1658,
+            "total_cost_ms_sum": 34247564.55396268,
+            "migrations": 303,
+            "controlled_migrations": 303,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 20655.949670665064,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Data_Heavy_DAG": {
+            "decision_count": 1158,
+            "total_cost_ms_sum": 28323836.963817596,
+            "migrations": 590,
+            "controlled_migrations": 590,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 24459.27198947979,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Compute_Heavy_DAG": {
+            "decision_count": 1741,
+            "total_cost_ms_sum": 48175391.65556978,
+            "migrations": 239,
+            "controlled_migrations": 239,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 27671.103765404812,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_1": {
+            "decision_count": 4713,
+            "total_cost_ms_sum": 84895263.14516254,
+            "migrations": 337,
+            "controlled_migrations": 337,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 18012.998757725978,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          }
+        },
+        "migrations_by_dag_type": {
+          "FanOut_Broadcaster_2": 756,
+          "Diamond_DAG_2": 261,
+          "FanIn_Aggregator_2": 463,
+          "FanOut_Broadcaster_3": 224,
+          "Diamond_DAG_1": 448,
+          "FanIn_Aggregator_1": 228,
+          "IoT_Lightweight_DAG": 349,
+          "FanIn_Aggregator_3": 449,
+          "Diamond_DAG_3": 303,
+          "Data_Heavy_DAG": 590,
+          "Compute_Heavy_DAG": 239,
+          "FanOut_Broadcaster_1": 337
+        },
+        "controlled_migrations_by_dag_type": {
+          "FanOut_Broadcaster_2": 756,
+          "Diamond_DAG_2": 261,
+          "FanIn_Aggregator_2": 463,
+          "FanOut_Broadcaster_3": 224,
+          "Diamond_DAG_1": 448,
+          "FanIn_Aggregator_1": 228,
+          "IoT_Lightweight_DAG": 349,
+          "FanIn_Aggregator_3": 449,
+          "Diamond_DAG_3": 303,
+          "Data_Heavy_DAG": 590,
+          "Compute_Heavy_DAG": 239,
+          "FanOut_Broadcaster_1": 337
+        },
+        "invalid_action_masked_count": 53857,
+        "action_mask_fallback_count": 0,
+        "lambda_migration": 0.05,
+        "lambda_split": 0.02,
+        "avg_total_cost_ms": 20265.561936435726
+      }
+    },
+    "reactive": {
+      "SA": {
+        "total_migrations": 7918,
+        "total_violations": 17987,
+        "proactive_decisions": 0,
+        "decision_count": 17987,
+        "total_reward": -45218.05041260053,
+        "avg_decision_time_ms": 4.364282398578313,
+        "total_cost_ms_sum": 443566602.8742255,
+        "total_sla_penalty_ms": 274180000.0,
+        "total_tearing_penalty_ms": 590028.1600000854,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 37972.16345817193,
+        "total_communication_cost": 36273.573117325315,
+        "total_migration_cost": 168722328.9776512,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 24660.399336978124
+      },
+      "Nearest": {
+        "total_migrations": 10848,
+        "total_violations": 15904,
+        "proactive_decisions": 0,
+        "decision_count": 15904,
+        "total_reward": -49199.13134602751,
+        "avg_decision_time_ms": 0.051195788192183296,
+        "total_cost_ms_sum": 1324762347.1267078,
+        "total_sla_penalty_ms": 271100000.0,
+        "total_tearing_penalty_ms": 0.0,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 33714.46603168198,
+        "total_communication_cost": 0.0,
+        "total_migration_cost": 1053628632.6607045,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 83297.43128311794
+      },
+      "DQN": {
+        "total_migrations": 22218,
+        "total_violations": 17443,
+        "proactive_decisions": 0,
+        "decision_count": 17443,
+        "total_reward": -49897.810059973184,
+        "avg_decision_time_ms": 0.40413444241991403,
+        "total_cost_ms_sum": 578204592.4327044,
+        "total_sla_penalty_ms": 309300000.0,
+        "total_tearing_penalty_ms": 672120.0200000462,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 37137.12645404074,
+        "total_communication_cost": 32504.38132371849,
+        "total_migration_cost": 268162830.90492532,
+        "avg_total_cost_ms": 33148.23094838643
+      },
+      "GAT-MARL": {
+        "total_migrations": 4022,
+        "total_violations": 14861,
+        "primary_entry_violations": 16142,
+        "max_entry_violations": 14861,
+        "proactive_decisions": 0,
+        "decision_count": 16142,
+        "total_reward": -44584.72626038662,
+        "avg_decision_time_ms": 0.663238328270796,
+        "total_cost_ms_sum": 404756961.7256741,
+        "total_sla_penalty_ms": 278620000.0,
+        "total_tearing_penalty_ms": 901508.5349999209,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 34217.86840663453,
+        "total_communication_cost": 41362.43485194156,
+        "total_migration_cost": 125159872.88742413,
+        "dag_proactive_migration_stats": {},
+        "avg_agents_per_decision": 4.530169743526205,
+        "controlled_agents_per_decision": 3.9999380498079544,
+        "pinned_agents_per_decision": 0.5302316937182505,
+        "avg_migrated_agents_per_decision": 0.24916367240738446,
+        "avg_controlled_migrated_agents_per_decision": 0.24916367240738446,
+        "controlled_migrations": 4022,
+        "all_agents_migrated_decisions": 0,
+        "all_agents_migrated_ratio": 0.0,
+        "controlled_all_agents_migrated_decisions": 155,
+        "controlled_all_agents_migrated_ratio": 0.009602279767067278,
+        "stay_action_ratio": 0.9449990427481334,
+        "candidate_action_counts": {
+          "0": 69104,
+          "1": 4018,
+          "2": 4,
+          "3": 0
+        },
+        "joint_action_distribution": {
+          "1-0-0-0": 725,
+          "0-0-1-1-0-0": 285,
+          "0-0-1-1": 299,
+          "1-0-0": 203,
+          "1-0-0-0-0": 262,
+          "1-0-1-0-0": 54,
+          "0-0-1-0-1": 27,
+          "0-1-0-1-0": 83,
+          "0-1-1-0": 136,
+          "1-1-0-0-0": 121,
+          "0-0-0-0-0": 4385,
+          "0-0-0-1-1": 183,
+          "0-1-1-1-1": 18,
+          "0-1-1-0-0": 91,
+          "0-0-0-0": 7702,
+          "0-0-1-1-0": 69,
+          "0-1-2-0": 1,
+          "0-0-1-2-0-0": 1,
+          "0-0-0": 27,
+          "1-1-1-1-0": 11,
+          "0-1-0-0-0": 1,
+          "1-1-1-0-0": 4,
+          "0-0-0-0-0-0": 1452,
+          "0-0-2-2-0-0": 1,
+          "0-0-1-0-0": 1
+        },
+        "local_migration_cost_sum": 125159872.88742413,
+        "edge_split_cost_sum": 5388.574201513681,
+        "dense_distance_bonus_sum": 0.0,
+        "entry_sla_bonus_sum": 934.149652344168,
+        "proactive_logit_bias_count": 0,
+        "proactive_best_bias_action_counts": {
+          "0": 0,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "reactive_action_clipped_count": 55440,
+        "counterfactual_score_sum": -25895.75534216573,
+        "entry_node_migration_count": 4022,
+        "sla_improving_action_count": 4450,
+        "cost_guard_blocked_count": 55226,
+        "non_entry_distance_only_blocked_count": 34352,
+        "cost_by_dag_complexity": {
+          "medium": {
+            "decision_count": 10024,
+            "total_cost_ms_sum": 240799618.83800748,
+            "migrations": 2778,
+            "avg_total_cost_ms": 24022.308343775687
+          },
+          "simple": {
+            "decision_count": 6118,
+            "total_cost_ms_sum": 163957342.88767633,
+            "migrations": 1244,
+            "avg_total_cost_ms": 26799.173404327612
+          }
+        },
+        "cost_by_dag_type": {
+          "Diamond_DAG_3": {
+            "decision_count": 1670,
+            "total_cost_ms_sum": 31097899.655115936,
+            "migrations": 282,
+            "controlled_migrations": 282,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 18621.49679947062,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Data_Heavy_DAG": {
+            "decision_count": 1739,
+            "total_cost_ms_sum": 66580687.06117281,
+            "migrations": 574,
+            "controlled_migrations": 574,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 38286.76656766694,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_3": {
+            "decision_count": 2745,
+            "total_cost_ms_sum": 52637082.68157539,
+            "migrations": 279,
+            "controlled_migrations": 279,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 19175.62210622054,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Compute_Heavy_DAG": {
+            "decision_count": 1499,
+            "total_cost_ms_sum": 76694774.1330398,
+            "migrations": 598,
+            "controlled_migrations": 598,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 51163.9587278451,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "IoT_Lightweight_DAG": {
+            "decision_count": 230,
+            "total_cost_ms_sum": 3099024.7161445986,
+            "migrations": 203,
+            "controlled_migrations": 203,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 13474.020504976515,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_1": {
+            "decision_count": 3247,
+            "total_cost_ms_sum": 63442482.8726569,
+            "migrations": 234,
+            "controlled_migrations": 234,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 19538.799775995347,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_3": {
+            "decision_count": 885,
+            "total_cost_ms_sum": 18223317.4458434,
+            "migrations": 226,
+            "controlled_migrations": 226,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 20591.319147845647,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_2": {
+            "decision_count": 165,
+            "total_cost_ms_sum": 5684829.272914801,
+            "migrations": 344,
+            "controlled_migrations": 344,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 34453.51074493818,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_2": {
+            "decision_count": 972,
+            "total_cost_ms_sum": 24642548.26279014,
+            "migrations": 754,
+            "controlled_migrations": 754,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 18,
+            "avg_total_cost_ms": 25352.415908220308,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.018518518518518517
+          },
+          "Diamond_DAG_2": {
+            "decision_count": 1644,
+            "total_cost_ms_sum": 31526461.356915615,
+            "migrations": 164,
+            "controlled_migrations": 164,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 19176.67965749125,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_1": {
+            "decision_count": 1305,
+            "total_cost_ms_sum": 29226276.67315683,
+            "migrations": 274,
+            "controlled_migrations": 274,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 137,
+            "avg_total_cost_ms": 22395.61430893244,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.1049808429118774
+          },
+          "FanIn_Aggregator_1": {
+            "decision_count": 41,
+            "total_cost_ms_sum": 1901577.5943557755,
+            "migrations": 90,
+            "controlled_migrations": 90,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 46379.941325750624,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          }
+        },
+        "migrations_by_dag_type": {
+          "Diamond_DAG_3": 282,
+          "Data_Heavy_DAG": 574,
+          "FanOut_Broadcaster_3": 279,
+          "Compute_Heavy_DAG": 598,
+          "IoT_Lightweight_DAG": 203,
+          "FanOut_Broadcaster_1": 234,
+          "FanIn_Aggregator_3": 226,
+          "FanIn_Aggregator_2": 344,
+          "FanOut_Broadcaster_2": 754,
+          "Diamond_DAG_2": 164,
+          "Diamond_DAG_1": 274,
+          "FanIn_Aggregator_1": 90
+        },
+        "controlled_migrations_by_dag_type": {
+          "Diamond_DAG_3": 282,
+          "Data_Heavy_DAG": 574,
+          "FanOut_Broadcaster_3": 279,
+          "Compute_Heavy_DAG": 598,
+          "IoT_Lightweight_DAG": 203,
+          "FanOut_Broadcaster_1": 234,
+          "FanIn_Aggregator_3": 226,
+          "FanIn_Aggregator_2": 344,
+          "FanOut_Broadcaster_2": 754,
+          "Diamond_DAG_2": 164,
+          "Diamond_DAG_1": 274,
+          "FanIn_Aggregator_1": 90
+        },
+        "invalid_action_masked_count": 46701,
+        "action_mask_fallback_count": 0,
+        "lambda_migration": 0.3,
+        "lambda_split": 0.1,
+        "avg_total_cost_ms": 25074.771510697192
+      }
+    }
+  },
+  "inference": {
+    "proactive": {
+      "SA": {
+        "total_migrations": 1853,
+        "total_violations": 5939,
+        "proactive_decisions": 666,
+        "decision_count": 6605,
+        "total_reward": -16793.802722019096,
+        "avg_decision_time_ms": 5.7547567602258285,
+        "total_cost_ms_sum": 144349901.26174644,
+        "total_sla_penalty_ms": 104700000.0,
+        "total_tearing_penalty_ms": 329014.2400000153,
+        "total_future_penalty_ms": 274.2097415428822,
+        "total_access_latency": 13875.862846911146,
+        "total_communication_cost": 14490.794772766892,
+        "total_migration_cost": 39292246.15438151,
+        "dag_proactive_migration_stats": {
+          "FanOut_Broadcaster_1": {
+            "proactive_decisions": 161,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_3": {
+            "proactive_decisions": 24,
+            "migrated_nodes": 13
+          },
+          "Diamond_DAG_2": {
+            "proactive_decisions": 126,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_2": {
+            "proactive_decisions": 83,
+            "migrated_nodes": 54
+          },
+          "Diamond_DAG_3": {
+            "proactive_decisions": 15,
+            "migrated_nodes": 0
+          },
+          "Diamond_DAG_1": {
+            "proactive_decisions": 71,
+            "migrated_nodes": 69
+          },
+          "Data_Heavy_DAG": {
+            "proactive_decisions": 69,
+            "migrated_nodes": 78
+          },
+          "FanOut_Broadcaster_3": {
+            "proactive_decisions": 7,
+            "migrated_nodes": 0
+          },
+          "IoT_Lightweight_DAG": {
+            "proactive_decisions": 84,
+            "migrated_nodes": 0
+          },
+          "FanIn_Aggregator_1": {
+            "proactive_decisions": 26,
+            "migrated_nodes": 13
+          }
+        },
+        "avg_total_cost_ms": 21854.640614950255
+      },
+      "Nearest": {
+        "total_migrations": 3381,
+        "total_violations": 5381,
+        "proactive_decisions": 530,
+        "decision_count": 5911,
+        "total_reward": -19027.324750182986,
+        "avg_decision_time_ms": 0.05425328964367824,
+        "total_cost_ms_sum": 465739199.89556724,
+        "total_sla_penalty_ms": 103880000.0,
+        "total_tearing_penalty_ms": 0.0,
+        "total_future_penalty_ms": 258.0977829865862,
+        "total_access_latency": 12446.170628415231,
+        "total_communication_cost": 0.0,
+        "total_migration_cost": 361846495.6271593,
+        "dag_proactive_migration_stats": {
+          "Data_Heavy_DAG": {
+            "proactive_decisions": 154,
+            "migrated_nodes": 924
+          },
+          "FanOut_Broadcaster_3": {
+            "proactive_decisions": 187,
+            "migrated_nodes": 748
+          },
+          "FanOut_Broadcaster_2": {
+            "proactive_decisions": 37,
+            "migrated_nodes": 185
+          },
+          "Diamond_DAG_3": {
+            "proactive_decisions": 44,
+            "migrated_nodes": 164
+          },
+          "Diamond_DAG_1": {
+            "proactive_decisions": 38,
+            "migrated_nodes": 152
+          },
+          "FanOut_Broadcaster_1": {
+            "proactive_decisions": 43,
+            "migrated_nodes": 215
+          },
+          "Diamond_DAG_2": {
+            "proactive_decisions": 19,
+            "migrated_nodes": 76
+          },
+          "IoT_Lightweight_DAG": {
+            "proactive_decisions": 8,
+            "migrated_nodes": 24
+          }
+        },
+        "avg_total_cost_ms": 78791.94719938542
+      },
+      "DQN": {
+        "total_migrations": 2665,
+        "total_violations": 8758,
+        "proactive_decisions": 607,
+        "decision_count": 9365,
+        "total_reward": -26602.385338055406,
+        "avg_decision_time_ms": 0.43797079499590164,
+        "total_cost_ms_sum": 214864725.4266392,
+        "total_sla_penalty_ms": 166180000.0,
+        "total_tearing_penalty_ms": 1004267.6050001212,
+        "total_future_penalty_ms": 360.6663123809343,
+        "total_access_latency": 19652.36572025903,
+        "total_communication_cost": 26284.697637920635,
+        "total_migration_cost": 47634160.091963254,
+        "avg_total_cost_ms": 22943.376980954534
+      },
+      "GAT-MARL": {
+        "total_migrations": 1085,
+        "total_violations": 6596,
+        "primary_entry_violations": 5602,
+        "max_entry_violations": 6596,
+        "proactive_decisions": 587,
+        "decision_count": 6189,
+        "total_reward": -17089.248471978033,
+        "avg_decision_time_ms": 0.8526453687777055,
+        "total_cost_ms_sum": 129506306.20880502,
+        "total_sla_penalty_ms": 105880000.0,
+        "total_tearing_penalty_ms": 301984.1249999987,
+        "total_future_penalty_ms": 269.8979401016163,
+        "total_access_latency": 13024.81817350206,
+        "total_communication_cost": 13471.404521302416,
+        "total_migration_cost": 23297555.96316766,
+        "dag_proactive_migration_stats": {
+          "IoT_Lightweight_DAG": {
+            "proactive_decisions": 57,
+            "migrated_nodes": 0
+          },
+          "Diamond_DAG_3": {
+            "proactive_decisions": 51,
+            "migrated_nodes": 66
+          },
+          "FanIn_Aggregator_1": {
+            "proactive_decisions": 8,
+            "migrated_nodes": 10
+          },
+          "Compute_Heavy_DAG": {
+            "proactive_decisions": 42,
+            "migrated_nodes": 17
+          },
+          "Diamond_DAG_1": {
+            "proactive_decisions": 69,
+            "migrated_nodes": 77
+          },
+          "FanOut_Broadcaster_3": {
+            "proactive_decisions": 185,
+            "migrated_nodes": 218
+          },
+          "FanIn_Aggregator_2": {
+            "proactive_decisions": 68,
+            "migrated_nodes": 76
+          },
+          "Data_Heavy_DAG": {
+            "proactive_decisions": 50,
+            "migrated_nodes": 42
+          },
+          "FanOut_Broadcaster_2": {
+            "proactive_decisions": 57,
+            "migrated_nodes": 0
+          }
+        },
+        "avg_agents_per_decision": 4.052674099208272,
+        "controlled_agents_per_decision": 3.112942317014057,
+        "pinned_agents_per_decision": 0.9397317821942155,
+        "avg_migrated_agents_per_decision": 0.1753110357085151,
+        "avg_controlled_migrated_agents_per_decision": 0.1753110357085151,
+        "controlled_migrations": 1085,
+        "all_agents_migrated_decisions": 0,
+        "all_agents_migrated_ratio": 0.0,
+        "controlled_all_agents_migrated_decisions": 27,
+        "controlled_all_agents_migrated_ratio": 0.004362578768783325,
+        "stay_action_ratio": 0.956741886611913,
+        "candidate_action_counts": {
+          "0": 23997,
+          "1": 1079,
+          "2": 6,
+          "3": 0
+        },
+        "joint_action_distribution": {
+          "0-0-0": 57,
+          "1-0-0": 56,
+          "1-0-0-1": 52,
+          "1-1-0-0-1": 2,
+          "0-1-1-0": 23,
+          "1-0-0-0": 289,
+          "0-0-1-1": 42,
+          "0-0-0-0": 5224,
+          "0-1-0-0": 55,
+          "1-1-1-1-0": 3,
+          "1-0-0-0-1": 17,
+          "0-0-0-0-1": 42,
+          "0-0-1-1-0-0": 10,
+          "0-0-1-0-0-0": 29,
+          "0-0-0-2-0-0": 1,
+          "0-0-0-0-0": 69,
+          "0-0-1-1-0": 18,
+          "0-1-0-0-0": 29,
+          "0-0-1-0-1": 8,
+          "0-1-0-1-0": 13,
+          "0-0-2-0": 2,
+          "0-0-1-0": 40,
+          "0-0-0-1-1": 21,
+          "1-1-0-0-0": 16,
+          "0-0-0-1-0-0": 35,
+          "0-1-1-0-0": 9,
+          "0-1-1-1-0": 1,
+          "0-0-0-0-0-0": 13,
+          "1-0-0-0-0": 2,
+          "0-0-1-0-0-1": 5,
+          "0-1-1-1-1": 3,
+          "2-0-0-0": 2,
+          "0-2-1-0": 1
+        },
+        "local_migration_cost_sum": 23297555.96316766,
+        "edge_split_cost_sum": 4149.754564061281,
+        "dense_distance_bonus_sum": 2127.4156574992858,
+        "entry_sla_bonus_sum": 174.0,
+        "proactive_logit_bias_count": 2610,
+        "proactive_best_bias_action_counts": {
+          "0": 1312,
+          "1": 798,
+          "2": 49,
+          "3": 28
+        },
+        "reactive_action_clipped_count": 15494,
+        "counterfactual_score_sum": 29476.163352372754,
+        "entry_node_migration_count": 949,
+        "sla_improving_action_count": 2722,
+        "cost_guard_blocked_count": 19359,
+        "non_entry_distance_only_blocked_count": 5708,
+        "cost_by_dag_complexity": {
+          "simple": {
+            "decision_count": 5648,
+            "total_cost_ms_sum": 116926714.56701796,
+            "migrations": 448,
+            "avg_total_cost_ms": 20702.321984245387
+          },
+          "medium": {
+            "decision_count": 541,
+            "total_cost_ms_sum": 12579591.641786607,
+            "migrations": 637,
+            "avg_total_cost_ms": 23252.47992936526
+          }
+        },
+        "cost_by_dag_type": {
+          "IoT_Lightweight_DAG": {
+            "decision_count": 113,
+            "total_cost_ms_sum": 785098.2747503011,
+            "migrations": 56,
+            "controlled_migrations": 56,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 6947.772342923019,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_3": {
+            "decision_count": 72,
+            "total_cost_ms_sum": 1985960.6968017335,
+            "migrations": 87,
+            "controlled_migrations": 87,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 27582.78745557963,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_1": {
+            "decision_count": 11,
+            "total_cost_ms_sum": 239003.08598773286,
+            "migrations": 16,
+            "controlled_migrations": 16,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 21727.55327161208,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_1": {
+            "decision_count": 123,
+            "total_cost_ms_sum": 1425442.9787897328,
+            "migrations": 145,
+            "controlled_migrations": 145,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 24,
+            "avg_total_cost_ms": 11588.967307233599,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.1951219512195122
+          },
+          "Compute_Heavy_DAG": {
+            "decision_count": 5277,
+            "total_cost_ms_sum": 110730689.5641459,
+            "migrations": 101,
+            "controlled_migrations": 101,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 20983.64403337993,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_2": {
+            "decision_count": 135,
+            "total_cost_ms_sum": 3727164.6283826046,
+            "migrations": 188,
+            "controlled_migrations": 188,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 27608.626876908183,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_3": {
+            "decision_count": 256,
+            "total_cost_ms_sum": 5398611.528478841,
+            "migrations": 289,
+            "controlled_migrations": 289,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 21088.326283120474,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Data_Heavy_DAG": {
+            "decision_count": 93,
+            "total_cost_ms_sum": 2681668.838745458,
+            "migrations": 95,
+            "controlled_migrations": 95,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 28835.1488037146,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_2": {
+            "decision_count": 107,
+            "total_cost_ms_sum": 2520351.413079351,
+            "migrations": 106,
+            "controlled_migrations": 106,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 3,
+            "avg_total_cost_ms": 23554.686103545337,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.028037383177570093
+          },
+          "Diamond_DAG_2": {
+            "decision_count": 2,
+            "total_cost_ms_sum": 12315.199641501502,
+            "migrations": 2,
+            "controlled_migrations": 2,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 6157.599820750751,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          }
+        },
+        "migrations_by_dag_type": {
+          "IoT_Lightweight_DAG": 56,
+          "Diamond_DAG_3": 87,
+          "FanIn_Aggregator_1": 16,
+          "Diamond_DAG_1": 145,
+          "Compute_Heavy_DAG": 101,
+          "FanIn_Aggregator_2": 188,
+          "FanOut_Broadcaster_3": 289,
+          "Data_Heavy_DAG": 95,
+          "FanOut_Broadcaster_2": 106,
+          "Diamond_DAG_2": 2
+        },
+        "controlled_migrations_by_dag_type": {
+          "IoT_Lightweight_DAG": 56,
+          "Diamond_DAG_3": 87,
+          "FanIn_Aggregator_1": 16,
+          "Diamond_DAG_1": 145,
+          "Compute_Heavy_DAG": 101,
+          "FanIn_Aggregator_2": 188,
+          "FanOut_Broadcaster_3": 289,
+          "Data_Heavy_DAG": 95,
+          "FanOut_Broadcaster_2": 106,
+          "Diamond_DAG_2": 2
+        },
+        "invalid_action_masked_count": 31428,
+        "action_mask_fallback_count": 0,
+        "lambda_migration": 0.05,
+        "lambda_split": 0.02,
+        "avg_total_cost_ms": 20925.239329262404
+      }
+    },
+    "reactive": {
+      "SA": {
+        "total_migrations": 1565,
+        "total_violations": 7112,
+        "proactive_decisions": 0,
+        "decision_count": 7112,
+        "total_reward": -16597.349490422115,
+        "avg_decision_time_ms": 4.384699029689791,
+        "total_cost_ms_sum": 138037210.42999887,
+        "total_sla_penalty_ms": 104140000.0,
+        "total_tearing_penalty_ms": 430639.08500003756,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 14881.620354639848,
+        "total_communication_cost": 14458.798155220424,
+        "total_migration_cost": 33437230.926489137,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 19409.05658464551
+      },
+      "Nearest": {
+        "total_migrations": 2337,
+        "total_violations": 5732,
+        "proactive_decisions": 0,
+        "decision_count": 5732,
+        "total_reward": -17440.28641838784,
+        "avg_decision_time_ms": 0.05204047381699824,
+        "total_cost_ms_sum": 272927294.11047834,
+        "total_sla_penalty_ms": 103880000.0,
+        "total_tearing_penalty_ms": 0.0,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 12086.983138868576,
+        "total_communication_cost": 0.0,
+        "total_migration_cost": 169035207.1273381,
+        "dag_proactive_migration_stats": {},
+        "avg_total_cost_ms": 47614.67098926698
+      },
+      "DQN": {
+        "total_migrations": 1744,
+        "total_violations": 9862,
+        "proactive_decisions": 0,
+        "decision_count": 9862,
+        "total_reward": -29431.95932623951,
+        "avg_decision_time_ms": 0.28640760447946306,
+        "total_cost_ms_sum": 213887897.3530957,
+        "total_sla_penalty_ms": 189060000.0,
+        "total_tearing_penalty_ms": 547041.0800000612,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 20644.114826949764,
+        "total_communication_cost": 20804.5629612147,
+        "total_migration_cost": 24239407.5953036,
+        "avg_total_cost_ms": 21688.085312623778
+      },
+      "GAT-MARL": {
+        "total_migrations": 988,
+        "total_violations": 5591,
+        "primary_entry_violations": 5771,
+        "max_entry_violations": 5591,
+        "proactive_decisions": 0,
+        "decision_count": 5771,
+        "total_reward": -16618.67204399319,
+        "avg_decision_time_ms": 0.7351876109492488,
+        "total_cost_ms_sum": 128813155.84406635,
+        "total_sla_penalty_ms": 105420000.0,
+        "total_tearing_penalty_ms": 411701.9850000304,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 12171.658672307613,
+        "total_communication_cost": 16114.39786618945,
+        "total_migration_cost": 22953167.802529603,
+        "dag_proactive_migration_stats": {},
+        "avg_agents_per_decision": 5.86154912493502,
+        "controlled_agents_per_decision": 3.9608386761393173,
+        "pinned_agents_per_decision": 1.9007104487957027,
+        "avg_migrated_agents_per_decision": 0.17120083174493156,
+        "avg_controlled_migrated_agents_per_decision": 0.17120083174493156,
+        "controlled_migrations": 988,
+        "all_agents_migrated_decisions": 0,
+        "all_agents_migrated_ratio": 0.0,
+        "controlled_all_agents_migrated_decisions": 170,
+        "controlled_all_agents_migrated_ratio": 0.02945763299254895,
+        "stay_action_ratio": 0.970792562154492,
+        "candidate_action_counts": {
+          "0": 32839,
+          "1": 988,
+          "2": 0,
+          "3": 0
+        },
+        "joint_action_distribution": {
+          "0-0-1-0-1": 1,
+          "0-1-0-1-0": 21,
+          "1-0-1-0-0": 25,
+          "0-0-1-1-0-0": 74,
+          "1-0-0-0-0": 51,
+          "0-1-1-1-1": 3,
+          "1-0-0-0": 89,
+          "0-1-1-0": 167,
+          "0-0-0-0-0-0": 5199,
+          "0-0-0-1-1": 64,
+          "1-0-0": 20,
+          "1-1-0-0-0": 27,
+          "0-1-1-0-0": 20,
+          "0-0-1-1": 3,
+          "1-1-1-0-0": 2,
+          "0-0-1-1-0": 3,
+          "0-0-0-0": 2
+        },
+        "local_migration_cost_sum": 22953167.802529603,
+        "edge_split_cost_sum": 1118.540053196001,
+        "dense_distance_bonus_sum": 0.0,
+        "entry_sla_bonus_sum": 165.0,
+        "proactive_logit_bias_count": 0,
+        "proactive_best_bias_action_counts": {
+          "0": 0,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "reactive_action_clipped_count": 20969,
+        "counterfactual_score_sum": -26028.45983927192,
+        "entry_node_migration_count": 988,
+        "sla_improving_action_count": 1076,
+        "cost_guard_blocked_count": 20913,
+        "non_entry_distance_only_blocked_count": 10502,
+        "cost_by_dag_complexity": {
+          "medium": {
+            "decision_count": 5720,
+            "total_cost_ms_sum": 127650331.01205948,
+            "migrations": 934,
+            "avg_total_cost_ms": 22316.491435674736
+          },
+          "simple": {
+            "decision_count": 51,
+            "total_cost_ms_sum": 1162824.8320068473,
+            "migrations": 54,
+            "avg_total_cost_ms": 22800.486902095043
+          }
+        },
+        "cost_by_dag_type": {
+          "FanOut_Broadcaster_2": {
+            "decision_count": 82,
+            "total_cost_ms_sum": 2787162.517383646,
+            "migrations": 170,
+            "controlled_migrations": 170,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 3,
+            "avg_total_cost_ms": 33989.786797361536,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.036585365853658534
+          },
+          "FanIn_Aggregator_3": {
+            "decision_count": 61,
+            "total_cost_ms_sum": 1518369.1223764312,
+            "migrations": 113,
+            "controlled_migrations": 113,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 24891.297088138217,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Data_Heavy_DAG": {
+            "decision_count": 5273,
+            "total_cost_ms_sum": 113824601.25178619,
+            "migrations": 148,
+            "controlled_migrations": 148,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 21586.30784217451,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_1": {
+            "decision_count": 40,
+            "total_cost_ms_sum": 460428.6088333235,
+            "migrations": 40,
+            "controlled_migrations": 40,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 11510.715220833088,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_2": {
+            "decision_count": 28,
+            "total_cost_ms_sum": 329497.60438476625,
+            "migrations": 28,
+            "controlled_migrations": 28,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 11767.771585170223,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_1": {
+            "decision_count": 169,
+            "total_cost_ms_sum": 7370026.1939695105,
+            "migrations": 334,
+            "controlled_migrations": 334,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 167,
+            "avg_total_cost_ms": 43609.62244952373,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.9881656804733728
+          },
+          "Diamond_DAG_3": {
+            "decision_count": 61,
+            "total_cost_ms_sum": 705766.7340307643,
+            "migrations": 61,
+            "controlled_migrations": 61,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 11569.946459520726,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "IoT_Lightweight_DAG": {
+            "decision_count": 20,
+            "total_cost_ms_sum": 287815.801778204,
+            "migrations": 20,
+            "controlled_migrations": 20,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 14390.790088910198,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanIn_Aggregator_2": {
+            "decision_count": 34,
+            "total_cost_ms_sum": 983976.583680418,
+            "migrations": 68,
+            "controlled_migrations": 68,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 28940.48775530641,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Compute_Heavy_DAG": {
+            "decision_count": 3,
+            "total_cost_ms_sum": 545511.4258438773,
+            "migrations": 6,
+            "controlled_migrations": 6,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 181837.14194795908,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          }
+        },
+        "migrations_by_dag_type": {
+          "FanOut_Broadcaster_2": 170,
+          "FanIn_Aggregator_3": 113,
+          "Data_Heavy_DAG": 148,
+          "FanOut_Broadcaster_1": 40,
+          "Diamond_DAG_2": 28,
+          "Diamond_DAG_1": 334,
+          "Diamond_DAG_3": 61,
+          "IoT_Lightweight_DAG": 20,
+          "FanIn_Aggregator_2": 68,
+          "Compute_Heavy_DAG": 6
+        },
+        "controlled_migrations_by_dag_type": {
+          "FanOut_Broadcaster_2": 170,
+          "FanIn_Aggregator_3": 113,
+          "Data_Heavy_DAG": 148,
+          "FanOut_Broadcaster_1": 40,
+          "Diamond_DAG_2": 28,
+          "Diamond_DAG_1": 334,
+          "Diamond_DAG_3": 61,
+          "IoT_Lightweight_DAG": 20,
+          "FanIn_Aggregator_2": 68,
+          "Compute_Heavy_DAG": 6
+        },
+        "invalid_action_masked_count": 43372,
+        "action_mask_fallback_count": 0,
+        "lambda_migration": 0.3,
+        "lambda_split": 0.1,
+        "avg_total_cost_ms": 22320.7686439207
+      }
+    }
+  },
+  "elapsed_seconds_so_far": 9528.9544942379,
+  "completed_at": "2026-05-19T22:39:57.085972",
+  "elapsed_seconds": 9528.957185983658
+}

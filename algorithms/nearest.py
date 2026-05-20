@@ -8,7 +8,12 @@ import pandas as pd
 from tqdm import tqdm
 
 from core.context import TRIGGER_PROACTIVE, check_sla_violation, get_trigger_type
-from core.dag_utils import assign_dag_type, get_entry_nodes, initialize_dag_assignment, topological_sort
+from core.dag_utils import (
+    assign_dag_type,
+    get_deployable_nodes,
+    get_service_entry_nodes,
+    initialize_dag_assignment,
+)
 from core.geo import find_k_nearest_servers, haversine_distance
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.reward import build_servers_info, calculate_microservice_reward, estimate_dag_migration_time_s
@@ -16,6 +21,21 @@ from prediction.simple_predictor import build_predict_future_time_kwargs, touch_
 
 
 FORECAST_HORIZON = 15
+
+
+def _entry_violation_counts(entry_nodes, assignments, user_lat, user_lon, servers_info):
+    if not entry_nodes:
+        return 0, 0
+    primary_server = assignments[entry_nodes[0]]
+    primary_lat, primary_lon = servers_info[primary_server]
+    primary = int(check_sla_violation(user_lat, user_lon, primary_lat, primary_lon))
+    max_entry = 0
+    for node in entry_nodes:
+        srv_lat, srv_lon = servers_info[assignments[node]]
+        if check_sla_violation(user_lat, user_lon, srv_lat, srv_lon):
+            max_entry = 1
+            break
+    return primary, max_entry
 
 
 def run_nearest_microservice_fair(
@@ -34,6 +54,8 @@ def run_nearest_microservice_fair(
 
     total_migrations = 0
     total_violations = 0
+    primary_entry_violations = 0
+    max_entry_violations = 0
     proactive_decisions = 0
     decision_count = 0
     total_reward_sum = 0.0
@@ -75,7 +97,7 @@ def run_nearest_microservice_fair(
 
             dag_type = taxi_dag_type[taxi_id]
             dag_info = MICROSERVICE_DAGS[dag_type]
-            entry_nodes = get_entry_nodes(dag_info)
+            entry_nodes = get_service_entry_nodes(dag_info)
             if not entry_nodes:
                 touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
                 continue
@@ -84,8 +106,12 @@ def run_nearest_microservice_fair(
             gw_lat, gw_lon = servers_info[gateway_server]
             gateway_dist = haversine_distance(current_lat, current_lon, gw_lat, gw_lon)
 
-            if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
-                total_violations += 1
+            primary_v, max_v = _entry_violation_counts(
+                entry_nodes, taxi_dag_assignments[taxi_id], current_lat, current_lon, servers_info
+            )
+            primary_entry_violations += primary_v
+            max_entry_violations += max_v
+            total_violations += max_v
 
             predicted_locations = None
             if use_proactive:
@@ -115,7 +141,7 @@ def run_nearest_microservice_fair(
                 proactive_decisions += 1
 
             old_assignments = copy.copy(taxi_dag_assignments[taxi_id])
-            sorted_nodes = topological_sort(dag_info)
+            sorted_nodes = get_deployable_nodes(dag_info)
             t0 = time.perf_counter()
             nearest_server = find_k_nearest_servers(current_lat, current_lon, servers_df, k=1)[0][0]
             for node in sorted_nodes:
@@ -159,6 +185,8 @@ def run_nearest_microservice_fair(
     return {
         "total_migrations": total_migrations,
         "total_violations": total_violations,
+        "primary_entry_violations": primary_entry_violations,
+        "max_entry_violations": max_entry_violations,
         "proactive_decisions": proactive_decisions,
         "decision_count": decision_count,
         "total_reward": total_reward_sum,

@@ -16,11 +16,31 @@ from tqdm import tqdm
 from core.microservice_dags import MICROSERVICE_DAGS
 from core.geo import haversine_distance, find_k_nearest_servers
 from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE, check_sla_violation
-from core.dag_utils import get_entry_nodes, assign_dag_type, initialize_dag_assignment, topological_sort
+from core.dag_utils import (
+    assign_dag_type,
+    get_deployable_nodes,
+    get_service_entry_nodes,
+    initialize_dag_assignment,
+)
 from core.reward import build_servers_info, calculate_microservice_reward, estimate_dag_migration_time_s
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
 FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
+
+
+def _entry_violation_counts(entry_nodes, assignments, user_lat, user_lon, servers_info):
+    if not entry_nodes:
+        return 0, 0
+    primary_server = assignments[entry_nodes[0]]
+    primary_lat, primary_lon = servers_info[primary_server]
+    primary = int(check_sla_violation(user_lat, user_lon, primary_lat, primary_lon))
+    max_entry = 0
+    for node in entry_nodes:
+        srv_lat, srv_lon = servers_info[assignments[node]]
+        if check_sla_violation(user_lat, user_lon, srv_lat, srv_lon):
+            max_entry = 1
+            break
+    return primary, max_entry
 
 
 class MicroserviceSAReturn(tuple):
@@ -166,6 +186,8 @@ def run_sa_microservice_fair(
     taxi_dag_assignments = {}
     total_migrations = 0
     total_violations = 0
+    primary_entry_violations = 0
+    max_entry_violations = 0
     proactive_decisions = 0
     total_reward_sum = 0.0
     reward_history = []
@@ -220,7 +242,10 @@ def run_sa_microservice_fair(
 
             dag_type = taxi_dag_type[taxi_id]
             dag_info = MICROSERVICE_DAGS[dag_type]
-            entry_nodes = get_entry_nodes(dag_info)
+            entry_nodes = get_service_entry_nodes(dag_info)
+            if not entry_nodes:
+                touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
+                continue
             gateway_node = entry_nodes[0]
 
             gateway_server_id = taxi_dag_assignments[taxi_id][gateway_node]
@@ -229,9 +254,13 @@ def run_sa_microservice_fair(
                 current_lat, current_lon, gw_lat, gw_lon
             )
 
-            # --- SCORING: Real violation count (independent of trigger) ---
-            if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
-                total_violations += 1
+            # --- SCORING: max-entry SLA count, with primary-entry retained for diagnostics ---
+            primary_v, max_v = _entry_violation_counts(
+                entry_nodes, taxi_dag_assignments[taxi_id], current_lat, current_lon, servers_info
+            )
+            primary_entry_violations += primary_v
+            max_entry_violations += max_v
+            total_violations += max_v
 
             # --- Trajectory prediction ---
             predicted_locations = None
@@ -303,8 +332,8 @@ def run_sa_microservice_fair(
             total_tearing_penalty_ms += details.get('tearing_penalty_ms', details.get('tearing_penalty', 0.0))
             total_future_penalty_ms += details.get('future_penalty_ms', details.get('future_penalty', 0.0))
 
-            # 与 Hybrid SAC 同口径：拓扑序节点集合上比对迁移数
-            sorted_nodes = topological_sort(dag_info)
+            # 统一口径：只统计可部署微服务节点迁移数。
+            sorted_nodes = get_deployable_nodes(dag_info)
             nodes_migrated = sum(
                 1 for n in sorted_nodes
                 if old_assignments[n] != best_assignments[n]
@@ -328,6 +357,8 @@ def run_sa_microservice_fair(
     return {
         'total_migrations': total_migrations,
         'total_violations': total_violations,
+        'primary_entry_violations': primary_entry_violations,
+        'max_entry_violations': max_entry_violations,
         'proactive_decisions': proactive_decisions,
         'decision_count': decision_count,
         'total_reward': total_reward_sum,

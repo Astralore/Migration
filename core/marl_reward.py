@@ -211,6 +211,67 @@ def _dense_distance_bonuses(
     return bonuses
 
 
+def _entry_sla_bonuses(
+    dag_info,
+    current_assignments,
+    previous_assignments,
+    user_location,
+    servers_info,
+    *,
+    max_bonus=3.0,
+):
+    """Reward-scale bonus for actions that improve the entry-node SLA bottleneck."""
+    bonuses = {node: 0.0 for node in dag_info["nodes"]}
+    entry_nodes = get_service_entry_nodes(dag_info)
+    if not entry_nodes:
+        return bonuses
+
+    user_lat, user_lon = user_location
+    prev_dists = {
+        node: float(haversine_distance(
+            user_lat,
+            user_lon,
+            servers_info[previous_assignments[node]][0],
+            servers_info[previous_assignments[node]][1],
+        ))
+        for node in entry_nodes
+    }
+    curr_dists = {
+        node: float(haversine_distance(
+            user_lat,
+            user_lon,
+            servers_info[current_assignments[node]][0],
+            servers_info[current_assignments[node]][1],
+        ))
+        for node in entry_nodes
+    }
+    prev_max = max(prev_dists.values()) if prev_dists else 0.0
+    curr_max = max(curr_dists.values()) if curr_dists else 0.0
+    if curr_max >= prev_max:
+        return bonuses
+
+    prev_excess = max(0.0, prev_max - SLA_DISTANCE_THRESHOLD)
+    curr_excess = max(0.0, curr_max - SLA_DISTANCE_THRESHOLD)
+    improvement_ratio = max(0.0, prev_excess - curr_excess) / max(SLA_DISTANCE_THRESHOLD, 1e-6)
+    if prev_max > SLA_DISTANCE_THRESHOLD and curr_max <= SLA_DISTANCE_THRESHOLD:
+        improvement_ratio += 1.0
+    bonus_value = min(max_bonus, max_bonus * improvement_ratio)
+    if bonus_value <= 0.0:
+        return bonuses
+
+    improved_entries = [
+        node for node in entry_nodes
+        if current_assignments[node] != previous_assignments[node]
+        and curr_dists[node] < prev_dists[node]
+    ]
+    if not improved_entries:
+        return bonuses
+    share = bonus_value / float(len(improved_entries))
+    for node in improved_entries:
+        bonuses[node] = float(share)
+    return bonuses
+
+
 def calculate_marl_rewards(
     taxi_id,
     dag_info,
@@ -271,6 +332,13 @@ def calculate_marl_rewards(
         )
         if dense_distance_bonus else {node: 0.0 for node in dag_info["nodes"]}
     )
+    entry_sla_bonuses = _entry_sla_bonuses(
+        dag_info,
+        current_assignments,
+        previous_assignments,
+        user_location,
+        servers_info,
+    )
 
     agent_rewards = {}
     for node in dag_info["nodes"]:
@@ -281,7 +349,12 @@ def calculate_marl_rewards(
             lambda_migration * (migration_costs[node] / local_cost_scale_ms)
             + lambda_split * (split_costs[node] / local_cost_scale_ms)
         )
-        agent_rewards[node] = float(shared_reward + distance_bonuses[node] - local_penalty)
+        agent_rewards[node] = float(
+            shared_reward
+            + distance_bonuses[node]
+            + entry_sla_bonuses[node]
+            - local_penalty
+        )
 
     details = dict(details)
     details.update(
@@ -291,9 +364,11 @@ def calculate_marl_rewards(
             "local_migration_costs": migration_costs,
             "local_edge_split_costs": split_costs,
             "dense_distance_bonuses": distance_bonuses,
+            "entry_sla_bonuses": entry_sla_bonuses,
             "local_migration_cost_sum": float(np.sum(list(migration_costs.values()))),
             "edge_split_cost_sum": float(np.sum(list(split_costs.values()))),
             "dense_distance_bonus_sum": float(np.sum(list(distance_bonuses.values()))),
+            "entry_sla_bonus_sum": float(np.sum(list(entry_sla_bonuses.values()))),
             "lambda_migration": float(lambda_migration),
             "lambda_split": float(lambda_split),
             "training_reward": float(np.mean(list(agent_rewards.values()))) if agent_rewards else float(shared_reward),

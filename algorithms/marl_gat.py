@@ -23,11 +23,13 @@ from tqdm import tqdm
 from core.context import (
     DISTANCE_THRESHOLD_KM,
     TRIGGER_PROACTIVE,
+    TRIGGER_REACTIVE,
     get_trigger_type,
     check_sla_violation,
 )
 from core.dag_utils import (
     assign_dag_type,
+    get_deployable_nodes,
     get_service_entry_nodes,
     initialize_dag_assignment,
     is_external_node,
@@ -41,12 +43,31 @@ from core.marl_state_builder import (
     build_marl_graph_state,
 )
 from core.microservice_dags import MICROSERVICE_DAGS
-from core.reward import build_servers_info, estimate_dag_migration_time_s
+from core.reward import (
+    BASE_MIGRATION_OVERHEAD_MS,
+    EDGE_BACKHAUL_MBPS,
+    MAX_BW_MBPS,
+    MAX_TEARING_MB,
+    MB_TO_MBIT,
+    MIN_BW_MBPS,
+    REACTIVE_MIGRATION_MULT,
+    RPC_SIZE_MB,
+    SLA_PENALTY_MS,
+    build_servers_info,
+    estimate_dag_migration_time_s,
+)
+from core.physics_utils import BASE_ROUTER_DELAY_MS, FIBER_SPEED_KM_MS
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
 
 FORECAST_HORIZON = 15
 MAX_NODES = 12
+CF_SLA_WEIGHT = 0.003
+CF_FUTURE_WEIGHT = 0.0015
+CF_TOPOLOGY_WEIGHT = 0.001
+CF_COST_SCALE_MS = 1000.0
+CF_SCORE_EPS = 1e-6
+CF_SLA_ENTRY_SCORE_FLOOR = -0.2
 
 
 class GraphEncoder(nn.Module):
@@ -249,6 +270,257 @@ def _server_distance_to_user(server_id, user_lat, user_lon, servers_info):
     return float(haversine_distance(user_lat, user_lon, srv_lat, srv_lon))
 
 
+def _edge_split_delta_ms(src, dst, traffic, assignments, node, target_server,
+                         servers_info, max_traffic):
+    src_server = target_server if src == node else assignments[src]
+    dst_server = target_server if dst == node else assignments[dst]
+    old_same = assignments[src] == assignments[dst]
+    new_same = src_server == dst_server
+    if old_same == new_same:
+        return 0.0
+
+    def split_cost(server_a, server_b):
+        if server_a == server_b:
+            return 0.0
+        lat_a, lon_a = servers_info[server_a]
+        lat_b, lon_b = servers_info[server_b]
+        dist_km = float(haversine_distance(lat_a, lon_a, lat_b, lon_b))
+        norm_traffic = float(traffic) / max(float(max_traffic), 1e-6)
+        cross_mb = min(float(traffic) * RPC_SIZE_MB, MAX_TEARING_MB)
+        tearing_ms = (cross_mb / EDGE_BACKHAUL_MBPS) * 1000.0
+        comm_ms = norm_traffic * ((max(0.0, dist_km) / FIBER_SPEED_KM_MS) + BASE_ROUTER_DELAY_MS)
+        return float(tearing_ms + comm_ms)
+
+    old_cost = split_cost(assignments[src], assignments[dst])
+    new_cost = split_cost(src_server, dst_server)
+    return float(new_cost - old_cost)
+
+
+def _build_counterfactual_context(
+    dag_info,
+    assignments,
+    candidates,
+    user_lat,
+    user_lon,
+    servers_info,
+    predicted_locations=None,
+    trigger_type=TRIGGER_PROACTIVE,
+):
+    deployable = set(get_deployable_nodes(dag_info))
+    entry_nodes = [node for node in get_service_entry_nodes(dag_info) if node in deployable]
+    entry_distances = {
+        node: _server_distance_to_user(assignments[node], user_lat, user_lon, servers_info)
+        for node in entry_nodes
+    }
+    current_max_entry_dist = max(entry_distances.values()) if entry_distances else 0.0
+    bottleneck_entries = {
+        node for node, dist in entry_distances.items()
+        if dist >= current_max_entry_dist - 1e-6
+    }
+    violating_entries = {
+        node for node, dist in entry_distances.items()
+        if dist > DISTANCE_THRESHOLD_KM
+    }
+    risk_ratio = (
+        min(current_max_entry_dist / DISTANCE_THRESHOLD_KM, 1.0)
+        if DISTANCE_THRESHOLD_KM > 0 else 0.0
+    )
+    bandwidth = MIN_BW_MBPS + (MAX_BW_MBPS - MIN_BW_MBPS) * (risk_ratio ** 2)
+    max_traffic = max(dag_info["edges"].values()) if dag_info["edges"] else 0.0
+
+    incident_edges = defaultdict(list)
+    for (src, dst), traffic in dag_info["edges"].items():
+        incident_edges[src].append((src, dst, traffic))
+        incident_edges[dst].append((src, dst, traffic))
+
+    candidate_distances = {}
+    for action in range(MARL_ACTION_DIM):
+        if action == 0:
+            continue
+        cand_idx = action - 1
+        if 0 <= cand_idx < len(candidates or []):
+            server_id = candidates[cand_idx][0]
+            candidate_distances[action] = _server_distance_to_user(
+                server_id, user_lat, user_lon, servers_info
+            )
+
+    migration_costs = {}
+    migration_mult = REACTIVE_MIGRATION_MULT if trigger_type != TRIGGER_PROACTIVE else 1.0
+    for node in deployable:
+        props = dag_info["nodes"][node]
+        mb = float(props["image_mb"]) + float(props["state_mb"])
+        migration_costs[node] = (
+            ((mb * MB_TO_MBIT / max(bandwidth, 1e-6)) * 1000.0)
+            + BASE_MIGRATION_OVERHEAD_MS
+        ) * migration_mult
+
+    pred_arr = None
+    current_future_max = 0.0
+    if predicted_locations:
+        pred_arr = np.asarray(predicted_locations, dtype=np.float64)
+        if pred_arr.ndim != 2 or pred_arr.shape[1] != 2:
+            pred_arr = np.reshape(pred_arr, (-1, 2))
+        if pred_arr.size > 0 and entry_nodes:
+            future_max = []
+            for lat, lon in pred_arr:
+                dists = [
+                    _server_distance_to_user(assignments[node], float(lat), float(lon), servers_info)
+                    for node in entry_nodes
+                ]
+                future_max.append(max(dists) if dists else 0.0)
+            current_future_max = float(np.mean(np.maximum(0.0, np.asarray(future_max) - DISTANCE_THRESHOLD_KM)))
+
+    return {
+        "deployable": deployable,
+        "entry_nodes": set(entry_nodes),
+        "primary_entry": entry_nodes[0] if entry_nodes else None,
+        "entry_distances": entry_distances,
+        "current_max_entry_dist": current_max_entry_dist,
+        "bottleneck_entries": bottleneck_entries,
+        "violating_entries": violating_entries,
+        "bandwidth": bandwidth,
+        "max_traffic": max_traffic,
+        "incident_edges": incident_edges,
+        "candidate_distances": candidate_distances,
+        "migration_costs": migration_costs,
+        "split_delta_cache": {},
+        "future_gain_cache": {},
+        "predicted_locations": pred_arr,
+        "current_future_max": current_future_max,
+        "trigger_type": trigger_type,
+        "user_lat": user_lat,
+        "user_lon": user_lon,
+    }
+
+
+def _score_counterfactual_action(
+    dag_info,
+    node,
+    action,
+    assignments,
+    candidates,
+    servers_info,
+    cf_ctx,
+    lambda_migration,
+    lambda_split,
+):
+    if is_external_node(node) or int(action) == 0:
+        return None
+    current_server = assignments[node]
+    target_server = action_to_server(action, candidates, current_server)
+    if target_server == current_server:
+        return None
+
+    migration_cost_ms = cf_ctx["migration_costs"].get(node, 0.0)
+
+    split_key = (node, int(action))
+    if split_key in cf_ctx["split_delta_cache"]:
+        split_delta_ms = cf_ctx["split_delta_cache"][split_key]
+    else:
+        split_delta_ms = 0.0
+        for src, dst, traffic in cf_ctx["incident_edges"].get(node, []):
+            split_delta_ms += _edge_split_delta_ms(
+                src, dst, traffic, assignments, node, target_server,
+                servers_info, cf_ctx["max_traffic"],
+            )
+        cf_ctx["split_delta_cache"][split_key] = split_delta_ms
+    split_cost_ms = max(0.0, split_delta_ms)
+    topology_gain_ms = max(0.0, -split_delta_ms)
+
+    sla_gain_ms = 0.0
+    future_gain_ms = 0.0
+    non_entry_distance_only = False
+    if node in cf_ctx["entry_nodes"] and (
+        node in cf_ctx["violating_entries"]
+        or node in cf_ctx["bottleneck_entries"]
+        or node == cf_ctx["primary_entry"]
+    ):
+        target_dist = cf_ctx["candidate_distances"].get(int(action))
+        if target_dist is not None:
+            other_entry_max = max(
+                [
+                    dist for entry, dist in cf_ctx["entry_distances"].items()
+                    if entry != node
+                ] or [0.0]
+            )
+            new_max = max(other_entry_max, target_dist)
+            old_max = cf_ctx["current_max_entry_dist"]
+            old_excess = max(0.0, old_max - DISTANCE_THRESHOLD_KM)
+            new_excess = max(0.0, new_max - DISTANCE_THRESHOLD_KM)
+            sla_gain_ms = max(0.0, old_excess - new_excess) / max(DISTANCE_THRESHOLD_KM, 1e-6) * SLA_PENALTY_MS
+            sla_gain_ms += (
+                max(0.0, old_max - new_max)
+                / max(DISTANCE_THRESHOLD_KM, 1e-6)
+                * SLA_PENALTY_MS
+                * 0.25
+            )
+            primary_old = cf_ctx["entry_distances"].get(node, 0.0)
+            primary_excess_old = max(0.0, primary_old - DISTANCE_THRESHOLD_KM)
+            primary_excess_new = max(0.0, target_dist - DISTANCE_THRESHOLD_KM)
+            sla_gain_ms += (
+                max(0.0, primary_excess_old - primary_excess_new)
+                / max(DISTANCE_THRESHOLD_KM, 1e-6)
+                * SLA_PENALTY_MS
+                * 0.5
+            )
+            sla_gain_ms += (
+                max(0.0, primary_old - target_dist)
+                / max(DISTANCE_THRESHOLD_KM, 1e-6)
+                * SLA_PENALTY_MS
+                * 0.1
+            )
+            if old_max > DISTANCE_THRESHOLD_KM and new_max <= DISTANCE_THRESHOLD_KM:
+                sla_gain_ms += SLA_PENALTY_MS
+
+            pred_arr = cf_ctx["predicted_locations"]
+            if pred_arr is not None and pred_arr.size > 0 and cf_ctx["entry_nodes"]:
+                future_key = (node, int(action))
+                if future_key in cf_ctx["future_gain_cache"]:
+                    future_gain_ms = cf_ctx["future_gain_cache"][future_key]
+                else:
+                    future_excess = []
+                    for lat, lon in pred_arr:
+                        dists = []
+                        for entry in cf_ctx["entry_nodes"]:
+                            server_id = target_server if entry == node else assignments[entry]
+                            dists.append(_server_distance_to_user(server_id, float(lat), float(lon), servers_info))
+                        future_excess.append(max(dists) - DISTANCE_THRESHOLD_KM if dists else 0.0)
+                    new_future = float(np.mean(np.maximum(0.0, np.asarray(future_excess))))
+                    future_gain_ms = (
+                        max(0.0, cf_ctx["current_future_max"] - new_future)
+                        / max(DISTANCE_THRESHOLD_KM, 1e-6)
+                        * SLA_PENALTY_MS
+                    )
+                    cf_ctx["future_gain_cache"][future_key] = future_gain_ms
+    else:
+        target_dist = cf_ctx["candidate_distances"].get(int(action))
+        current_dist = _server_distance_to_user(
+            current_server,
+            cf_ctx["user_lat"],
+            cf_ctx["user_lon"],
+            servers_info,
+        )
+        if target_dist is not None and target_dist < current_dist:
+            non_entry_distance_only = True
+
+    score = (
+        sla_gain_ms * CF_SLA_WEIGHT
+        + future_gain_ms * CF_FUTURE_WEIGHT
+        + topology_gain_ms * CF_TOPOLOGY_WEIGHT
+        - (migration_cost_ms / CF_COST_SCALE_MS) * float(lambda_migration)
+        - (split_cost_ms / CF_COST_SCALE_MS) * float(lambda_split)
+    )
+    return {
+        "score": float(score),
+        "sla_gain_ms": float(sla_gain_ms),
+        "future_gain_ms": float(future_gain_ms),
+        "topology_gain_ms": float(topology_gain_ms),
+        "migration_cost_ms": float(migration_cost_ms),
+        "split_cost_ms": float(split_cost_ms),
+        "non_entry_distance_only": bool(non_entry_distance_only),
+    }
+
+
 def _apply_proactive_distance_bias(
     masked_logits,
     sorted_nodes,
@@ -259,40 +531,77 @@ def _apply_proactive_distance_bias(
     user_lat,
     user_lon,
     servers_info,
+    dag_info,
+    predicted_locations,
+    lambda_migration,
+    lambda_split,
     *,
-    bias_scale=3.0,
-    max_bias=2.5,
+    bias_scale=0.8,
+    max_bias=1.0,
 ):
-    """Add a small logit prior for candidate actions that move closer to the user."""
+    """Add a light logit prior for actions with positive counterfactual value."""
     biased_logits = masked_logits.clone()
     positive_bias_count = 0
     best_action_counts = defaultdict(int)
+    score_sum = 0.0
+    sla_improving_count = 0
+    cost_guard_blocked_count = 0
+    non_entry_distance_only_blocked_count = 0
+    cf_ctx = _build_counterfactual_context(
+        dag_info,
+        assignments,
+        candidates,
+        user_lat,
+        user_lon,
+        servers_info,
+        predicted_locations=predicted_locations,
+        trigger_type=TRIGGER_PROACTIVE,
+    )
 
     for node in sorted_nodes:
         if is_external_node(node):
             continue
         node_idx = node_to_idx[node]
-        current_server = assignments[node]
-        current_dist = _server_distance_to_user(current_server, user_lat, user_lon, servers_info)
         best_action = 0
-        best_improvement = 0.0
+        best_score = -float("inf")
         for action in range(1, MARL_ACTION_DIM):
             if not bool(action_masks[node_idx, action].item()):
                 continue
-            target_server = action_to_server(action, candidates, current_server)
-            target_dist = _server_distance_to_user(target_server, user_lat, user_lon, servers_info)
-            improvement = max(0.0, current_dist - target_dist)
-            if improvement <= 1e-6:
+            scored = _score_counterfactual_action(
+                dag_info,
+                node,
+                action,
+                assignments,
+                candidates,
+                servers_info,
+                cf_ctx,
+                lambda_migration,
+                lambda_split,
+            )
+            if scored is None:
                 continue
-            bias = min(max_bias, bias_scale * improvement / max(DISTANCE_THRESHOLD_KM, 1e-6))
+            score_sum += scored["score"]
+            if scored["sla_gain_ms"] > 0.0:
+                sla_improving_count += 1
+            if scored["non_entry_distance_only"] and scored["score"] <= CF_SCORE_EPS:
+                non_entry_distance_only_blocked_count += 1
+            if scored["score"] <= CF_SCORE_EPS:
+                cost_guard_blocked_count += 1
+                continue
+            bias = min(max_bias, bias_scale * scored["score"])
             biased_logits[node_idx, action] = biased_logits[node_idx, action] + float(bias)
             positive_bias_count += 1
-            if improvement > best_improvement:
-                best_improvement = improvement
+            if scored["score"] > best_score:
+                best_score = scored["score"]
                 best_action = action
         best_action_counts[str(best_action)] += 1
 
-    return biased_logits, positive_bias_count, dict(best_action_counts)
+    return biased_logits, positive_bias_count, dict(best_action_counts), {
+        "counterfactual_score_sum": float(score_sum),
+        "sla_improving_action_count": int(sla_improving_count),
+        "cost_guard_blocked_count": int(cost_guard_blocked_count),
+        "non_entry_distance_only_blocked_count": int(non_entry_distance_only_blocked_count),
+    }
 
 
 def _clip_reactive_actions(
@@ -303,32 +612,148 @@ def _clip_reactive_actions(
     user_lat,
     user_lon,
     servers_info,
+    dag_info,
+    lambda_migration,
+    lambda_split,
+    node_to_idx=None,
+    action_masks=None,
     *,
-    max_migrations=2,
+    max_migrations=None,
 ):
-    """Keep only the top-k reactive migrations by immediate distance improvement."""
+    """Keep only reactive migrations with positive counterfactual value."""
+    controlled_count = sum(1 for node in sorted_nodes if not is_external_node(node))
+    cf_ctx = _build_counterfactual_context(
+        dag_info,
+        assignments,
+        candidates,
+        user_lat,
+        user_lon,
+        servers_info,
+        predicted_locations=None,
+        trigger_type=TRIGGER_REACTIVE,
+    )
+    if max_migrations is None:
+        max_migrations = min(
+            controlled_count,
+            max(2, int(controlled_count * 0.4), len(cf_ctx["violating_entries"])),
+        )
+    sorted_node_to_action_idx = {node: idx for idx, node in enumerate(sorted_nodes)}
     scored = []
+    score_sum = 0.0
+    sla_improving_count = 0
+    cost_guard_blocked_count = 0
+    non_entry_distance_only_blocked_count = 0
     for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
         if is_external_node(node) or int(action) == 0:
             continue
-        current_server = assignments[node]
-        target_server = action_to_server(action, candidates, current_server)
-        current_dist = _server_distance_to_user(current_server, user_lat, user_lon, servers_info)
-        target_dist = _server_distance_to_user(target_server, user_lat, user_lon, servers_info)
-        improvement = current_dist - target_dist
-        if improvement > 1e-6:
-            scored.append((improvement, idx))
+        item = _score_counterfactual_action(
+            dag_info,
+            node,
+            action,
+            assignments,
+            candidates,
+            servers_info,
+            cf_ctx,
+            lambda_migration,
+            lambda_split,
+        )
+        if item is None:
+            continue
+        score_sum += item["score"]
+        if item["sla_gain_ms"] > 0.0:
+            sla_improving_count += 1
+        if item["non_entry_distance_only"] and item["score"] <= CF_SCORE_EPS:
+            non_entry_distance_only_blocked_count += 1
+        is_sla_entry_action = item["sla_gain_ms"] > 0.0
+        if item["score"] > CF_SCORE_EPS or (
+            is_sla_entry_action and item["score"] > CF_SLA_ENTRY_SCORE_FLOOR
+        ):
+            scored.append((item["score"], idx))
+        else:
+            cost_guard_blocked_count += 1
 
-    keep = {idx for _, idx in sorted(scored, reverse=True)[:max_migrations]}
+    selected = {
+        idx: (float(score), int(actions[idx]))
+        for score, idx in sorted(scored, reverse=True)[:max_migrations]
+    }
+
+    if action_masks is not None and node_to_idx is not None:
+        entry_candidates = []
+        forced_entry_indices = set()
+        fallback_entries = set(cf_ctx["violating_entries"])
+        fallback_entries.update(cf_ctx["bottleneck_entries"])
+        if cf_ctx["primary_entry"] is not None:
+            fallback_entries.add(cf_ctx["primary_entry"])
+        for node in sorted(
+            fallback_entries,
+            key=lambda n: cf_ctx["entry_distances"].get(n, 0.0),
+            reverse=True,
+        ):
+            if node not in node_to_idx or node not in sorted_node_to_action_idx:
+                continue
+            node_idx = node_to_idx[node]
+            action_idx = sorted_node_to_action_idx[node]
+            best_entry = None
+            for action in range(1, MARL_ACTION_DIM):
+                if not bool(action_masks[node_idx, action].item()):
+                    continue
+                item = _score_counterfactual_action(
+                    dag_info,
+                    node,
+                    action,
+                    assignments,
+                    candidates,
+                    servers_info,
+                    cf_ctx,
+                    lambda_migration,
+                    lambda_split,
+                )
+                if item is None or item["sla_gain_ms"] <= 0.0:
+                    continue
+                if best_entry is None or item["score"] > best_entry[0]:
+                    best_entry = (item["score"], action_idx, action)
+            if best_entry is not None and best_entry[0] > CF_SLA_ENTRY_SCORE_FLOOR:
+                entry_candidates.append(best_entry)
+
+        for score, action_idx, action in sorted(entry_candidates, reverse=True):
+            selected[action_idx] = (float(score), int(action))
+            if sorted_nodes[action_idx] in cf_ctx["violating_entries"]:
+                forced_entry_indices.add(action_idx)
+    else:
+        forced_entry_indices = set()
+
+    if len(selected) > max_migrations:
+        forced = [
+            (idx, selected[idx])
+            for idx in forced_entry_indices
+            if idx in selected
+        ]
+        forced = sorted(forced, key=lambda kv: kv[1][0], reverse=True)[:max_migrations]
+        remaining_slots = max_migrations - len(forced)
+        forced_ids = {idx for idx, _ in forced}
+        optional = [
+            (idx, value)
+            for idx, value in selected.items()
+            if idx not in forced_ids
+        ]
+        optional = sorted(optional, key=lambda kv: kv[1][0], reverse=True)[:remaining_slots]
+        selected = dict(forced + optional)
+
     clipped = 0
-    clipped_actions = list(actions)
+    clipped_actions = [0 for _ in actions]
+    for idx, (score, action) in selected.items():
+        clipped_actions[idx] = int(action)
     for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
         if is_external_node(node) or int(action) == 0:
             continue
-        if idx not in keep:
-            clipped_actions[idx] = 0
+        if idx not in selected:
             clipped += 1
-    return clipped_actions, clipped
+    return clipped_actions, clipped, {
+        "counterfactual_score_sum": float(score_sum),
+        "sla_improving_action_count": int(sla_improving_count),
+        "cost_guard_blocked_count": int(cost_guard_blocked_count),
+        "non_entry_distance_only_blocked_count": int(non_entry_distance_only_blocked_count),
+    }
 
 
 def run_marl_gat_microservice(
@@ -388,6 +813,8 @@ def run_marl_gat_microservice(
     decision_count = 0
     total_migrations = 0
     total_violations = 0
+    primary_entry_violations = 0
+    max_entry_violations = 0
     proactive_decisions = 0
     total_reward_sum = 0.0
     total_access_latency = 0.0
@@ -400,8 +827,14 @@ def run_marl_gat_microservice(
     local_migration_cost_sum = 0.0
     edge_split_cost_sum = 0.0
     proactive_logit_bias_count = 0
+    entry_sla_bonus_sum = 0.0
     proactive_best_bias_action_counts = {str(i): 0 for i in range(MARL_ACTION_DIM)}
     reactive_action_clipped_count = 0
+    counterfactual_score_sum = 0.0
+    entry_node_migration_count = 0
+    sla_improving_action_count = 0
+    cost_guard_blocked_count = 0
+    non_entry_distance_only_blocked_count = 0
     invalid_action_masked_count = 0
     action_mask_fallback_count = 0
     agent_decision_count = 0
@@ -443,6 +876,8 @@ def run_marl_gat_microservice(
             decision_count = 0
             total_migrations = 0
             total_violations = 0
+            primary_entry_violations = 0
+            max_entry_violations = 0
             proactive_decisions = 0
             total_reward_sum = 0.0
             total_access_latency = 0.0
@@ -455,9 +890,15 @@ def run_marl_gat_microservice(
             local_migration_cost_sum = 0.0
             edge_split_cost_sum = 0.0
             dense_distance_bonus_sum = 0.0
+            entry_sla_bonus_sum = 0.0
             proactive_logit_bias_count = 0
             proactive_best_bias_action_counts = {str(i): 0 for i in range(MARL_ACTION_DIM)}
             reactive_action_clipped_count = 0
+            counterfactual_score_sum = 0.0
+            entry_node_migration_count = 0
+            sla_improving_action_count = 0
+            cost_guard_blocked_count = 0
+            non_entry_distance_only_blocked_count = 0
             invalid_action_masked_count = 0
             action_mask_fallback_count = 0
             agent_decision_count = 0
@@ -532,7 +973,22 @@ def run_marl_gat_microservice(
                 gw_lat, gw_lon = servers_info[gateway_server]
                 gateway_dist = float(haversine_distance(current_lat, current_lon, gw_lat, gw_lon))
 
-                if check_sla_violation(current_lat, current_lon, gw_lat, gw_lon):
+                primary_violation = check_sla_violation(current_lat, current_lon, gw_lat, gw_lon)
+                entry_distances = [
+                    _server_distance_to_user(
+                        taxi_dag_assignments[taxi_id][entry],
+                        current_lat,
+                        current_lon,
+                        servers_info,
+                    )
+                    for entry in entry_nodes
+                ]
+                max_entry_violation = bool(entry_distances and max(entry_distances) > DISTANCE_THRESHOLD_KM)
+                if primary_violation:
+                    primary_entry_violations += 1
+                if max_entry_violation:
+                    max_entry_violations += 1
+                if max_entry_violation:
                     total_violations += 1
 
                 predicted_locations = None
@@ -579,6 +1035,7 @@ def run_marl_gat_microservice(
                 controlled_nodes = [node for node in sorted_nodes if not is_external_node(node)]
                 node_to_idx = {name: i for i, name in enumerate(state["node_names"])}
                 actions = []
+                lm, ls = epoch_lm, epoch_ls
 
                 t0 = time.perf_counter()
                 with torch.no_grad():
@@ -595,7 +1052,7 @@ def run_marl_gat_microservice(
                         logits, tensors["action_masks"]
                     )
                     if use_proactive and trigger_type == TRIGGER_PROACTIVE:
-                        masked_logits, bias_count, best_bias_actions = _apply_proactive_distance_bias(
+                        masked_logits, bias_count, best_bias_actions, cf_info = _apply_proactive_distance_bias(
                             masked_logits,
                             sorted_nodes,
                             node_to_idx,
@@ -605,8 +1062,16 @@ def run_marl_gat_microservice(
                             current_lat,
                             current_lon,
                             servers_info,
+                            dag_info,
+                            predicted_locations,
+                            lm,
+                            ls,
                         )
                         proactive_logit_bias_count += bias_count
+                        counterfactual_score_sum += cf_info["counterfactual_score_sum"]
+                        sla_improving_action_count += cf_info["sla_improving_action_count"]
+                        cost_guard_blocked_count += cf_info["cost_guard_blocked_count"]
+                        non_entry_distance_only_blocked_count += cf_info["non_entry_distance_only_blocked_count"]
                         for key, value in best_bias_actions.items():
                             proactive_best_bias_action_counts[key] = (
                                 proactive_best_bias_action_counts.get(key, 0) + value
@@ -627,7 +1092,7 @@ def run_marl_gat_microservice(
                         actions.append(action)
 
                     if trigger_type != TRIGGER_PROACTIVE:
-                        actions, clipped_count = _clip_reactive_actions(
+                        actions, clipped_count, cf_info = _clip_reactive_actions(
                             actions,
                             sorted_nodes,
                             taxi_dag_assignments[taxi_id],
@@ -635,8 +1100,17 @@ def run_marl_gat_microservice(
                             current_lat,
                             current_lon,
                             servers_info,
+                            dag_info,
+                            lm,
+                            ls,
+                            node_to_idx,
+                            tensors["action_masks"],
                         )
                         reactive_action_clipped_count += clipped_count
+                        counterfactual_score_sum += cf_info["counterfactual_score_sum"]
+                        sla_improving_action_count += cf_info["sla_improving_action_count"]
+                        cost_guard_blocked_count += cf_info["cost_guard_blocked_count"]
+                        non_entry_distance_only_blocked_count += cf_info["non_entry_distance_only_blocked_count"]
 
                     for ms_node, action in zip(sorted_nodes, actions):
                         current_server = taxi_dag_assignments[taxi_id][ms_node]
@@ -656,7 +1130,6 @@ def run_marl_gat_microservice(
                     candidate_action_counts[key] = candidate_action_counts.get(key, 0) + 1
                 joint_action_distribution["-".join(map(str, actions))] += 1
 
-                lm, ls = epoch_lm, epoch_ls
                 lambda_migration_history.append(lm)
                 lambda_split_history.append(ls)
                 shared_reward, agent_rewards, details = calculate_marl_rewards(
@@ -685,6 +1158,7 @@ def run_marl_gat_microservice(
                 local_migration_cost_sum += details.get("local_migration_cost_sum", 0.0)
                 edge_split_cost_sum += details.get("edge_split_cost_sum", 0.0)
                 dense_distance_bonus_sum += details.get("dense_distance_bonus_sum", 0.0)
+                entry_sla_bonus_sum += details.get("entry_sla_bonus_sum", 0.0)
 
                 nodes_migrated = sum(
                     1 for n in sorted_nodes
@@ -692,6 +1166,10 @@ def run_marl_gat_microservice(
                 )
                 controlled_nodes_migrated = sum(
                     1 for n in controlled_nodes
+                    if old_assignments[n] != taxi_dag_assignments[taxi_id][n]
+                )
+                entry_node_migration_count += sum(
+                    1 for n in entry_nodes
                     if old_assignments[n] != taxi_dag_assignments[taxi_id][n]
                 )
                 total_migrations += nodes_migrated
@@ -772,6 +1250,8 @@ def run_marl_gat_microservice(
     return {
         "total_migrations": total_migrations,
         "total_violations": total_violations,
+        "primary_entry_violations": primary_entry_violations,
+        "max_entry_violations": max_entry_violations,
         "proactive_decisions": proactive_decisions,
         "decision_count": decision_count,
         "total_reward": total_reward_sum,
@@ -807,9 +1287,15 @@ def run_marl_gat_microservice(
         "local_migration_cost_sum": local_migration_cost_sum,
         "edge_split_cost_sum": edge_split_cost_sum,
         "dense_distance_bonus_sum": dense_distance_bonus_sum,
+        "entry_sla_bonus_sum": entry_sla_bonus_sum,
         "proactive_logit_bias_count": proactive_logit_bias_count,
         "proactive_best_bias_action_counts": dict(proactive_best_bias_action_counts),
         "reactive_action_clipped_count": reactive_action_clipped_count,
+        "counterfactual_score_sum": counterfactual_score_sum,
+        "entry_node_migration_count": entry_node_migration_count,
+        "sla_improving_action_count": sla_improving_action_count,
+        "cost_guard_blocked_count": cost_guard_blocked_count,
+        "non_entry_distance_only_blocked_count": non_entry_distance_only_blocked_count,
         "cost_by_dag_complexity": {
             k: {
                 **v,

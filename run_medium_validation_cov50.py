@@ -7,6 +7,10 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from algorithms.dqn import run_dqn_microservice_fair
 from algorithms.marl_gat import run_marl_gat_microservice
@@ -62,6 +66,8 @@ def _summarize_result(res):
     keys = [
         "total_migrations",
         "total_violations",
+        "primary_entry_violations",
+        "max_entry_violations",
         "proactive_decisions",
         "decision_count",
         "total_reward",
@@ -103,9 +109,15 @@ def _summarize_result(res):
         "local_migration_cost_sum",
         "edge_split_cost_sum",
         "dense_distance_bonus_sum",
+        "entry_sla_bonus_sum",
         "proactive_logit_bias_count",
         "proactive_best_bias_action_counts",
         "reactive_action_clipped_count",
+        "counterfactual_score_sum",
+        "entry_node_migration_count",
+        "sla_improving_action_count",
+        "cost_guard_blocked_count",
+        "non_entry_distance_only_blocked_count",
         "cost_by_dag_complexity",
         "cost_by_dag_type",
         "migrations_by_dag_type",
@@ -206,15 +218,59 @@ def _split_by_balanced_exposure(df, servers_df):
 
 def _row(name, res, proactive=False):
     pro = int(res.get("proactive_decisions") or 0)
+    dc = int(res.get("decision_count") or 0)
+    avg_access = (float(res.get("total_access_latency") or 0.0) / dc) if dc > 0 else 0.0
+    avg_system = _avg_total_cost_ms(res)
     if proactive:
         return (
             f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
-            f"{pro} | {res.get('avg_decision_time_ms', 0):.2f} | {_avg_total_cost_ms(res):.2f} |\n"
+            f"{pro} | {res.get('avg_decision_time_ms', 0):.2f} | {avg_access:.2f} | {avg_system:.2f} |\n"
         )
     return (
         f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
-        f"{res.get('avg_decision_time_ms', 0):.2f} | {_avg_total_cost_ms(res):.2f} |\n"
+        f"{res.get('avg_decision_time_ms', 0):.2f} | {avg_access:.2f} | {avg_system:.2f} |\n"
     )
+
+
+def _cost_row(name, res):
+    dc = int(res.get("decision_count") or 0)
+    avg_sla = (float(res.get("total_sla_penalty_ms") or 0.0) / dc) if dc > 0 else 0.0
+    avg_migration = (float(res.get("total_migration_cost") or 0.0) / dc) if dc > 0 else 0.0
+    return f"| {name} | {avg_sla:.2f} | {avg_migration:.2f} |\n"
+
+
+def _write_cost_decomposition_chart(payload, stage, filename):
+    phases = [("proactive", payload[stage]["proactive"]), ("reactive", payload[stage]["reactive"])]
+    algorithms = ["SA", "Nearest", "DQN", "GAT-MARL"]
+    components = [
+        ("SLA penalty", "total_sla_penalty_ms"),
+        ("Migration", "total_migration_cost"),
+    ]
+    colors = ["#d62728", "#ff7f0e"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    for ax, (mode, results) in zip(axes, phases):
+        x = np.arange(len(algorithms))
+        bottoms = np.zeros(len(algorithms), dtype=float)
+        for (label, key), color in zip(components, colors):
+            values = []
+            for name in algorithms:
+                res = results.get(name, {})
+                dc = int(res.get("decision_count") or 0)
+                values.append((float(res.get(key) or 0.0) / dc) if dc > 0 else 0.0)
+            ax.bar(x, values, bottom=bottoms, label=label, color=color)
+            bottoms += np.asarray(values, dtype=float)
+        ax.set_title(f"{stage.capitalize()} {mode.capitalize()}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(algorithms, rotation=20, ha="right")
+        ax.set_ylabel("Avg cost per decision (ms)")
+        ax.grid(axis="y", alpha=0.25)
+    axes[1].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, filename)
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return filename
 
 
 def _write_report(payload):
@@ -222,22 +278,40 @@ def _write_report(payload):
     train_rea = payload["train"]["reactive"]
     infer_pro = payload["inference"]["proactive"]
     infer_rea = payload["inference"]["reactive"]
+    cost_chart = _write_cost_decomposition_chart(
+        payload, "inference", "cost_decomposition_inference.png"
+    )
 
     def table(pro, rea):
-        s = "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Latency (ms) | Avg Total Cost (ms) |\n"
-        s += "|-----------|------------|------------|---------------------|------------------|---------------------|\n"
+        s = "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
+        s += "|-----------|------------|------------|---------------------|------------------------|-------------------------|----------------------------|\n"
         for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in pro:
                 s += _row(name, pro[name], proactive=True)
             else:
-                s += f"| {name} | — | — | — | — | — |\n"
-        s += "\n| Algorithm | Migrations | Violations | Avg Latency (ms) | Avg Total Cost (ms) |\n"
-        s += "|-----------|------------|------------|------------------|---------------------|\n"
+                s += f"| {name} | — | — | — | — | — | — |\n"
+        s += "\n| Algorithm | Migrations | Violations | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
+        s += "|-----------|------------|------------|------------------------|-------------------------|----------------------------|\n"
         for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in rea:
                 s += _row(name, rea[name], proactive=False)
             else:
-                s += f"| {name} | — | — | — | — |\n"
+                s += f"| {name} | — | — | — | — | — |\n"
+        return s
+
+    def cost_table(pro, rea):
+        s = "| Algorithm | Proactive SLA Penalty (ms) | Proactive Migration (ms) | Reactive SLA Penalty (ms) | Reactive Migration (ms) |\n"
+        s += "|-----------|----------------------------|--------------------------|---------------------------|-------------------------|\n"
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
+            pro_res = pro.get(name, {})
+            rea_res = rea.get(name, {})
+            pro_dc = int(pro_res.get("decision_count") or 0)
+            rea_dc = int(rea_res.get("decision_count") or 0)
+            pro_sla = (float(pro_res.get("total_sla_penalty_ms") or 0.0) / pro_dc) if pro_dc > 0 else 0.0
+            pro_mig = (float(pro_res.get("total_migration_cost") or 0.0) / pro_dc) if pro_dc > 0 else 0.0
+            rea_sla = (float(rea_res.get("total_sla_penalty_ms") or 0.0) / rea_dc) if rea_dc > 0 else 0.0
+            rea_mig = (float(rea_res.get("total_migration_cost") or 0.0) / rea_dc) if rea_dc > 0 else 0.0
+            s += f"| {name} | {pro_sla:.2f} | {pro_mig:.2f} | {rea_sla:.2f} | {rea_mig:.2f} |\n"
         return s
 
     report = f"""# 中等规模 cov50 数据验证报告
@@ -257,11 +331,19 @@ def _write_report(payload):
 
 {table(infer_pro, infer_rea)}
 
+## 成本分解堆叠图
+
+![Inference Cost Decomposition]({cost_chart})
+
+## 推理阶段成本分解均值
+
+{cost_table(infer_pro, infer_rea)}
+
 ## 本轮验证关注点
 
 - 验证脚本显式使用 cov50 覆盖过滤数据，不再读取旧 cleaned CSV。
 - train/test 按最近服务器距离风险暴露平衡切分，减少 proactive opportunity 偏斜。
-- Avg Total Cost 使用 `total_cost_ms_sum / decision_count`，包含 SLA / future / tearing.
+- Avg Decision Time 是算法计算耗时；Avg Access Latency 是真实接入延迟；Avg Total System Cost 使用 `total_cost_ms_sum / decision_count`，包含 SLA penalty 和迁移等系统代价。
 
 """
     with open(os.path.join(OUT_DIR, "result.md"), "w", encoding="utf-8") as f:
