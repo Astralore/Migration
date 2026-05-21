@@ -106,6 +106,24 @@ def _dag_stats_markdown_table(stats):
     return "".join(lines)
 
 
+def _dag_stats_total_migrations(stats):
+    return sum(int(bucket.get("migrated_nodes", 0)) for bucket in (stats or {}).values())
+
+
+def _dag_stats_reconcile_table(proactive_results, stats_by_algorithm):
+    lines = [
+        "| Algorithm | Proactive-mode Total Migrations | PROACTIVE-trigger Migrated Nodes | Other-trigger Migrated Nodes |\n",
+        "|-----------|---------------------------------|----------------------------------|------------------------------|\n",
+    ]
+    for name in ["SA", "Nearest", "GAT-MARL"]:
+        res = proactive_results.get(name) or {}
+        total = int(res.get("total_migrations") or 0)
+        pro_trigger_total = _dag_stats_total_migrations(stats_by_algorithm.get(name) or {})
+        other = max(0, total - pro_trigger_total)
+        lines.append(f"| {name} | {total} | {pro_trigger_total} | {other} |\n")
+    return "".join(lines)
+
+
 def build_dag_adaptive_dual_appendix(proactive_results, section_heading="## 五、"):
     """
     SA / Nearest / GAT-MARL 的 Proactive 按 DAG 统计。
@@ -114,14 +132,23 @@ def build_dag_adaptive_dual_appendix(proactive_results, section_heading="## 五�
     sa_stats = (proactive_results.get("SA") or {}).get("dag_proactive_migration_stats") or {}
     nearest_stats = (proactive_results.get("Nearest") or {}).get("dag_proactive_migration_stats") or {}
     marl_stats = (proactive_results.get("GAT-MARL") or {}).get("dag_proactive_migration_stats") or {}
+    stats_by_algorithm = {
+        "SA": sa_stats,
+        "Nearest": nearest_stats,
+        "GAT-MARL": marl_stats,
+    }
     return (
         f"\n{section_heading}Proactive 按 DAG 自适应迁移统计（SA / Nearest / GAT-MARL 同口径）\n\n"
-        "**统一条件**：已启用前瞻（`use_proactive`）；`get_trigger_type(...) == PROACTIVE`；"
-        "单次决策内在 **同一拓扑序 `sorted_nodes`** 上比较 `previous_assignments` 与决策后节点放置，"
-        "统计发生变更的节点数 `migrated_nodes_count`；按 **DAG Name**（`dag_type`）聚合 "
+        "**统一条件**：该附录只统计推理阶段 Proactive 分支中 `get_trigger_type(...) == PROACTIVE` 的决策；"
+        "单次决策内比较 `previous_assignments` 与决策后节点放置，"
+        "统计发生变更的可部署微服务节点数 `migrated_nodes_count`；按 **DAG Name**（`dag_type`）聚合 "
         "`proactive_decisions` 与 `migrated_nodes`；**Avg = migrated / proactive_decisions**（保留两位小数）。\n\n"
-        "**开关对齐（仅推理实验）**：仅在推理实验的 Proactive 分支采集本统计。"
-        "**训练阶段**不采集本统计。\n\n"
+        "**口径说明**：主表中的 Proactive-mode `Migrations` 是启用预测后的全部触发迁移，"
+        "其中仍可能包含当前已经 SLA 违规而触发的 REACTIVE 决策；因此主表总迁移数通常大于本附录的 "
+        "`PROACTIVE-trigger Migrated Nodes`。**训练阶段**不采集本统计。\n\n"
+        "### 口径对账\n\n"
+        + _dag_stats_reconcile_table(proactive_results, stats_by_algorithm)
+        + "\n"
         "### SA（Simulated Annealing）\n\n"
         + _dag_stats_markdown_table(sa_stats)
         + "\n### Nearest\n\n"

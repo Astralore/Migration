@@ -28,7 +28,10 @@ MAX_TEARING_MB = 50.0
 EDGE_BACKHAUL_MBPS = 1000.0
 FUTURE_DECAY = 0.9
 FUTURE_DIST_THRESHOLD = 15.0
-SLA_PENALTY_MS = 20000.0
+SLA_BASE_PENALTY_MS = 2000.0
+SLA_PENALTY_PER_KM_MS = 500.0
+# Backward-compatible reference scale.  Actual SLA cost is now linear excess.
+SLA_PENALTY_MS = SLA_BASE_PENALTY_MS + SLA_PENALTY_PER_KM_MS * 10.0
 # C2：用 log 压缩真实物理代价，避免 -10 硬截断让严重违规/昂贵迁移不可区分。
 REWARD_COST_SCALE_MS = 1000.0
 REWARD_RECOVERY_BONUS_MAX = 3.0
@@ -100,6 +103,17 @@ def estimate_dag_migration_time_s(
             delta_s *= REACTIVE_MIGRATION_MULT
         total_s += delta_s
     return total_s
+
+
+def calculate_sla_penalty_ms(max_entry_dist_km, access_latency_ms=0.0):
+    """Linear-excess SLA penalty: base violation cost plus distance/QoS excess."""
+    distance_excess_km = max(0.0, float(max_entry_dist_km) - SLA_DISTANCE_THRESHOLD)
+    qos_excess_ms = max(0.0, float(access_latency_ms) - USER_SLA_TOLERANCE_MS)
+    if distance_excess_km <= 0.0 and qos_excess_ms <= 0.0:
+        return 0.0
+    # QoS-only excess is converted back to an equivalent propagation distance.
+    equivalent_excess_km = distance_excess_km + qos_excess_ms * FIBER_SPEED_KM_MS
+    return float(SLA_BASE_PENALTY_MS + equivalent_excess_km * SLA_PENALTY_PER_KM_MS)
 
 
 def calculate_microservice_reward(
@@ -221,7 +235,7 @@ def calculate_microservice_reward(
 
     spatial_violation = max_entry_dist_km > SLA_DISTANCE_THRESHOLD
     qos_violation = access_latency_ms > USER_SLA_TOLERANCE_MS
-    sla_penalty_ms = SLA_PENALTY_MS if (spatial_violation or qos_violation) else 0.0
+    sla_penalty_ms = calculate_sla_penalty_ms(max_entry_dist_km, access_latency_ms)
 
     total_cost_ms = (
         access_latency_ms

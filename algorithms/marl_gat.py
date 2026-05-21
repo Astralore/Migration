@@ -52,8 +52,9 @@ from core.reward import (
     MIN_BW_MBPS,
     REACTIVE_MIGRATION_MULT,
     RPC_SIZE_MB,
-    SLA_PENALTY_MS,
+    SLA_PENALTY_PER_KM_MS,
     build_servers_info,
+    calculate_sla_penalty_ms,
     estimate_dag_migration_time_s,
 )
 from core.physics_utils import BASE_ROUTER_DELAY_MS, FIBER_SPEED_KM_MS
@@ -68,6 +69,22 @@ CF_TOPOLOGY_WEIGHT = 0.001
 CF_COST_SCALE_MS = 1000.0
 CF_SCORE_EPS = 1e-6
 CF_SLA_ENTRY_SCORE_FLOOR = -0.2
+PROACTIVE_MAX_MIGRATABLE_MB = 100.0
+STATEFUL_FUTURE_GAIN_DISCOUNT = 0.1
+PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS = 20000.0
+
+
+def _node_transfer_mb(dag_info, node):
+    props = dag_info["nodes"].get(node, {})
+    return float(props.get("image_mb", 0.0)) + float(props.get("state_mb", 0.0))
+
+
+def _node_state_mb(dag_info, node):
+    return float(dag_info["nodes"].get(node, {}).get("state_mb", 0.0))
+
+
+def _is_heavy_for_proactive(dag_info, node):
+    return _node_transfer_mb(dag_info, node) > PROACTIVE_MAX_MIGRATABLE_MB
 
 
 class GraphEncoder(nn.Module):
@@ -445,32 +462,26 @@ def _score_counterfactual_action(
             )
             new_max = max(other_entry_max, target_dist)
             old_max = cf_ctx["current_max_entry_dist"]
-            old_excess = max(0.0, old_max - DISTANCE_THRESHOLD_KM)
-            new_excess = max(0.0, new_max - DISTANCE_THRESHOLD_KM)
-            sla_gain_ms = max(0.0, old_excess - new_excess) / max(DISTANCE_THRESHOLD_KM, 1e-6) * SLA_PENALTY_MS
+            old_penalty = calculate_sla_penalty_ms(old_max)
+            new_penalty = calculate_sla_penalty_ms(new_max)
+            sla_gain_ms = max(0.0, old_penalty - new_penalty)
             sla_gain_ms += (
                 max(0.0, old_max - new_max)
-                / max(DISTANCE_THRESHOLD_KM, 1e-6)
-                * SLA_PENALTY_MS
+                * SLA_PENALTY_PER_KM_MS
                 * 0.25
             )
             primary_old = cf_ctx["entry_distances"].get(node, 0.0)
-            primary_excess_old = max(0.0, primary_old - DISTANCE_THRESHOLD_KM)
-            primary_excess_new = max(0.0, target_dist - DISTANCE_THRESHOLD_KM)
+            primary_penalty_old = calculate_sla_penalty_ms(primary_old)
+            primary_penalty_new = calculate_sla_penalty_ms(target_dist)
             sla_gain_ms += (
-                max(0.0, primary_excess_old - primary_excess_new)
-                / max(DISTANCE_THRESHOLD_KM, 1e-6)
-                * SLA_PENALTY_MS
+                max(0.0, primary_penalty_old - primary_penalty_new)
                 * 0.5
             )
             sla_gain_ms += (
                 max(0.0, primary_old - target_dist)
-                / max(DISTANCE_THRESHOLD_KM, 1e-6)
-                * SLA_PENALTY_MS
+                * SLA_PENALTY_PER_KM_MS
                 * 0.1
             )
-            if old_max > DISTANCE_THRESHOLD_KM and new_max <= DISTANCE_THRESHOLD_KM:
-                sla_gain_ms += SLA_PENALTY_MS
 
             pred_arr = cf_ctx["predicted_locations"]
             if pred_arr is not None and pred_arr.size > 0 and cf_ctx["entry_nodes"]:
@@ -488,9 +499,10 @@ def _score_counterfactual_action(
                     new_future = float(np.mean(np.maximum(0.0, np.asarray(future_excess))))
                     future_gain_ms = (
                         max(0.0, cf_ctx["current_future_max"] - new_future)
-                        / max(DISTANCE_THRESHOLD_KM, 1e-6)
-                        * SLA_PENALTY_MS
+                        * SLA_PENALTY_PER_KM_MS
                     )
+                    if _node_state_mb(dag_info, node) > 0.0:
+                        future_gain_ms *= STATEFUL_FUTURE_GAIN_DISCOUNT
                     cf_ctx["future_gain_cache"][future_key] = future_gain_ms
     else:
         target_dist = cf_ctx["candidate_distances"].get(int(action))
@@ -518,6 +530,7 @@ def _score_counterfactual_action(
         "migration_cost_ms": float(migration_cost_ms),
         "split_cost_ms": float(split_cost_ms),
         "non_entry_distance_only": bool(non_entry_distance_only),
+        "is_heavy_proactive": bool(_is_heavy_for_proactive(dag_info, node)),
     }
 
 
@@ -536,8 +549,8 @@ def _apply_proactive_distance_bias(
     lambda_migration,
     lambda_split,
     *,
-    bias_scale=0.8,
-    max_bias=1.0,
+    bias_scale=0.45,
+    max_bias=0.6,
 ):
     """Add a light logit prior for actions with positive counterfactual value."""
     biased_logits = masked_logits.clone()
@@ -583,6 +596,9 @@ def _apply_proactive_distance_bias(
             score_sum += scored["score"]
             if scored["sla_gain_ms"] > 0.0:
                 sla_improving_count += 1
+            if scored["is_heavy_proactive"]:
+                cost_guard_blocked_count += 1
+                continue
             if scored["non_entry_distance_only"] and scored["score"] <= CF_SCORE_EPS:
                 non_entry_distance_only_blocked_count += 1
             if scored["score"] <= CF_SCORE_EPS:
@@ -619,6 +635,7 @@ def _clip_reactive_actions(
     action_masks=None,
     *,
     max_migrations=None,
+    size_guard_enabled=False,
 ):
     """Keep only reactive migrations with positive counterfactual value."""
     controlled_count = sum(1 for node in sorted_nodes if not is_external_node(node))
@@ -665,6 +682,14 @@ def _clip_reactive_actions(
         if item["non_entry_distance_only"] and item["score"] <= CF_SCORE_EPS:
             non_entry_distance_only_blocked_count += 1
         is_sla_entry_action = item["sla_gain_ms"] > 0.0
+        heavy_blocked = (
+            size_guard_enabled
+            and item["is_heavy_proactive"]
+            and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
+        )
+        if heavy_blocked:
+            cost_guard_blocked_count += 1
+            continue
         if item["score"] > CF_SCORE_EPS or (
             is_sla_entry_action and item["score"] > CF_SLA_ENTRY_SCORE_FLOOR
         ):
@@ -709,6 +734,12 @@ def _clip_reactive_actions(
                     lambda_split,
                 )
                 if item is None or item["sla_gain_ms"] <= 0.0:
+                    continue
+                if (
+                    size_guard_enabled
+                    and item["is_heavy_proactive"]
+                    and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
+                ):
                     continue
                 if best_entry is None or item["score"] > best_entry[0]:
                     best_entry = (item["score"], action_idx, action)
@@ -773,10 +804,11 @@ def run_marl_gat_microservice(
     servers_info = build_servers_info(servers_df)
     use_proactive = proactive and predictor is not None
     if max_lambda_migration is None:
-        # Proactive 由动作前 distance bias 引导迁移，lambda 只负责轻度成本约束。
-        max_lambda_migration = 0.05 if use_proactive else 0.3
+        # Linear SLA penalty lowers benefit scale, so Proactive needs a stronger
+        # cost exchange rate to avoid expensive early migrations.
+        max_lambda_migration = 0.12 if use_proactive else 0.3
     if max_lambda_split is None:
-        max_lambda_split = 0.02 if use_proactive else 0.1
+        max_lambda_split = 0.04 if use_proactive else 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  Lambda: migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}")
 
@@ -974,16 +1006,14 @@ def run_marl_gat_microservice(
                 gateway_dist = float(haversine_distance(current_lat, current_lon, gw_lat, gw_lon))
 
                 primary_violation = check_sla_violation(current_lat, current_lon, gw_lat, gw_lon)
-                entry_distances = [
-                    _server_distance_to_user(
-                        taxi_dag_assignments[taxi_id][entry],
-                        current_lat,
-                        current_lon,
-                        servers_info,
+                entry_violations = []
+                for entry in entry_nodes:
+                    entry_server = taxi_dag_assignments[taxi_id][entry]
+                    entry_lat, entry_lon = servers_info[entry_server]
+                    entry_violations.append(
+                        check_sla_violation(current_lat, current_lon, entry_lat, entry_lon)
                     )
-                    for entry in entry_nodes
-                ]
-                max_entry_violation = bool(entry_distances and max(entry_distances) > DISTANCE_THRESHOLD_KM)
+                max_entry_violation = any(entry_violations)
                 if primary_violation:
                     primary_entry_violations += 1
                 if max_entry_violation:
@@ -1105,6 +1135,7 @@ def run_marl_gat_microservice(
                             ls,
                             node_to_idx,
                             tensors["action_masks"],
+                            size_guard_enabled=use_proactive,
                         )
                         reactive_action_clipped_count += clipped_count
                         counterfactual_score_sum += cf_info["counterfactual_score_sum"]

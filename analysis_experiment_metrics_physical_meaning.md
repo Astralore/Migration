@@ -282,13 +282,25 @@ access_latency_ms = distance_km / 200.0 + 2.0
 
 表示 SLA 违规惩罚总和。
 
-当前每次 SLA 违规会增加固定惩罚：
+当前 SLA penalty 已从固定二值惩罚改为线性超额惩罚：
 
 ```python
-SLA_PENALTY_MS
+if max_entry_distance > DISTANCE_THRESHOLD_KM:
+    sla_penalty_ms = SLA_BASE_PENALTY_MS + (
+        max_entry_distance - DISTANCE_THRESHOLD_KM
+    ) * SLA_PENALTY_PER_KM_MS
+else:
+    sla_penalty_ms = 0
 ```
 
-该指标和 `Violations` 高度相关。报告中如果同时比较 `Violations` 和 `Avg Total Cost`，必须说明 `Avg Total Cost` 已包含 SLA penalty，因此二者不是完全独立指标。
+当前参数为：
+
+- `SLA_BASE_PENALTY_MS = 2000`
+- `SLA_PENALTY_PER_KM_MS = 500`
+
+这比旧的 `SLA_PENALTY_MS = 20000` 固定罚金更合理：刚超过阈值的轻微违规不会被放大成极端成本，严重远离阈值的违规仍会随着超额距离线性增大。
+
+该指标和 `Violations` 相关，但不再完全等价。`Violations` 只表示是否超过阈值；`total_sla_penalty_ms` 进一步表示超过阈值的严重程度。
 
 ## 8. GAT-MARL 诊断指标
 

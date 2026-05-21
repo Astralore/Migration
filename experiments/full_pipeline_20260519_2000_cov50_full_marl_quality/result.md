@@ -1,6 +1,6 @@
 # 全量 cov50 训练与推理实验报告
 
-**生成时间**：2026-05-20 10:51:39  
+**生成时间**：2026-05-20 11:05:08  
 **输出目录**：`experiments/full_pipeline_20260519_2000_cov50_full_marl_quality`  
 **数据文件**：`data\processed\taxi_cleaned_active100_min100_eps2h_cov50.csv`  
 **数据规模**：Top-100 active taxis；train=148153 rows/80 taxis；test=57783 rows/20 taxis  
@@ -66,9 +66,17 @@
 
 ## DAG Proactive 迁移统计Proactive 按 DAG 自适应迁移统计（SA / Nearest / GAT-MARL 同口径）
 
-**统一条件**：已启用前瞻（`use_proactive`）；`get_trigger_type(...) == PROACTIVE`；单次决策内在 **同一拓扑序 `sorted_nodes`** 上比较 `previous_assignments` 与决策后节点放置，统计发生变更的节点数 `migrated_nodes_count`；按 **DAG Name**（`dag_type`）聚合 `proactive_decisions` 与 `migrated_nodes`；**Avg = migrated / proactive_decisions**（保留两位小数）。
+**统一条件**：该附录只统计推理阶段 Proactive 分支中 `get_trigger_type(...) == PROACTIVE` 的决策；单次决策内比较 `previous_assignments` 与决策后节点放置，统计发生变更的可部署微服务节点数 `migrated_nodes_count`；按 **DAG Name**（`dag_type`）聚合 `proactive_decisions` 与 `migrated_nodes`；**Avg = migrated / proactive_decisions**（保留两位小数）。
 
-**开关对齐（仅推理实验）**：仅在推理实验的 Proactive 分支采集本统计。**训练阶段**不采集本统计。
+**口径说明**：主表中的 Proactive-mode `Migrations` 是启用预测后的全部触发迁移，其中仍可能包含当前已经 SLA 违规而触发的 REACTIVE 决策；因此主表总迁移数通常大于本附录的 `PROACTIVE-trigger Migrated Nodes`。**训练阶段**不采集本统计。
+
+### 口径对账
+
+| Algorithm | Proactive-mode Total Migrations | PROACTIVE-trigger Migrated Nodes | Other-trigger Migrated Nodes |
+|-----------|---------------------------------|----------------------------------|------------------------------|
+| SA | 1853 | 227 | 1626 |
+| Nearest | 3381 | 2488 | 893 |
+| GAT-MARL | 1085 | 506 | 579 |
 
 ### SA（Simulated Annealing）
 
