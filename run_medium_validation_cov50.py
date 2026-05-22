@@ -68,6 +68,10 @@ def _summarize_result(res):
         "total_violations",
         "primary_entry_violations",
         "max_entry_violations",
+        "severe_sla_violations",
+        "total_sla_excess_distance_km",
+        "avg_sla_excess_distance_km",
+        "p95_sla_excess_distance_km",
         "proactive_decisions",
         "decision_count",
         "total_reward",
@@ -221,13 +225,18 @@ def _row(name, res, proactive=False):
     dc = int(res.get("decision_count") or 0)
     avg_access = (float(res.get("total_access_latency") or 0.0) / dc) if dc > 0 else 0.0
     avg_system = _avg_total_cost_ms(res)
+    avg_sla_penalty = (float(res.get("total_sla_penalty_ms") or 0.0) / dc) if dc > 0 else 0.0
     if proactive:
         return (
             f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
+            f"{res.get('severe_sla_violations', 0)} | {res.get('avg_sla_excess_distance_km', 0):.2f} | "
+            f"{res.get('p95_sla_excess_distance_km', 0):.2f} | {avg_sla_penalty:.2f} | "
             f"{pro} | {res.get('avg_decision_time_ms', 0):.2f} | {avg_access:.2f} | {avg_system:.2f} |\n"
         )
     return (
         f"| {name} | {res['total_migrations']} | {res['total_violations']} | "
+        f"{res.get('severe_sla_violations', 0)} | {res.get('avg_sla_excess_distance_km', 0):.2f} | "
+        f"{res.get('p95_sla_excess_distance_km', 0):.2f} | {avg_sla_penalty:.2f} | "
         f"{res.get('avg_decision_time_ms', 0):.2f} | {avg_access:.2f} | {avg_system:.2f} |\n"
     )
 
@@ -283,20 +292,20 @@ def _write_report(payload):
     )
 
     def table(pro, rea):
-        s = "| Algorithm | Migrations | Violations | Proactive Decisions | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
-        s += "|-----------|------------|------------|---------------------|------------------------|-------------------------|----------------------------|\n"
+        s = "| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Proactive Decisions | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
+        s += "|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|---------------------|------------------------|-------------------------|----------------------------|\n"
         for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in pro:
                 s += _row(name, pro[name], proactive=True)
             else:
-                s += f"| {name} | — | — | — | — | — | — |\n"
-        s += "\n| Algorithm | Migrations | Violations | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
-        s += "|-----------|------------|------------|------------------------|-------------------------|----------------------------|\n"
+                s += f"| {name} | — | — | — | — | — | — | — | — | — | — |\n"
+        s += "\n| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
+        s += "|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|------------------------|-------------------------|----------------------------|\n"
         for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
             if name in rea:
                 s += _row(name, rea[name], proactive=False)
             else:
-                s += f"| {name} | — | — | — | — | — |\n"
+                s += f"| {name} | — | — | — | — | — | — | — | — | — |\n"
         return s
 
     def cost_table(pro, rea):
@@ -344,6 +353,7 @@ def _write_report(payload):
 - 验证脚本显式使用 cov50 覆盖过滤数据，不再读取旧 cleaned CSV。
 - train/test 按最近服务器距离风险暴露平衡切分，减少 proactive opportunity 偏斜。
 - Avg Decision Time 是算法计算耗时；Avg Access Latency 是真实接入延迟；Avg Total System Cost 使用 `total_cost_ms_sum / decision_count`，包含 SLA penalty 和迁移等系统代价。
+- SLA Risk Count 是 max-entry 风险次数；Severe SLA Violations 和 SLA Excess 用于区分轻微风险与严重服务质量退化。
 
 """
     with open(os.path.join(OUT_DIR, "result.md"), "w", encoding="utf-8") as f:

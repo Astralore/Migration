@@ -28,7 +28,12 @@ from core.dag_utils import (
     initialize_dag_assignment,
     topological_sort,
 )
-from core.reward import build_servers_info, calculate_microservice_reward, estimate_dag_migration_time_s
+from core.reward import (
+    build_servers_info,
+    calculate_entry_sla_metrics,
+    calculate_microservice_reward,
+    estimate_dag_migration_time_s,
+)
 from core.state_builder import build_node_state
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
@@ -145,6 +150,9 @@ def run_dqn_microservice_fair(
     total_violations = 0
     primary_entry_violations = 0
     max_entry_violations = 0
+    severe_sla_violations = 0
+    total_sla_excess_distance_km = 0.0
+    sla_excess_distance_history = []
     proactive_decisions = 0
     total_reward_sum = 0.0
 
@@ -230,12 +238,17 @@ def run_dqn_microservice_fair(
             )
 
             # --- SCORING: max-entry SLA count, with primary-entry retained for diagnostics ---
-            primary_v, max_v = _entry_violation_counts(
+            sla_metrics = calculate_entry_sla_metrics(
                 entry_nodes, taxi_dag_assignments[taxi_id], current_lat, current_lon, servers_info
             )
+            primary_v = sla_metrics["primary_entry_violation"]
+            max_v = sla_metrics["max_entry_violation"]
             primary_entry_violations += primary_v
             max_entry_violations += max_v
             total_violations += max_v
+            severe_sla_violations += sla_metrics["severe_sla_violation"]
+            total_sla_excess_distance_km += sla_metrics["sla_excess_distance_km"]
+            sla_excess_distance_history.append(sla_metrics["sla_excess_distance_km"])
 
             # --- Trajectory prediction (lon,lat) -> (lat,lon) ---
             predicted_locations = None
@@ -370,11 +383,20 @@ def run_dqn_microservice_fair(
     avg_ms = (
         (total_decision_time / decision_count * 1000.0) if decision_count > 0 else 0.0
     )
+    sorted_excess = sorted(sla_excess_distance_history)
+    p95_idx = int(0.95 * (len(sorted_excess) - 1)) if sorted_excess else 0
     return {
         'total_migrations': total_migrations,
         'total_violations': total_violations,
         'primary_entry_violations': primary_entry_violations,
         'max_entry_violations': max_entry_violations,
+        'severe_sla_violations': severe_sla_violations,
+        'total_sla_excess_distance_km': total_sla_excess_distance_km,
+        'avg_sla_excess_distance_km': (
+            total_sla_excess_distance_km / len(sla_excess_distance_history)
+            if sla_excess_distance_history else 0.0
+        ),
+        'p95_sla_excess_distance_km': sorted_excess[p95_idx] if sorted_excess else 0.0,
         'proactive_decisions': proactive_decisions,
         'decision_count': decision_count,
         'total_reward': total_reward_sum,

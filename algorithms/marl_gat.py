@@ -54,6 +54,7 @@ from core.reward import (
     RPC_SIZE_MB,
     SLA_PENALTY_PER_KM_MS,
     build_servers_info,
+    calculate_entry_sla_metrics,
     calculate_sla_penalty_ms,
     estimate_dag_migration_time_s,
 )
@@ -72,6 +73,8 @@ CF_SLA_ENTRY_SCORE_FLOOR = -0.2
 PROACTIVE_MAX_MIGRATABLE_MB = 100.0
 STATEFUL_FUTURE_GAIN_DISCOUNT = 0.1
 PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS = 20000.0
+LIGHTWEIGHT_ENTRY_SCORE_FLOOR = -1.0
+LIGHTWEIGHT_ENTRY_MIN_BIAS = 0.2
 
 
 def _node_transfer_mb(dag_info, node):
@@ -85,6 +88,14 @@ def _node_state_mb(dag_info, node):
 
 def _is_heavy_for_proactive(dag_info, node):
     return _node_transfer_mb(dag_info, node) > PROACTIVE_MAX_MIGRATABLE_MB
+
+
+def _is_lightweight_entry_rescue(dag_info, node, cf_ctx):
+    return (
+        node in cf_ctx["entry_nodes"]
+        and _node_transfer_mb(dag_info, node) <= PROACTIVE_MAX_MIGRATABLE_MB
+        and _node_state_mb(dag_info, node) <= 0.0
+    )
 
 
 class GraphEncoder(nn.Module):
@@ -531,6 +542,7 @@ def _score_counterfactual_action(
         "split_cost_ms": float(split_cost_ms),
         "non_entry_distance_only": bool(non_entry_distance_only),
         "is_heavy_proactive": bool(_is_heavy_for_proactive(dag_info, node)),
+        "is_lightweight_entry_rescue": bool(_is_lightweight_entry_rescue(dag_info, node, cf_ctx)),
     }
 
 
@@ -596,15 +608,21 @@ def _apply_proactive_distance_bias(
             score_sum += scored["score"]
             if scored["sla_gain_ms"] > 0.0:
                 sla_improving_count += 1
+            lightweight_rescue = (
+                scored["is_lightweight_entry_rescue"]
+                and scored["sla_gain_ms"] > 0.0
+                and scored["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
+            )
             if scored["is_heavy_proactive"]:
                 cost_guard_blocked_count += 1
                 continue
             if scored["non_entry_distance_only"] and scored["score"] <= CF_SCORE_EPS:
                 non_entry_distance_only_blocked_count += 1
-            if scored["score"] <= CF_SCORE_EPS:
+            if scored["score"] <= CF_SCORE_EPS and not lightweight_rescue:
                 cost_guard_blocked_count += 1
                 continue
-            bias = min(max_bias, bias_scale * scored["score"])
+            bias_source = max(scored["score"], LIGHTWEIGHT_ENTRY_MIN_BIAS) if lightweight_rescue else scored["score"]
+            bias = min(max_bias, bias_scale * bias_source)
             biased_logits[node_idx, action] = biased_logits[node_idx, action] + float(bias)
             positive_bias_count += 1
             if scored["score"] > best_score:
@@ -613,6 +631,72 @@ def _apply_proactive_distance_bias(
         best_action_counts[str(best_action)] += 1
 
     return biased_logits, positive_bias_count, dict(best_action_counts), {
+        "counterfactual_score_sum": float(score_sum),
+        "sla_improving_action_count": int(sla_improving_count),
+        "cost_guard_blocked_count": int(cost_guard_blocked_count),
+        "non_entry_distance_only_blocked_count": int(non_entry_distance_only_blocked_count),
+    }
+
+
+def _apply_proactive_size_guard(
+    actions,
+    sorted_nodes,
+    assignments,
+    candidates,
+    user_lat,
+    user_lon,
+    servers_info,
+    dag_info,
+    predicted_locations,
+    lambda_migration,
+    lambda_split,
+):
+    """Block expensive proactive migrations selected by the actor itself."""
+    guarded_actions = list(actions)
+    clipped = 0
+    score_sum = 0.0
+    sla_improving_count = 0
+    cost_guard_blocked_count = 0
+    non_entry_distance_only_blocked_count = 0
+    cf_ctx = _build_counterfactual_context(
+        dag_info,
+        assignments,
+        candidates,
+        user_lat,
+        user_lon,
+        servers_info,
+        predicted_locations=predicted_locations,
+        trigger_type=TRIGGER_PROACTIVE,
+    )
+    for idx, (node, action) in enumerate(zip(sorted_nodes, actions)):
+        if is_external_node(node) or int(action) == 0:
+            continue
+        item = _score_counterfactual_action(
+            dag_info,
+            node,
+            action,
+            assignments,
+            candidates,
+            servers_info,
+            cf_ctx,
+            lambda_migration,
+            lambda_split,
+        )
+        if item is None:
+            continue
+        score_sum += item["score"]
+        if item["sla_gain_ms"] > 0.0:
+            sla_improving_count += 1
+        if item["non_entry_distance_only"] and item["score"] <= CF_SCORE_EPS:
+            non_entry_distance_only_blocked_count += 1
+        if (
+            item["is_heavy_proactive"]
+            and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
+        ):
+            guarded_actions[idx] = 0
+            clipped += 1
+            cost_guard_blocked_count += 1
+    return guarded_actions, clipped, {
         "counterfactual_score_sum": float(score_sum),
         "sla_improving_action_count": int(sla_improving_count),
         "cost_guard_blocked_count": int(cost_guard_blocked_count),
@@ -682,6 +766,11 @@ def _clip_reactive_actions(
         if item["non_entry_distance_only"] and item["score"] <= CF_SCORE_EPS:
             non_entry_distance_only_blocked_count += 1
         is_sla_entry_action = item["sla_gain_ms"] > 0.0
+        lightweight_rescue = (
+            item["is_lightweight_entry_rescue"]
+            and item["sla_gain_ms"] > 0.0
+            and item["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
+        )
         heavy_blocked = (
             size_guard_enabled
             and item["is_heavy_proactive"]
@@ -692,7 +781,7 @@ def _clip_reactive_actions(
             continue
         if item["score"] > CF_SCORE_EPS or (
             is_sla_entry_action and item["score"] > CF_SLA_ENTRY_SCORE_FLOOR
-        ):
+        ) or lightweight_rescue:
             scored.append((item["score"], idx))
         else:
             cost_guard_blocked_count += 1
@@ -741,9 +830,15 @@ def _clip_reactive_actions(
                     and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
                 ):
                     continue
+                lightweight_rescue = (
+                    item["is_lightweight_entry_rescue"]
+                    and item["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
+                )
+                if item["score"] <= CF_SLA_ENTRY_SCORE_FLOOR and not lightweight_rescue:
+                    continue
                 if best_entry is None or item["score"] > best_entry[0]:
                     best_entry = (item["score"], action_idx, action)
-            if best_entry is not None and best_entry[0] > CF_SLA_ENTRY_SCORE_FLOOR:
+            if best_entry is not None:
                 entry_candidates.append(best_entry)
 
         for score, action_idx, action in sorted(entry_candidates, reverse=True):
@@ -847,6 +942,9 @@ def run_marl_gat_microservice(
     total_violations = 0
     primary_entry_violations = 0
     max_entry_violations = 0
+    severe_sla_violations = 0
+    total_sla_excess_distance_km = 0.0
+    sla_excess_distance_history = []
     proactive_decisions = 0
     total_reward_sum = 0.0
     total_access_latency = 0.0
@@ -910,6 +1008,9 @@ def run_marl_gat_microservice(
             total_violations = 0
             primary_entry_violations = 0
             max_entry_violations = 0
+            severe_sla_violations = 0
+            total_sla_excess_distance_km = 0.0
+            sla_excess_distance_history = []
             proactive_decisions = 0
             total_reward_sum = 0.0
             total_access_latency = 0.0
@@ -1005,21 +1106,21 @@ def run_marl_gat_microservice(
                 gw_lat, gw_lon = servers_info[gateway_server]
                 gateway_dist = float(haversine_distance(current_lat, current_lon, gw_lat, gw_lon))
 
-                primary_violation = check_sla_violation(current_lat, current_lon, gw_lat, gw_lon)
-                entry_violations = []
-                for entry in entry_nodes:
-                    entry_server = taxi_dag_assignments[taxi_id][entry]
-                    entry_lat, entry_lon = servers_info[entry_server]
-                    entry_violations.append(
-                        check_sla_violation(current_lat, current_lon, entry_lat, entry_lon)
-                    )
-                max_entry_violation = any(entry_violations)
-                if primary_violation:
+                sla_metrics = calculate_entry_sla_metrics(
+                    entry_nodes,
+                    taxi_dag_assignments[taxi_id],
+                    current_lat,
+                    current_lon,
+                    servers_info,
+                )
+                if sla_metrics["primary_entry_violation"]:
                     primary_entry_violations += 1
-                if max_entry_violation:
+                if sla_metrics["max_entry_violation"]:
                     max_entry_violations += 1
-                if max_entry_violation:
                     total_violations += 1
+                severe_sla_violations += sla_metrics["severe_sla_violation"]
+                total_sla_excess_distance_km += sla_metrics["sla_excess_distance_km"]
+                sla_excess_distance_history.append(sla_metrics["sla_excess_distance_km"])
 
                 predicted_locations = None
                 if use_proactive:
@@ -1121,7 +1222,26 @@ def run_marl_gat_microservice(
                             action = int(torch.argmax(probs[node_idx]).item())
                         actions.append(action)
 
-                    if trigger_type != TRIGGER_PROACTIVE:
+                    if use_proactive and trigger_type == TRIGGER_PROACTIVE:
+                        actions, clipped_count, cf_info = _apply_proactive_size_guard(
+                            actions,
+                            sorted_nodes,
+                            taxi_dag_assignments[taxi_id],
+                            candidates,
+                            current_lat,
+                            current_lon,
+                            servers_info,
+                            dag_info,
+                            predicted_locations,
+                            lm,
+                            ls,
+                        )
+                        reactive_action_clipped_count += clipped_count
+                        counterfactual_score_sum += cf_info["counterfactual_score_sum"]
+                        sla_improving_action_count += cf_info["sla_improving_action_count"]
+                        cost_guard_blocked_count += cf_info["cost_guard_blocked_count"]
+                        non_entry_distance_only_blocked_count += cf_info["non_entry_distance_only_blocked_count"]
+                    elif trigger_type != TRIGGER_PROACTIVE:
                         actions, clipped_count, cf_info = _clip_reactive_actions(
                             actions,
                             sorted_nodes,
@@ -1278,11 +1398,20 @@ def run_marl_gat_microservice(
         controlled_all_agents_migrated_decisions / decision_count if decision_count > 0 else 0.0
     )
     stay_action_ratio = stay_action_count / agent_decision_count if agent_decision_count > 0 else 0.0
+    sorted_excess = sorted(sla_excess_distance_history)
+    p95_idx = int(0.95 * (len(sorted_excess) - 1)) if sorted_excess else 0
     return {
         "total_migrations": total_migrations,
         "total_violations": total_violations,
         "primary_entry_violations": primary_entry_violations,
         "max_entry_violations": max_entry_violations,
+        "severe_sla_violations": severe_sla_violations,
+        "total_sla_excess_distance_km": total_sla_excess_distance_km,
+        "avg_sla_excess_distance_km": (
+            total_sla_excess_distance_km / len(sla_excess_distance_history)
+            if sla_excess_distance_history else 0.0
+        ),
+        "p95_sla_excess_distance_km": sorted_excess[p95_idx] if sorted_excess else 0.0,
         "proactive_decisions": proactive_decisions,
         "decision_count": decision_count,
         "total_reward": total_reward_sum,

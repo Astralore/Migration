@@ -30,6 +30,7 @@ FUTURE_DECAY = 0.9
 FUTURE_DIST_THRESHOLD = 15.0
 SLA_BASE_PENALTY_MS = 2000.0
 SLA_PENALTY_PER_KM_MS = 500.0
+SEVERE_SLA_EXCESS_KM = 5.0
 # Backward-compatible reference scale.  Actual SLA cost is now linear excess.
 SLA_PENALTY_MS = SLA_BASE_PENALTY_MS + SLA_PENALTY_PER_KM_MS * 10.0
 # C2：用 log 压缩真实物理代价，避免 -10 硬截断让严重违规/昂贵迁移不可区分。
@@ -114,6 +115,40 @@ def calculate_sla_penalty_ms(max_entry_dist_km, access_latency_ms=0.0):
     # QoS-only excess is converted back to an equivalent propagation distance.
     equivalent_excess_km = distance_excess_km + qos_excess_ms * FIBER_SPEED_KM_MS
     return float(SLA_BASE_PENALTY_MS + equivalent_excess_km * SLA_PENALTY_PER_KM_MS)
+
+
+def calculate_entry_sla_metrics(entry_nodes, assignments, user_lat, user_lon, servers_info):
+    """Return max-entry SLA risk and excess-distance diagnostics for a placement."""
+    if not entry_nodes:
+        return {
+            "primary_entry_violation": 0,
+            "max_entry_violation": 0,
+            "max_entry_distance_km": 0.0,
+            "sla_excess_distance_km": 0.0,
+            "severe_sla_violation": 0,
+        }
+
+    distances = []
+    violations = []
+    for node in entry_nodes:
+        srv_lat, srv_lon = servers_info[assignments[node]]
+        dist = float(haversine_distance(user_lat, user_lon, srv_lat, srv_lon))
+        distances.append(dist)
+        violations.append(
+            bool(
+                dist > SLA_DISTANCE_THRESHOLD
+                or calc_access_latency_ms(dist) > USER_SLA_TOLERANCE_MS
+            )
+        )
+    max_dist = max(distances) if distances else 0.0
+    excess = max(0.0, max_dist - SLA_DISTANCE_THRESHOLD)
+    return {
+        "primary_entry_violation": int(violations[0]) if violations else 0,
+        "max_entry_violation": int(any(violations)),
+        "max_entry_distance_km": float(max_dist),
+        "sla_excess_distance_km": float(excess),
+        "severe_sla_violation": int(excess > SEVERE_SLA_EXCESS_KM),
+    }
 
 
 def calculate_microservice_reward(
@@ -296,6 +331,8 @@ def calculate_microservice_reward(
         "trigger_type": trigger_type,
         "sla_penalty_ms": sla_penalty_ms,
         "access_latency_ms": access_latency_ms,
+        "max_entry_distance_km": max_entry_dist_km,
+        "sla_excess_distance_km": max(0.0, max_entry_dist_km - SLA_DISTANCE_THRESHOLD),
         "total_cost_ms": total_cost_ms,
         "tearing_penalty_ms": tearing_delay_ms,
         "future_penalty_ms": future_delay_ms,
