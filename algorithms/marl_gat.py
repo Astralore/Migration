@@ -73,7 +73,8 @@ CF_SLA_ENTRY_SCORE_FLOOR = -0.2
 PROACTIVE_MAX_MIGRATABLE_MB = 100.0
 STATEFUL_FUTURE_GAIN_DISCOUNT = 0.1
 PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS = 20000.0
-LIGHTWEIGHT_ENTRY_SCORE_FLOOR = -1.0
+LIGHTWEIGHT_ENTRY_SCORE_FLOOR = -0.5  # 收紧：从 -1.0 改为 -0.5
+LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS = 1000.0  # 新增：最小 SLA 增益要求
 LIGHTWEIGHT_ENTRY_MIN_BIAS = 0.2
 
 
@@ -610,7 +611,7 @@ def _apply_proactive_distance_bias(
                 sla_improving_count += 1
             lightweight_rescue = (
                 scored["is_lightweight_entry_rescue"]
-                and scored["sla_gain_ms"] > 0.0
+                and scored["sla_gain_ms"] >= LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS
                 and scored["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
             )
             if scored["is_heavy_proactive"]:
@@ -768,7 +769,7 @@ def _clip_reactive_actions(
         is_sla_entry_action = item["sla_gain_ms"] > 0.0
         lightweight_rescue = (
             item["is_lightweight_entry_rescue"]
-            and item["sla_gain_ms"] > 0.0
+            and item["sla_gain_ms"] >= LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS
             and item["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
         )
         heavy_blocked = (
@@ -832,6 +833,7 @@ def _clip_reactive_actions(
                     continue
                 lightweight_rescue = (
                     item["is_lightweight_entry_rescue"]
+                    and item["sla_gain_ms"] >= LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS
                     and item["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
                 )
                 if item["score"] <= CF_SLA_ENTRY_SCORE_FLOOR and not lightweight_rescue:
