@@ -15,6 +15,7 @@ from core.reward import (
     REACTIVE_MIGRATION_MULT,
     RPC_SIZE_MB,
     SLA_DISTANCE_THRESHOLD,
+    calculate_nonlinear_migration_cost_ms,
     calculate_microservice_reward,
 )
 from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
@@ -87,10 +88,16 @@ def _local_migration_costs(dag_info, current_assignments, previous_assignments,
         target_server = current_assignments[node]
         target_concurrency = max(1, int(migrating_targets.get(target_server, 1)))
         node_bandwidth = max(bandwidth / target_concurrency, 1e-6)
-        cost_ms = ((mb * MB_TO_MBIT / node_bandwidth) * 1000.0) + BASE_MIGRATION_OVERHEAD_MS
+        raw_cost_ms = ((mb * MB_TO_MBIT / node_bandwidth) * 1000.0) + BASE_MIGRATION_OVERHEAD_MS
         if trigger_type == TRIGGER_REACTIVE:
-            cost_ms *= REACTIVE_MIGRATION_MULT
-        costs[node] = float(cost_ms)
+            raw_cost_ms *= REACTIVE_MIGRATION_MULT
+        costs[node] = float(
+            calculate_nonlinear_migration_cost_ms(
+                raw_cost_ms,
+                props.get("image_mb", 0.0),
+                props.get("state_mb", 0.0),
+            )
+        )
     return costs
 
 
@@ -285,7 +292,7 @@ def calculate_marl_rewards(
     lambda_migration=0.0,
     lambda_split=0.0,
     local_cost_scale_ms=1000.0,
-    dense_distance_bonus=True,
+    dense_distance_bonus=False,
 ):
     """
     Return shared DAG reward plus per-agent rewards and decomposition details.
@@ -321,8 +328,9 @@ def calculate_marl_rewards(
         previous_assignments,
         servers_info,
     )
-    distance_bonuses = (
-        _dense_distance_bonuses(
+    distance_bonuses = {node: 0.0 for node in dag_info["nodes"]}
+    if dense_distance_bonus:
+        distance_bonuses = _dense_distance_bonuses(
             dag_info,
             current_assignments,
             previous_assignments,
@@ -330,15 +338,9 @@ def calculate_marl_rewards(
             servers_info,
             trigger_type,
         )
-        if dense_distance_bonus else {node: 0.0 for node in dag_info["nodes"]}
-    )
-    entry_sla_bonuses = _entry_sla_bonuses(
-        dag_info,
-        current_assignments,
-        previous_assignments,
-        user_location,
-        servers_info,
-    )
+    # Entry/SLA preference is now represented by the shared SLA penalty rather
+    # than a hand-written local bonus.
+    entry_sla_bonuses = {node: 0.0 for node in dag_info["nodes"]}
 
     agent_rewards = {}
     for node in dag_info["nodes"]:
@@ -347,7 +349,6 @@ def calculate_marl_rewards(
             continue
         local_penalty = (
             lambda_migration * (migration_costs[node] / local_cost_scale_ms)
-            + lambda_split * (split_costs[node] / local_cost_scale_ms)
         )
         agent_rewards[node] = float(
             shared_reward

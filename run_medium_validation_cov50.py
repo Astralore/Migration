@@ -34,7 +34,8 @@ PROCESSED_TAXI_PATH = os.path.join(
     "processed",
     "taxi_cleaned_active100_min100_eps2h_cov50.csv",
 )
-ACTIVE_USERS = 12
+ACTIVE_USERS = int(os.environ.get("MEDIUM_VALIDATION_ACTIVE_USERS", "12"))
+TEST_TAXI_RATIO = float(os.environ.get("MEDIUM_VALIDATION_TEST_TAXI_RATIO", "0.2"))
 SPLIT_SEED = 42
 MARL_EPOCHS = int(os.environ.get("MEDIUM_VALIDATION_MARL_EPOCHS", "8"))
 FORECAST_HORIZON = 15
@@ -184,7 +185,8 @@ def _taxi_exposure_stats(df, servers_df):
 def _split_by_balanced_exposure(df, servers_df):
     stats = _taxi_exposure_stats(df, servers_df)
     ids = list(stats["taxi_id"])
-    n_test = max(1, len(ids) - max(1, int(np.floor(0.8 * len(ids)))))
+    test_ratio = min(max(TEST_TAXI_RATIO, 0.05), 0.8)
+    n_test = max(1, int(np.ceil(test_ratio * len(ids))))
     target = n_test / len(ids)
     total_rows = float(stats["rows"].sum())
     total_risk = float(stats["risk_score"].sum())
@@ -382,6 +384,7 @@ def main():
         payload = {
             "config": {
                 "active_users": ACTIVE_USERS,
+                "test_taxi_ratio": TEST_TAXI_RATIO,
                 "split_seed": SPLIT_SEED,
                 "marl_epochs": MARL_EPOCHS,
                 "forecast_horizon": FORECAST_HORIZON,

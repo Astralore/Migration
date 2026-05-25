@@ -55,6 +55,7 @@ from core.reward import (
     SLA_PENALTY_PER_KM_MS,
     build_servers_info,
     calculate_entry_sla_metrics,
+    calculate_nonlinear_migration_cost_ms,
     calculate_sla_penalty_ms,
     estimate_dag_migration_time_s,
 )
@@ -74,8 +75,12 @@ PROACTIVE_MAX_MIGRATABLE_MB = 100.0
 STATEFUL_FUTURE_GAIN_DISCOUNT = 0.1
 PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS = 20000.0
 LIGHTWEIGHT_ENTRY_SCORE_FLOOR = -1.0
-LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS = 500.0
+LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS = 1000.0
 LIGHTWEIGHT_ENTRY_MIN_BIAS = 0.2
+PROACTIVE_MIGRATION_BUDGET_MS = 8000.0
+MIN_SLA_GAIN_COST_RATIO = 0.15
+HIGH_COST_MIGRATION_MS = 5000.0
+HIGH_COST_MIN_SLA_GAIN_MS = 3000.0
 
 
 def _node_transfer_mb(dag_info, node):
@@ -94,7 +99,6 @@ def _is_heavy_for_proactive(dag_info, node):
 def _is_lightweight_entry_rescue(dag_info, node, cf_ctx):
     return (
         node in cf_ctx["entry_nodes"]
-        and _node_transfer_mb(dag_info, node) <= PROACTIVE_MAX_MIGRATABLE_MB
         and _node_state_mb(dag_info, node) <= 0.0
     )
 
@@ -441,6 +445,12 @@ def _score_counterfactual_action(
         return None
 
     migration_cost_ms = cf_ctx["migration_costs"].get(node, 0.0)
+    node_props = dag_info["nodes"].get(node, {})
+    nonlinear_migration_cost_ms = calculate_nonlinear_migration_cost_ms(
+        migration_cost_ms,
+        node_props.get("image_mb", 0.0),
+        node_props.get("state_mb", 0.0),
+    )
 
     split_key = (node, int(action))
     if split_key in cf_ctx["split_delta_cache"]:
@@ -527,19 +537,19 @@ def _score_counterfactual_action(
         if target_dist is not None and target_dist < current_dist:
             non_entry_distance_only = True
 
+    effective_sla_gain_ms = sla_gain_ms + 0.5 * future_gain_ms
     score = (
-        sla_gain_ms * CF_SLA_WEIGHT
-        + future_gain_ms * CF_FUTURE_WEIGHT
-        + topology_gain_ms * CF_TOPOLOGY_WEIGHT
-        - (migration_cost_ms / CF_COST_SCALE_MS) * float(lambda_migration)
-        - (split_cost_ms / CF_COST_SCALE_MS) * float(lambda_split)
+        effective_sla_gain_ms * CF_SLA_WEIGHT
+        - (nonlinear_migration_cost_ms / CF_COST_SCALE_MS) * float(lambda_migration)
     )
     return {
         "score": float(score),
         "sla_gain_ms": float(sla_gain_ms),
+        "effective_sla_gain_ms": float(effective_sla_gain_ms),
         "future_gain_ms": float(future_gain_ms),
         "topology_gain_ms": float(topology_gain_ms),
         "migration_cost_ms": float(migration_cost_ms),
+        "nonlinear_migration_cost_ms": float(nonlinear_migration_cost_ms),
         "split_cost_ms": float(split_cost_ms),
         "non_entry_distance_only": bool(non_entry_distance_only),
         "is_heavy_proactive": bool(_is_heavy_for_proactive(dag_info, node)),
@@ -562,8 +572,8 @@ def _apply_proactive_distance_bias(
     lambda_migration,
     lambda_split,
     *,
-    bias_scale=0.45,
-    max_bias=0.6,
+    bias_scale=0.30,
+    max_bias=0.4,
 ):
     """Add a light logit prior for actions with positive counterfactual value."""
     biased_logits = masked_logits.clone()
@@ -614,9 +624,6 @@ def _apply_proactive_distance_bias(
                 and scored["sla_gain_ms"] >= LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS
                 and scored["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
             )
-            if scored["is_heavy_proactive"]:
-                cost_guard_blocked_count += 1
-                continue
             if scored["non_entry_distance_only"] and scored["score"] <= CF_SCORE_EPS:
                 non_entry_distance_only_blocked_count += 1
             if scored["score"] <= CF_SCORE_EPS and not lightweight_rescue:
@@ -652,13 +659,14 @@ def _apply_proactive_size_guard(
     lambda_migration,
     lambda_split,
 ):
-    """Block expensive proactive migrations selected by the actor itself."""
+    """Apply proactive migration budget and cost-benefit filtering."""
     guarded_actions = list(actions)
     clipped = 0
     score_sum = 0.0
     sla_improving_count = 0
     cost_guard_blocked_count = 0
     non_entry_distance_only_blocked_count = 0
+    accepted = []
     cf_ctx = _build_counterfactual_context(
         dag_info,
         assignments,
@@ -690,10 +698,36 @@ def _apply_proactive_size_guard(
             sla_improving_count += 1
         if item["non_entry_distance_only"] and item["score"] <= CF_SCORE_EPS:
             non_entry_distance_only_blocked_count += 1
+        migration_cost = max(float(item.get("nonlinear_migration_cost_ms", 0.0)), 1e-6)
+        gain_cost_ratio = float(item.get("effective_sla_gain_ms", 0.0)) / migration_cost
+        high_cost_low_gain = (
+            item["nonlinear_migration_cost_ms"] > HIGH_COST_MIGRATION_MS
+            and item["effective_sla_gain_ms"] < HIGH_COST_MIN_SLA_GAIN_MS
+        )
+        low_value_migration = (
+            gain_cost_ratio < MIN_SLA_GAIN_COST_RATIO
+            and item["effective_sla_gain_ms"] < HIGH_COST_MIN_SLA_GAIN_MS
+        )
         if (
-            item["is_heavy_proactive"]
-            and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
+            item["score"] <= CF_SCORE_EPS
+            or item["sla_gain_ms"] <= 0.0
+            or high_cost_low_gain
+            or low_value_migration
         ):
+            guarded_actions[idx] = 0
+            clipped += 1
+            cost_guard_blocked_count += 1
+            continue
+        accepted.append((item["score"], idx, migration_cost))
+    keep_indices = set()
+    used_budget_ms = 0.0
+    for _, idx, migration_cost in sorted(accepted, reverse=True):
+        if used_budget_ms + migration_cost > PROACTIVE_MIGRATION_BUDGET_MS:
+            continue
+        keep_indices.add(idx)
+        used_budget_ms += migration_cost
+    for idx, action in enumerate(list(guarded_actions)):
+        if int(action) != 0 and idx not in keep_indices:
             guarded_actions[idx] = 0
             clipped += 1
             cost_guard_blocked_count += 1
@@ -772,14 +806,6 @@ def _clip_reactive_actions(
             and item["sla_gain_ms"] >= LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS
             and item["score"] > LIGHTWEIGHT_ENTRY_SCORE_FLOOR
         )
-        heavy_blocked = (
-            size_guard_enabled
-            and item["is_heavy_proactive"]
-            and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
-        )
-        if heavy_blocked:
-            cost_guard_blocked_count += 1
-            continue
         if item["score"] > CF_SCORE_EPS or (
             is_sla_entry_action and item["score"] > CF_SLA_ENTRY_SCORE_FLOOR
         ) or lightweight_rescue:
@@ -824,12 +850,6 @@ def _clip_reactive_actions(
                     lambda_split,
                 )
                 if item is None or item["sla_gain_ms"] <= 0.0:
-                    continue
-                if (
-                    size_guard_enabled
-                    and item["is_heavy_proactive"]
-                    and item["sla_gain_ms"] < PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS
-                ):
                     continue
                 lightweight_rescue = (
                     item["is_lightweight_entry_rescue"]
@@ -903,7 +923,7 @@ def run_marl_gat_microservice(
     if max_lambda_migration is None:
         # Linear SLA penalty lowers benefit scale, so Proactive needs a stronger
         # cost exchange rate to avoid expensive early migrations.
-        max_lambda_migration = 0.12 if use_proactive else 0.3
+        max_lambda_migration = 0.40 if use_proactive else 0.3
     if max_lambda_split is None:
         max_lambda_split = 0.04 if use_proactive else 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

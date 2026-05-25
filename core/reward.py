@@ -30,13 +30,20 @@ FUTURE_DECAY = 0.9
 FUTURE_DIST_THRESHOLD = 15.0
 SLA_BASE_PENALTY_MS = 2000.0
 SLA_PENALTY_PER_KM_MS = 500.0
+SLA_QUADRATIC_PENALTY_PER_KM2_MS = 80.0
 SEVERE_SLA_EXCESS_KM = 5.0
 # Backward-compatible reference scale.  Actual SLA cost is now linear excess.
 SLA_PENALTY_MS = SLA_BASE_PENALTY_MS + SLA_PENALTY_PER_KM_MS * 10.0
 # C2：用 log 压缩真实物理代价，避免 -10 硬截断让严重违规/昂贵迁移不可区分。
 REWARD_COST_SCALE_MS = 1000.0
-REWARD_RECOVERY_BONUS_MAX = 3.0
-REWARD_DISTANCE_BONUS_WEIGHT = 2.0
+CORE_MIGRATION_REWARD_WEIGHT = 0.5
+MIGRATION_SIZE_REF_MB = 100.0
+MIGRATION_SIZE_ALPHA = 0.75
+MIGRATION_SIZE_POWER = 3.0
+MIGRATION_STATE_ALPHA = 0.5
+NONLINEAR_MIGRATION_COST_CLIP_MS = 300000.0
+REWARD_RECOVERY_BONUS_MAX = 0.0
+REWARD_DISTANCE_BONUS_WEIGHT = 0.0
 # Backward-compatible export; reward no longer hard-clips to this value.
 REWARD_CLIP_MIN = -float("inf")
 MB_TO_MBIT = 8.0
@@ -107,14 +114,40 @@ def estimate_dag_migration_time_s(
 
 
 def calculate_sla_penalty_ms(max_entry_dist_km, access_latency_ms=0.0):
-    """Linear-excess SLA penalty: base violation cost plus distance/QoS excess."""
+    """Severity-aware SLA penalty: base cost plus linear and quadratic excess."""
     distance_excess_km = max(0.0, float(max_entry_dist_km) - SLA_DISTANCE_THRESHOLD)
     qos_excess_ms = max(0.0, float(access_latency_ms) - USER_SLA_TOLERANCE_MS)
     if distance_excess_km <= 0.0 and qos_excess_ms <= 0.0:
         return 0.0
     # QoS-only excess is converted back to an equivalent propagation distance.
     equivalent_excess_km = distance_excess_km + qos_excess_ms * FIBER_SPEED_KM_MS
-    return float(SLA_BASE_PENALTY_MS + equivalent_excess_km * SLA_PENALTY_PER_KM_MS)
+    return float(
+        SLA_BASE_PENALTY_MS
+        + equivalent_excess_km * SLA_PENALTY_PER_KM_MS
+        + (equivalent_excess_km ** 2) * SLA_QUADRATIC_PENALTY_PER_KM2_MS
+    )
+
+
+def migration_size_state_multiplier(image_mb, state_mb):
+    """Continuous size/state penalty that replaces hard heavyweight guards."""
+    transfer_mb = max(0.0, float(image_mb) + float(state_mb))
+    state_mb = max(0.0, float(state_mb))
+    size_ratio = transfer_mb / max(MIGRATION_SIZE_REF_MB, 1e-6)
+    state_ratio = state_mb / max(MIGRATION_SIZE_REF_MB, 1e-6)
+    return float(
+        1.0
+        + MIGRATION_SIZE_ALPHA * (size_ratio ** MIGRATION_SIZE_POWER)
+        + MIGRATION_STATE_ALPHA * np.log1p(state_ratio)
+    )
+
+
+def calculate_nonlinear_migration_cost_ms(raw_migration_ms, image_mb, state_mb):
+    """Apply a smooth nonlinear cost to heavy/stateful migrations."""
+    nonlinear_cost = (
+        max(0.0, float(raw_migration_ms))
+        * migration_size_state_multiplier(image_mb, state_mb)
+    )
+    return float(min(nonlinear_cost, NONLINEAR_MIGRATION_COST_CLIP_MS))
 
 
 def calculate_entry_sla_metrics(entry_nodes, assignments, user_lat, user_lon, servers_info):
@@ -195,6 +228,7 @@ def calculate_microservice_reward(
             migrating_targets[target] = migrating_targets.get(target, 0) + 1
 
     migration_delay_ms = 0.0
+    nonlinear_migration_cost_ms = 0.0
     for node in get_deployable_nodes(dag_info):
         node_props = dag_info["nodes"][node]
         if current_assignments[node] != previous_assignments[node]:
@@ -211,6 +245,11 @@ def calculate_microservice_reward(
             if trigger_type == TRIGGER_REACTIVE:
                 delta_ms *= REACTIVE_MIGRATION_MULT
             migration_delay_ms += delta_ms
+            nonlinear_migration_cost_ms += calculate_nonlinear_migration_cost_ms(
+                delta_ms,
+                image_mb,
+                state_mb,
+            )
 
     max_traffic = max(dag_info["edges"].values()) if dag_info["edges"] else 0.0
     tearing_delay_ms = 0.0
@@ -280,6 +319,10 @@ def calculate_microservice_reward(
         + future_delay_ms
         + sla_penalty_ms
     )
+    reward_objective_ms = (
+        sla_penalty_ms
+        + CORE_MIGRATION_REWARD_WEIGHT * nonlinear_migration_cost_ms
+    )
 
     prev_violation = (
         prev_max_entry_dist_km > SLA_DISTANCE_THRESHOLD
@@ -294,7 +337,7 @@ def calculate_microservice_reward(
     recovery_bonus = 1.0 if resolved_violation else 0.0
     reward_bonus = min(distance_bonus + recovery_bonus, REWARD_RECOVERY_BONUS_MAX)
 
-    reward = -float(np.log1p(max(total_cost_ms, 0.0) / REWARD_COST_SCALE_MS)) + reward_bonus
+    reward = -float(np.log1p(max(reward_objective_ms, 0.0) / REWARD_COST_SCALE_MS)) + reward_bonus
 
     global _reward_dbg_remaining
     if _reward_dbg_remaining > 0:
@@ -304,10 +347,14 @@ def calculate_microservice_reward(
             total_cost_ms,
             " migration_delay_ms=",
             migration_delay_ms,
+            " nonlinear_migration_cost_ms=",
+            nonlinear_migration_cost_ms,
             " tearing_delay_ms=",
             tearing_delay_ms,
             " sla_penalty_ms=",
             sla_penalty_ms,
+            " reward_objective_ms=",
+            reward_objective_ms,
             " access_latency_ms=",
             access_latency_ms,
             " reward=",
@@ -321,12 +368,14 @@ def calculate_microservice_reward(
         "access_latency": access_latency_ms,
         "communication_cost": comm_delay_ms,
         "migration_cost": migration_delay_ms,
+        "nonlinear_migration_cost_ms": nonlinear_migration_cost_ms,
         "future_penalty": future_delay_ms,
         "tearing_penalty": tearing_delay_ms,
         "sla_violations": sla_violations,
         "risk_ratio": risk_ratio,
         "state_divisor": effective_bandwidth,
         "total_cost": total_cost_ms,
+        "reward_objective_ms": reward_objective_ms,
         "reward": reward,
         "trigger_type": trigger_type,
         "sla_penalty_ms": sla_penalty_ms,
