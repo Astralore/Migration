@@ -3,7 +3,7 @@ Reward v2.1 medium-scale validation (D0+D1+D1.5+D2), reactive-only, S=100000.
 
 - REWARD_SCHEME=v2.1 (v2 + internal path + clip + log-RPC features)
 - No proactive / no trajectory predictor (REACTIVE_ONLY)
-- Soft guard + 2 MARL epochs
+- v2 soft guard (hard cost-guard bypass) + 2 MARL epochs
 
 Launch:
   python -u run_reward_v21_medium_test_cov50.py
@@ -21,7 +21,7 @@ os.environ["PROACTIVE_MIGRATION_BUDGET_MS"] = "6000"
 os.environ["MEDIUM_VALIDATION_MARL_EPOCHS"] = os.environ.get(
     "MEDIUM_VALIDATION_MARL_EPOCHS", "2"
 )
-os.environ["MEDIUM_VALIDATION_STAMP"] = "20260527_reward_v21_reactive_s100k_v1"
+os.environ["MEDIUM_VALIDATION_STAMP"] = "20260527_reward_v21_softguard_s100k_v1"
 os.environ.pop("MEDIUM_VALIDATION_QUIET", None)
 os.environ.pop("TQDM_DISABLE", None)
 os.environ.pop("MEDIUM_VALIDATION_INFERENCE_ONLY", None)

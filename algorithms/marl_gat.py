@@ -127,6 +127,21 @@ def _reactive_migration_cap(controlled_count, violating_entry_count):
     )
 
 
+def _passthrough_guard_stats():
+    """Placeholder stats when v2 bypasses rule-based guards (soft reward only)."""
+    return {
+        "counterfactual_score_sum": 0.0,
+        "sla_improving_action_count": 0,
+        "cost_guard_blocked_count": 0,
+        "non_entry_distance_only_blocked_count": 0,
+    }
+
+
+def _bypass_rule_based_guards():
+    """Reward v2/v2.1: economic penalties in env reward replace hard action clipping."""
+    return is_reward_v2()
+
+
 def _node_transfer_mb(dag_info, node):
     props = dag_info["nodes"].get(node, {})
     return float(props.get("image_mb", 0.0)) + float(props.get("state_mb", 0.0))
@@ -654,6 +669,9 @@ def _apply_proactive_distance_bias(
     max_bias=0.25,
 ):
     """Add a light logit prior for actions with positive counterfactual value."""
+    if _bypass_rule_based_guards():
+        return masked_logits, 0, {"0": len(sorted_nodes)}, _passthrough_guard_stats()
+
     biased_logits = masked_logits.clone()
     positive_bias_count = 0
     best_action_counts = defaultdict(int)
@@ -738,6 +756,9 @@ def _apply_proactive_size_guard(
     lambda_split,
 ):
     """Apply proactive migration budget and cost-benefit filtering."""
+    if _bypass_rule_based_guards():
+        return list(actions), 0, _passthrough_guard_stats()
+
     guarded_actions = list(actions)
     clipped = 0
     score_sum = 0.0
@@ -838,6 +859,9 @@ def _clip_reactive_actions(
     size_guard_enabled=False,
 ):
     """Keep only reactive migrations with positive counterfactual value."""
+    if _bypass_rule_based_guards():
+        return list(actions), 0, _passthrough_guard_stats()
+
     controlled_count = sum(1 for node in sorted_nodes if not is_external_node(node))
     cf_ctx = _build_counterfactual_context(
         dag_info,
@@ -1008,7 +1032,12 @@ def run_marl_gat_microservice(
     if max_lambda_split is None:
         max_lambda_split = 0.04 if use_proactive else 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  Lambda: migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}")
+    guard_mode = "soft-reward (v2 bypass)" if _bypass_rule_based_guards() else "rule-based guards"
+    print(
+        f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  "
+        f"Lambda: migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}  |  "
+        f"Guards: {guard_mode}"
+    )
 
     hidden_dim = 64
     encoder = GraphEncoder(node_feat_dim=14, hidden_dim=hidden_dim, output_dim=hidden_dim).to(device)
