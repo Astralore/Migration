@@ -70,7 +70,9 @@ def run_nearest_microservice_fair(
     reward_history = []
     total_access_latency = 0.0
     total_communication_cost = 0.0
+    total_internal_path_ms = 0.0
     total_migration_cost = 0.0
+    migration_decision_count = 0
     total_cost_ms_sum = 0.0
     total_sla_penalty_ms = 0.0
     total_tearing_penalty_ms = 0.0
@@ -175,7 +177,10 @@ def run_nearest_microservice_fair(
             reward_history.append(reward)
             total_access_latency += details["access_latency"]
             total_communication_cost += details["communication_cost"]
+            total_internal_path_ms += float(details.get("internal_critical_path_ms", 0.0))
             total_migration_cost += details["migration_cost"]
+            if float(details.get("migration_cost") or 0.0) > 0.0:
+                migration_decision_count += 1
             total_cost_ms_sum += details["total_cost_ms"]
             total_sla_penalty_ms += details.get("sla_penalty_ms", 0.0)
             total_tearing_penalty_ms += details.get("tearing_penalty_ms", details.get("tearing_penalty", 0.0))
@@ -214,7 +219,9 @@ def run_nearest_microservice_fair(
         "total_reward": total_reward_sum,
         "total_access_latency": total_access_latency,
         "total_communication_cost": total_communication_cost,
+        "total_internal_path_ms": total_internal_path_ms,
         "total_migration_cost": total_migration_cost,
+        "migration_decision_count": migration_decision_count,
         "total_cost_ms_sum": total_cost_ms_sum,
         "total_sla_penalty_ms": total_sla_penalty_ms,
         "total_tearing_penalty_ms": total_tearing_penalty_ms,

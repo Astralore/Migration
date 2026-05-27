@@ -1,0 +1,409 @@
+{
+  "config": {
+    "source_experiment": "experiments\\medium_validation_20260526_phaseB_reward_align_v1",
+    "active_users": 12,
+    "split_seed": 42,
+    "proactive_max_migrations": 2,
+    "reactive_max_migrations": 2,
+    "proactive_migration_budget_ms": 6000.0,
+    "started_at": "2026-05-26T11:34:59.681941"
+  },
+  "data": {
+    "test_rows": 11548,
+    "test_taxis": 3,
+    "split": {
+      "method": "balanced_by_nearest_server_exposure",
+      "target_test_taxi_ratio": 0.25,
+      "test_row_ratio": 0.23385986229242609,
+      "test_risk_ratio": 0.13360916081578067,
+      "taxi_exposure": [
+        {
+          "taxi_id": 366,
+          "rows": 8571,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 2.047229815071814,
+          "nearest_p95": 2.1012775325798785
+        },
+        {
+          "taxi_id": 1059,
+          "rows": 8613,
+          "risk_score": 5182.0,
+          "nearest_over_15": 5177,
+          "nearest_10_to_15": 20,
+          "nearest_p50": 21.229302541403573,
+          "nearest_p95": 27.7556619956179
+        },
+        {
+          "taxi_id": 1359,
+          "rows": 2750,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 2.366835350382697,
+          "nearest_p95": 3.15894620078021
+        },
+        {
+          "taxi_id": 2780,
+          "rows": 2596,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 0.053191651796280104,
+          "nearest_p95": 0.8351089526051639
+        },
+        {
+          "taxi_id": 2832,
+          "rows": 2606,
+          "risk_score": 0.75,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 3,
+          "nearest_p50": 0.42686059452780967,
+          "nearest_p95": 1.6105370033554838
+        },
+        {
+          "taxi_id": 2862,
+          "rows": 3133,
+          "risk_score": 107.0,
+          "nearest_over_15": 106,
+          "nearest_10_to_15": 4,
+          "nearest_p50": 0.4061838918841765,
+          "nearest_p95": 2.7454035985086236
+        },
+        {
+          "taxi_id": 2881,
+          "rows": 2970,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 0.38080266911848537,
+          "nearest_p95": 1.5641548592457841
+        },
+        {
+          "taxi_id": 2894,
+          "rows": 4082,
+          "risk_score": 692.25,
+          "nearest_over_15": 690,
+          "nearest_10_to_15": 9,
+          "nearest_p50": 0.11030334614654198,
+          "nearest_p95": 23.368993377195476
+        },
+        {
+          "taxi_id": 3702,
+          "rows": 2861,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 2.4746395616810046,
+          "nearest_p95": 2.6169029787451175
+        },
+        {
+          "taxi_id": 3939,
+          "rows": 3971,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 0.3593578962934037,
+          "nearest_p95": 1.2167632460046522
+        },
+        {
+          "taxi_id": 3942,
+          "rows": 2894,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 0.3851736404584154,
+          "nearest_p95": 1.1329700631884005
+        },
+        {
+          "taxi_id": 3948,
+          "rows": 4333,
+          "risk_score": 0.0,
+          "nearest_over_15": 0,
+          "nearest_10_to_15": 0,
+          "nearest_p50": 0.4870063378499732,
+          "nearest_p95": 4.185732671765144
+        }
+      ]
+    }
+  },
+  "inference": {
+    "proactive": {
+      "GAT-MARL": {
+        "total_migrations": 80,
+        "total_violations": 5996,
+        "primary_entry_violations": 3827,
+        "max_entry_violations": 5996,
+        "severe_sla_violations": 928,
+        "total_sla_excess_distance_km": 12782.7254826235,
+        "avg_sla_excess_distance_km": 1.1072087901796015,
+        "p95_sla_excess_distance_km": 7.873628368246301,
+        "proactive_decisions": 147,
+        "decision_count": 3974,
+        "total_reward": -8992.591698258337,
+        "avg_decision_time_ms": 1.1100861851964239,
+        "total_cost_ms_sum": 68249849.48703091,
+        "total_sla_penalty_ms": 66245213.65547628,
+        "total_tearing_penalty_ms": 453090.9250000005,
+        "total_future_penalty_ms": 76.24293185763803,
+        "total_access_latency": 8269.59913872448,
+        "total_communication_cost": 15551.995898946598,
+        "total_migration_cost": 1527647.0685853078,
+        "migration_decision_count": 69,
+        "dag_proactive_migration_stats": {
+          "Data_Heavy_DAG_1": {
+            "proactive_decisions": 24,
+            "migrated_nodes": 0
+          },
+          "Compute_Heavy_DAG_2": {
+            "proactive_decisions": 40,
+            "migrated_nodes": 12
+          },
+          "FanOut_Broadcaster_2": {
+            "proactive_decisions": 83,
+            "migrated_nodes": 0
+          }
+        },
+        "avg_agents_per_decision": 5.673880221439356,
+        "controlled_agents_per_decision": 5.673880221439356,
+        "pinned_agents_per_decision": 0.0,
+        "avg_migrated_agents_per_decision": 0.020130850528434826,
+        "avg_controlled_migrated_agents_per_decision": 0.020130850528434826,
+        "controlled_migrations": 80,
+        "all_agents_migrated_decisions": 0,
+        "all_agents_migrated_ratio": 0.0,
+        "controlled_all_agents_migrated_decisions": 0,
+        "controlled_all_agents_migrated_ratio": 0.0,
+        "stay_action_ratio": 0.9964520134823488,
+        "candidate_action_counts": {
+          "0": 22468,
+          "1": 68,
+          "2": 0,
+          "3": 12
+        },
+        "joint_action_distribution": {
+          "0-0-0-0-0": 2588,
+          "0-1-0-0-0": 13,
+          "0-0-0-0-0-0-0": 1317,
+          "1-0-0-0-0-0-0": 22,
+          "0-3-0-0-0": 12,
+          "1-0-0-0-0": 11,
+          "1-1-0-0-0": 4,
+          "0-0-1-1-0": 7
+        },
+        "local_migration_cost_sum": 9398487.465104373,
+        "edge_split_cost_sum": 413.6441169656298,
+        "dense_distance_bonus_sum": 0.0,
+        "entry_sla_bonus_sum": 0.0,
+        "proactive_logit_bias_count": 56,
+        "proactive_best_bias_action_counts": {
+          "0": 882,
+          "1": 19,
+          "2": 0,
+          "3": 0
+        },
+        "reactive_action_clipped_count": 9481,
+        "counterfactual_score_sum": -325386.56269345694,
+        "entry_node_migration_count": 80,
+        "sla_improving_action_count": 6625,
+        "cost_guard_blocked_count": 12130,
+        "non_entry_distance_only_blocked_count": 3481,
+        "cost_by_dag_complexity": {
+          "medium": {
+            "decision_count": 3974,
+            "total_cost_ms_sum": 68249849.48703091,
+            "migrations": 80,
+            "avg_total_cost_ms": 17174.093982644918
+          }
+        },
+        "cost_by_dag_type": {
+          "Data_Heavy_DAG_1": {
+            "decision_count": 1634,
+            "total_cost_ms_sum": 50540195.40353315,
+            "migrations": 20,
+            "controlled_migrations": 20,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 30930.352144145138,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Compute_Heavy_DAG_2": {
+            "decision_count": 1001,
+            "total_cost_ms_sum": 11084890.367989898,
+            "migrations": 38,
+            "controlled_migrations": 38,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 11073.81655143846,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "FanOut_Broadcaster_2": {
+            "decision_count": 1339,
+            "total_cost_ms_sum": 6624763.715507941,
+            "migrations": 22,
+            "controlled_migrations": 22,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 4947.545717332294,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          }
+        },
+        "migrations_by_dag_type": {
+          "Data_Heavy_DAG_1": 20,
+          "Compute_Heavy_DAG_2": 38,
+          "FanOut_Broadcaster_2": 22
+        },
+        "controlled_migrations_by_dag_type": {
+          "Data_Heavy_DAG_1": 20,
+          "Compute_Heavy_DAG_2": 38,
+          "FanOut_Broadcaster_2": 22
+        },
+        "invalid_action_masked_count": 2275,
+        "action_mask_fallback_count": 0,
+        "lambda_migration": 0.5,
+        "lambda_split": 0.04,
+        "avg_total_cost_ms": 17174.093982644918
+      }
+    },
+    "reactive": {
+      "GAT-MARL": {
+        "total_migrations": 348,
+        "total_violations": 4805,
+        "primary_entry_violations": 2015,
+        "max_entry_violations": 4805,
+        "severe_sla_violations": 523,
+        "total_sla_excess_distance_km": 7708.897678868483,
+        "avg_sla_excess_distance_km": 0.6677260873857499,
+        "p95_sla_excess_distance_km": 4.91116681296737,
+        "proactive_decisions": 0,
+        "decision_count": 2015,
+        "total_reward": -4973.239700879699,
+        "avg_decision_time_ms": 1.164109033455023,
+        "total_cost_ms_sum": 39417034.77718469,
+        "total_sla_penalty_ms": 36967496.40373156,
+        "total_tearing_penalty_ms": 132799.91999999958,
+        "total_future_penalty_ms": 0.0,
+        "total_access_latency": 4194.217623153055,
+        "total_communication_cost": 11568.704186167066,
+        "total_migration_cost": 2300975.531643755,
+        "migration_decision_count": 289,
+        "dag_proactive_migration_stats": {},
+        "avg_agents_per_decision": 5.578163771712159,
+        "controlled_agents_per_decision": 5.578163771712159,
+        "pinned_agents_per_decision": 0.0,
+        "avg_migrated_agents_per_decision": 0.17270471464019851,
+        "avg_controlled_migrated_agents_per_decision": 0.17270471464019851,
+        "controlled_migrations": 348,
+        "all_agents_migrated_decisions": 0,
+        "all_agents_migrated_ratio": 0.0,
+        "controlled_all_agents_migrated_decisions": 0,
+        "controlled_all_agents_migrated_ratio": 0.0,
+        "stay_action_ratio": 0.9690391459074733,
+        "candidate_action_counts": {
+          "0": 10892,
+          "1": 348,
+          "2": 0,
+          "3": 0
+        },
+        "joint_action_distribution": {
+          "0-0-0-0-0-1-0": 40,
+          "0-0-0-0-1-0-0": 27,
+          "0-0-0-1-0-0-0": 40,
+          "0-0-1-0-0-0-0": 69,
+          "1-1-0-0-0-0-0": 20,
+          "0-0-0-1-1-0-0": 6,
+          "1-0-0-0-0-1-0": 2,
+          "0-1-1-0-0-0-0": 3,
+          "0-0-0-0": 925,
+          "1-0-0-0": 30,
+          "0-0-1-1-0-0-0": 8,
+          "0-0-0-0-1-1-0": 9,
+          "0-0-0-0-0-0-0": 801,
+          "0-1-0-0-0-0-0": 12,
+          "1-0-0-0-0-0-0": 12,
+          "0-0-1-0-1-0-0": 1,
+          "1-0-0-1-0-0-0": 4,
+          "0-0-1-0-0-1-0": 1,
+          "1-0-0-0-1-0-0": 2,
+          "1-0-1-0-0-0-0": 1,
+          "0-1-0-0-0-1-0": 2
+        },
+        "local_migration_cost_sum": 9322392.093179006,
+        "edge_split_cost_sum": 360.6831202657206,
+        "dense_distance_bonus_sum": 0.0,
+        "entry_sla_bonus_sum": 0.0,
+        "proactive_logit_bias_count": 0,
+        "proactive_best_bias_action_counts": {
+          "0": 0,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "reactive_action_clipped_count": 6237,
+        "counterfactual_score_sum": -59886.52397281839,
+        "entry_node_migration_count": 348,
+        "sla_improving_action_count": 991,
+        "cost_guard_blocked_count": 6239,
+        "non_entry_distance_only_blocked_count": 524,
+        "cost_by_dag_complexity": {
+          "medium": {
+            "decision_count": 1060,
+            "total_cost_ms_sum": 34802546.192737885,
+            "migrations": 318,
+            "avg_total_cost_ms": 32832.59074786593
+          },
+          "simple": {
+            "decision_count": 955,
+            "total_cost_ms_sum": 4614488.584446771,
+            "migrations": 30,
+            "avg_total_cost_ms": 4831.925219315991
+          }
+        },
+        "cost_by_dag_type": {
+          "FanIn_Aggregator_2": {
+            "decision_count": 1060,
+            "total_cost_ms_sum": 34802546.192737885,
+            "migrations": 318,
+            "controlled_migrations": 318,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 32832.59074786593,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          },
+          "Diamond_DAG_3": {
+            "decision_count": 955,
+            "total_cost_ms_sum": 4614488.584446771,
+            "migrations": 30,
+            "controlled_migrations": 30,
+            "all_agents_migrated_decisions": 0,
+            "controlled_all_agents_migrated_decisions": 0,
+            "avg_total_cost_ms": 4831.925219315991,
+            "all_agents_migrated_ratio": 0.0,
+            "controlled_all_agents_migrated_ratio": 0.0
+          }
+        },
+        "migrations_by_dag_type": {
+          "FanIn_Aggregator_2": 318,
+          "Diamond_DAG_3": 30
+        },
+        "controlled_migrations_by_dag_type": {
+          "FanIn_Aggregator_2": 318,
+          "Diamond_DAG_3": 30
+        },
+        "invalid_action_masked_count": 5105,
+        "action_mask_fallback_count": 0,
+        "lambda_migration": 0.35,
+        "lambda_split": 0.1,
+        "avg_total_cost_ms": 19561.803859645006
+      }
+    }
+  },
+  "elapsed_seconds_so_far": 21.392212629318237,
+  "completed_at": "2026-05-26T11:35:19.286059",
+  "elapsed_seconds": 21.393332719802856
+}

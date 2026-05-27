@@ -56,8 +56,17 @@ from core.reward import (
     build_servers_info,
     calculate_entry_sla_metrics,
     calculate_nonlinear_migration_cost_ms,
+    _entry_access_profile,
+    calc_access_latency_ms,
     calculate_sla_penalty_ms,
+    compute_internal_critical_path_ms,
     estimate_dag_migration_time_s,
+    future_mean_excess_penalty_gain_ms,
+    is_reward_v2,
+    REWARD_V2_OBJECTIVE_SCALE_MS,
+    sla_penalty_gain_ms,
+    use_reward_v2_internal_path,
+    edge_effective_latency_ms,
 )
 from core.physics_utils import BASE_ROUTER_DELAY_MS, FIBER_SPEED_KM_MS
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
@@ -65,22 +74,57 @@ from prediction.simple_predictor import build_predict_future_time_kwargs, touch_
 
 FORECAST_HORIZON = 15
 MAX_NODES = 12
-CF_SLA_WEIGHT = 0.003
+CF_SLA_WEIGHT = 0.002
 CF_FUTURE_WEIGHT = 0.0015
 CF_TOPOLOGY_WEIGHT = 0.001
 CF_COST_SCALE_MS = 1000.0
+
+
+def _cf_cost_scale_ms():
+    """Align counterfactual migration normalization with v2 reward scale."""
+    return REWARD_V2_OBJECTIVE_SCALE_MS if is_reward_v2() else CF_COST_SCALE_MS
 CF_SCORE_EPS = 1e-6
 CF_SLA_ENTRY_SCORE_FLOOR = -0.2
 PROACTIVE_MAX_MIGRATABLE_MB = 100.0
 STATEFUL_FUTURE_GAIN_DISCOUNT = 0.1
 PROACTIVE_HEAVY_SLA_GAIN_FLOOR_MS = 20000.0
-LIGHTWEIGHT_ENTRY_SCORE_FLOOR = -1.0
-LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS = 1000.0
+LIGHTWEIGHT_ENTRY_SCORE_FLOOR = -0.2
+LIGHTWEIGHT_ENTRY_MIN_SLA_GAIN_MS = 2500.0
 LIGHTWEIGHT_ENTRY_MIN_BIAS = 0.2
-PROACTIVE_MIGRATION_BUDGET_MS = 8000.0
-MIN_SLA_GAIN_COST_RATIO = 0.15
-HIGH_COST_MIGRATION_MS = 5000.0
-HIGH_COST_MIN_SLA_GAIN_MS = 3000.0
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    return float(raw) if raw is not None and raw != "" else default
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return int(raw) if raw is not None and raw != "" else default
+
+
+# Overridable via env for ablations (e.g. phase C0: MAX=2, budget=6000).
+PROACTIVE_MIGRATION_BUDGET_MS = _env_float("PROACTIVE_MIGRATION_BUDGET_MS", 3000.0)
+PROACTIVE_MAX_MIGRATIONS_PER_DECISION = _env_int("PROACTIVE_MAX_MIGRATIONS_PER_DECISION", 1)
+MIN_SLA_GAIN_COST_RATIO = 0.30
+HIGH_COST_MIGRATION_MS = 3000.0
+HIGH_COST_MIN_SLA_GAIN_MS = 5000.0
+REACTIVE_MAX_MIGRATIONS_PER_DECISION = _env_int("REACTIVE_MAX_MIGRATIONS_PER_DECISION", 1)
+
+
+def _unlimited_migration_cap(cap_setting):
+    """Non-positive env value disables per-step count cap (budget / ROI still apply)."""
+    return int(cap_setting) <= 0
+
+
+def _reactive_migration_cap(controlled_count, violating_entry_count):
+    if _unlimited_migration_cap(REACTIVE_MAX_MIGRATIONS_PER_DECISION):
+        return max(1, int(controlled_count))
+    return min(
+        REACTIVE_MAX_MIGRATIONS_PER_DECISION,
+        controlled_count,
+        max(1, int(violating_entry_count)),
+    )
 
 
 def _node_transfer_mb(dag_info, node):
@@ -303,8 +347,7 @@ def _server_distance_to_user(server_id, user_lat, user_lon, servers_info):
     return float(haversine_distance(user_lat, user_lon, srv_lat, srv_lon))
 
 
-def _edge_split_delta_ms(src, dst, traffic, assignments, node, target_server,
-                         servers_info, max_traffic):
+def _edge_split_delta_ms(src, dst, traffic, assignments, node, target_server, servers_info):
     src_server = target_server if src == node else assignments[src]
     dst_server = target_server if dst == node else assignments[dst]
     old_same = assignments[src] == assignments[dst]
@@ -318,10 +361,9 @@ def _edge_split_delta_ms(src, dst, traffic, assignments, node, target_server,
         lat_a, lon_a = servers_info[server_a]
         lat_b, lon_b = servers_info[server_b]
         dist_km = float(haversine_distance(lat_a, lon_a, lat_b, lon_b))
-        norm_traffic = float(traffic) / max(float(max_traffic), 1e-6)
         cross_mb = min(float(traffic) * RPC_SIZE_MB, MAX_TEARING_MB)
         tearing_ms = (cross_mb / EDGE_BACKHAUL_MBPS) * 1000.0
-        comm_ms = norm_traffic * ((max(0.0, dist_km) / FIBER_SPEED_KM_MS) + BASE_ROUTER_DELAY_MS)
+        comm_ms = edge_effective_latency_ms(dist_km, traffic, True)
         return float(tearing_ms + comm_ms)
 
     old_cost = split_cost(assignments[src], assignments[dst])
@@ -346,6 +388,10 @@ def _build_counterfactual_context(
         for node in entry_nodes
     }
     current_max_entry_dist = max(entry_distances.values()) if entry_distances else 0.0
+    current_access_latency_ms = float(calc_access_latency_ms(current_max_entry_dist))
+    current_internal_path_ms = float(
+        compute_internal_critical_path_ms(dag_info, assignments, servers_info)
+    )
     bottleneck_entries = {
         node for node, dist in entry_distances.items()
         if dist >= current_max_entry_dist - 1e-6
@@ -409,6 +455,8 @@ def _build_counterfactual_context(
         "primary_entry": entry_nodes[0] if entry_nodes else None,
         "entry_distances": entry_distances,
         "current_max_entry_dist": current_max_entry_dist,
+        "current_access_latency_ms": current_access_latency_ms,
+        "current_internal_path_ms": current_internal_path_ms,
         "bottleneck_entries": bottleneck_entries,
         "violating_entries": violating_entries,
         "bandwidth": bandwidth,
@@ -459,8 +507,7 @@ def _score_counterfactual_action(
         split_delta_ms = 0.0
         for src, dst, traffic in cf_ctx["incident_edges"].get(node, []):
             split_delta_ms += _edge_split_delta_ms(
-                src, dst, traffic, assignments, node, target_server,
-                servers_info, cf_ctx["max_traffic"],
+                src, dst, traffic, assignments, node, target_server, servers_info
             )
         cf_ctx["split_delta_cache"][split_key] = split_delta_ms
     split_cost_ms = max(0.0, split_delta_ms)
@@ -469,7 +516,34 @@ def _score_counterfactual_action(
     sla_gain_ms = 0.0
     future_gain_ms = 0.0
     non_entry_distance_only = False
-    if node in cf_ctx["entry_nodes"] and (
+
+    trial_assignments = dict(assignments)
+    trial_assignments[node] = target_server
+    new_internal_path_ms = float(
+        compute_internal_critical_path_ms(dag_info, trial_assignments, servers_info)
+    )
+    new_max_entry_dist, new_access_latency_ms = _entry_access_profile(
+        trial_assignments,
+        dag_info,
+        cf_ctx["user_lat"],
+        cf_ctx["user_lon"],
+        servers_info,
+    )
+    old_max_entry_dist = cf_ctx["current_max_entry_dist"]
+    old_access_latency_ms = cf_ctx["current_access_latency_ms"]
+    old_internal_path_ms = cf_ctx["current_internal_path_ms"]
+
+    if use_reward_v2_internal_path():
+        sla_gain_ms = sla_penalty_gain_ms(
+            old_max_entry_dist,
+            new_max_entry_dist,
+            old_access_latency_ms,
+            new_access_latency_ms,
+            old_internal_path_ms,
+            new_internal_path_ms,
+            use_e2e_qos=True,
+        )
+    elif node in cf_ctx["entry_nodes"] and (
         node in cf_ctx["violating_entries"]
         or node in cf_ctx["bottleneck_entries"]
         or node == cf_ctx["primary_entry"]
@@ -484,9 +558,7 @@ def _score_counterfactual_action(
             )
             new_max = max(other_entry_max, target_dist)
             old_max = cf_ctx["current_max_entry_dist"]
-            old_penalty = calculate_sla_penalty_ms(old_max)
-            new_penalty = calculate_sla_penalty_ms(new_max)
-            sla_gain_ms = max(0.0, old_penalty - new_penalty)
+            sla_gain_ms = sla_penalty_gain_ms(old_max, new_max)
             sla_gain_ms += (
                 max(0.0, old_max - new_max)
                 * SLA_PENALTY_PER_KM_MS
@@ -516,12 +588,18 @@ def _score_counterfactual_action(
                         dists = []
                         for entry in cf_ctx["entry_nodes"]:
                             server_id = target_server if entry == node else assignments[entry]
-                            dists.append(_server_distance_to_user(server_id, float(lat), float(lon), servers_info))
-                        future_excess.append(max(dists) - DISTANCE_THRESHOLD_KM if dists else 0.0)
+                            dists.append(
+                                _server_distance_to_user(
+                                    server_id, float(lat), float(lon), servers_info
+                                )
+                            )
+                        future_excess.append(
+                            max(dists) - DISTANCE_THRESHOLD_KM if dists else 0.0
+                        )
                     new_future = float(np.mean(np.maximum(0.0, np.asarray(future_excess))))
-                    future_gain_ms = (
-                        max(0.0, cf_ctx["current_future_max"] - new_future)
-                        * SLA_PENALTY_PER_KM_MS
+                    future_gain_ms = future_mean_excess_penalty_gain_ms(
+                        cf_ctx["current_future_max"],
+                        new_future,
                     )
                     if _node_state_mb(dag_info, node) > 0.0:
                         future_gain_ms *= STATEFUL_FUTURE_GAIN_DISCOUNT
@@ -540,7 +618,7 @@ def _score_counterfactual_action(
     effective_sla_gain_ms = sla_gain_ms + 0.5 * future_gain_ms
     score = (
         effective_sla_gain_ms * CF_SLA_WEIGHT
-        - (nonlinear_migration_cost_ms / CF_COST_SCALE_MS) * float(lambda_migration)
+        - (nonlinear_migration_cost_ms / _cf_cost_scale_ms()) * float(lambda_migration)
     )
     return {
         "score": float(score),
@@ -572,8 +650,8 @@ def _apply_proactive_distance_bias(
     lambda_migration,
     lambda_split,
     *,
-    bias_scale=0.30,
-    max_bias=0.4,
+    bias_scale=0.15,
+    max_bias=0.25,
 ):
     """Add a light logit prior for actions with positive counterfactual value."""
     biased_logits = masked_logits.clone()
@@ -721,7 +799,10 @@ def _apply_proactive_size_guard(
         accepted.append((item["score"], idx, migration_cost))
     keep_indices = set()
     used_budget_ms = 0.0
+    cap_by_count = not _unlimited_migration_cap(PROACTIVE_MAX_MIGRATIONS_PER_DECISION)
     for _, idx, migration_cost in sorted(accepted, reverse=True):
+        if cap_by_count and len(keep_indices) >= PROACTIVE_MAX_MIGRATIONS_PER_DECISION:
+            break
         if used_budget_ms + migration_cost > PROACTIVE_MIGRATION_BUDGET_MS:
             continue
         keep_indices.add(idx)
@@ -769,9 +850,9 @@ def _clip_reactive_actions(
         trigger_type=TRIGGER_REACTIVE,
     )
     if max_migrations is None:
-        max_migrations = min(
+        max_migrations = _reactive_migration_cap(
             controlled_count,
-            max(2, int(controlled_count * 0.4), len(cf_ctx["violating_entries"])),
+            len(cf_ctx["violating_entries"]),
         )
     sorted_node_to_action_idx = {node: idx for idx, node in enumerate(sorted_nodes)}
     scored = []
@@ -923,7 +1004,7 @@ def run_marl_gat_microservice(
     if max_lambda_migration is None:
         # Linear SLA penalty lowers benefit scale, so Proactive needs a stronger
         # cost exchange rate to avoid expensive early migrations.
-        max_lambda_migration = 0.40 if use_proactive else 0.3
+        max_lambda_migration = 0.50 if use_proactive else 0.35
     if max_lambda_split is None:
         max_lambda_split = 0.04 if use_proactive else 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -971,7 +1052,9 @@ def run_marl_gat_microservice(
     total_reward_sum = 0.0
     total_access_latency = 0.0
     total_communication_cost = 0.0
+    total_internal_path_ms = 0.0
     total_migration_cost = 0.0
+    migration_decision_count = 0
     total_cost_ms_sum = 0.0
     total_sla_penalty_ms = 0.0
     total_tearing_penalty_ms = 0.0
@@ -1037,7 +1120,9 @@ def run_marl_gat_microservice(
             total_reward_sum = 0.0
             total_access_latency = 0.0
             total_communication_cost = 0.0
+            total_internal_path_ms = 0.0
             total_migration_cost = 0.0
+            migration_decision_count = 0
             total_cost_ms_sum = 0.0
             total_sla_penalty_ms = 0.0
             total_tearing_penalty_ms = 0.0
@@ -1323,7 +1408,10 @@ def run_marl_gat_microservice(
                 reward_history.append(shared_reward)
                 total_access_latency += details["access_latency"]
                 total_communication_cost += details["communication_cost"]
+                total_internal_path_ms += float(details.get("internal_critical_path_ms", 0.0))
                 total_migration_cost += details["migration_cost"]
+                if float(details.get("migration_cost") or 0.0) > 0.0:
+                    migration_decision_count += 1
                 total_cost_ms_sum += details["total_cost_ms"]
                 total_sla_penalty_ms += details.get("sla_penalty_ms", 0.0)
                 total_tearing_penalty_ms += details.get("tearing_penalty_ms", details.get("tearing_penalty", 0.0))
@@ -1439,7 +1527,9 @@ def run_marl_gat_microservice(
         "total_reward": total_reward_sum,
         "total_access_latency": total_access_latency,
         "total_communication_cost": total_communication_cost,
+        "total_internal_path_ms": total_internal_path_ms,
         "total_migration_cost": total_migration_cost,
+        "migration_decision_count": migration_decision_count,
         "total_cost_ms_sum": total_cost_ms_sum,
         "total_sla_penalty_ms": total_sla_penalty_ms,
         "total_tearing_penalty_ms": total_tearing_penalty_ms,

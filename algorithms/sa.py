@@ -1,11 +1,12 @@
 """
 SA Microservice Migration — topology-aware Simulated Annealing baseline.
 Supports both reactive and proactive (trajectory-prediction) modes.
-Implements asymmetric migration cost based on trigger type.
+Optimizes reported physical total_cost_ms (not log-compressed reward).
 """
 
 import math
 import copy
+import os
 import random
 import time
 from collections import defaultdict
@@ -30,7 +31,11 @@ from core.reward import (
 )
 from prediction.simple_predictor import build_predict_future_time_kwargs, touch_taxi_last
 
-FORECAST_HORIZON = 15  # Extended horizon for better proactive detection
+FORECAST_HORIZON = 15
+SA_DEFAULT_MAX_ITER = int(os.environ.get("SA_MAX_ITER", "150"))
+SA_DEFAULT_TEMP = float(os.environ.get("SA_INITIAL_TEMP", "50000.0"))
+SA_DEFAULT_COOLING = float(os.environ.get("SA_COOLING_RATE", "0.99"))
+SA_NUM_RESTARTS = int(os.environ.get("SA_NUM_RESTARTS", "2"))
 
 
 def _entry_violation_counts(entry_nodes, assignments, user_lat, user_lon, servers_info):
@@ -48,6 +53,62 @@ def _entry_violation_counts(entry_nodes, assignments, user_lat, user_lon, server
     return primary, max_entry
 
 
+def _sa_total_cost_ms(
+    taxi_id,
+    dag_info,
+    assignments,
+    previous_assignments,
+    user_location,
+    servers_info,
+    *,
+    predicted_locations=None,
+    trigger_type=TRIGGER_REACTIVE,
+):
+    """Physical system cost used in experiment reports (same as total_cost_ms_sum)."""
+    _, details = calculate_microservice_reward(
+        taxi_id,
+        dag_info,
+        assignments,
+        previous_assignments,
+        user_location,
+        servers_info,
+        predicted_locations=predicted_locations,
+        trigger_type=trigger_type,
+    )
+    return float(details["total_cost_ms"])
+
+
+def _sa_colocate_start(deployable_nodes, current_assignments, candidate_server_ids):
+    start = dict(current_assignments)
+    if not deployable_nodes or not candidate_server_ids:
+        return start
+    target = random.choice(candidate_server_ids)
+    for node in deployable_nodes:
+        start[node] = target
+    return start
+
+
+def _sa_propose_neighbor(current_sol, deployable_nodes, candidate_server_ids):
+    if not deployable_nodes or not candidate_server_ids:
+        return None
+
+    if random.random() < 0.5:
+        neighbor = dict(current_sol)
+        target = random.choice(candidate_server_ids)
+        for node in deployable_nodes:
+            neighbor[node] = target
+        return neighbor
+
+    node = random.choice(deployable_nodes)
+    old_server = current_sol[node]
+    other_servers = [s for s in candidate_server_ids if s != old_server]
+    if not other_servers:
+        return None
+    neighbor = dict(current_sol)
+    neighbor[node] = random.choice(other_servers)
+    return neighbor
+
+
 class MicroserviceSAReturn(tuple):
     """
     2-tuple (best_assignments, best_cost) 解包与原生元组一致；
@@ -60,41 +121,33 @@ class MicroserviceSAReturn(tuple):
         return obj
 
 
-def microservice_simulated_annealing(
-    taxi_id, dag_info, current_assignments, candidates,
-    user_location, servers_info,
-    previous_assignments=None,
-    temp=3000.0, cooling_rate=0.97, max_iter=50,
-    predicted_locations=None,
-    trigger_type=TRIGGER_REACTIVE,
+def _sa_single_run(
+    taxi_id,
+    dag_info,
+    start_assignments,
+    candidate_server_ids,
+    user_location,
+    servers_info,
+    previous_assignments,
+    *,
+    predicted_locations,
+    trigger_type,
+    temp,
+    cooling_rate,
+    max_iter,
 ):
-    """
-    Simulated Annealing over all microservice node placements for one DAG.
-
-    When *predicted_locations* is provided the cost function includes the
-    future topology violation penalty so that SA also optimises for predicted
-    user movement.
-
-    Returns
-    -------
-    MicroserviceSAReturn
-        可像 ``(best_assignments, best_cost)`` 一样解包为两项；
-        统计指标见 ``result.sa_stats``（含 ``sa_accept_rate``、``sa_worse_accept_rate`` 等）。
-    """
-    if previous_assignments is None:
-        previous_assignments = current_assignments
-
-    candidate_server_ids = [c[0] for c in candidates]
-    all_nodes = list(dag_info['nodes'].keys())
-
-    current_sol = dict(current_assignments)
-    current_reward, _ = calculate_microservice_reward(
-        taxi_id, dag_info, current_sol, previous_assignments,
-        user_location, servers_info,
+    deployable_nodes = get_deployable_nodes(dag_info)
+    current_sol = dict(start_assignments)
+    current_cost = _sa_total_cost_ms(
+        taxi_id,
+        dag_info,
+        current_sol,
+        previous_assignments,
+        user_location,
+        servers_info,
         predicted_locations=predicted_locations,
         trigger_type=trigger_type,
     )
-    current_cost = -current_reward
 
     best_sol = dict(current_sol)
     best_cost = current_cost
@@ -104,27 +157,22 @@ def microservice_simulated_annealing(
     sa_neighbor_count = 0
 
     for _iteration in range(max_iter):
-        node = random.choice(all_nodes)
-        old_server = current_sol[node]
-
-        other_servers = [s for s in candidate_server_ids if s != old_server]
-        if not other_servers:
+        neighbor_sol = _sa_propose_neighbor(current_sol, deployable_nodes, candidate_server_ids)
+        if neighbor_sol is None:
             temp *= cooling_rate
             continue
-        new_server = random.choice(other_servers)
 
         sa_neighbor_count += 1
-
-        neighbor_sol = dict(current_sol)
-        neighbor_sol[node] = new_server
-
-        neighbor_reward, _ = calculate_microservice_reward(
-            taxi_id, dag_info, neighbor_sol, previous_assignments,
-            user_location, servers_info,
+        neighbor_cost = _sa_total_cost_ms(
+            taxi_id,
+            dag_info,
+            neighbor_sol,
+            previous_assignments,
+            user_location,
+            servers_info,
             predicted_locations=predicted_locations,
             trigger_type=trigger_type,
         )
-        neighbor_cost = -neighbor_reward
 
         delta = neighbor_cost - current_cost
         if delta < 0:
@@ -144,22 +192,94 @@ def microservice_simulated_annealing(
 
         temp *= cooling_rate
 
-    sa_accept_rate = (
-        sa_accept_count / sa_neighbor_count if sa_neighbor_count > 0 else 0.0
-    )
-    sa_worse_accept_rate = (
-        sa_worse_accept_count / sa_neighbor_count if sa_neighbor_count > 0 else 0.0
-    )
-
-    sa_stats = {
+    return best_sol, best_cost, {
         "sa_accept_count": sa_accept_count,
         "sa_worse_accept_count": sa_worse_accept_count,
         "sa_neighbor_count": sa_neighbor_count,
-        "sa_accept_rate": sa_accept_rate,
-        "sa_worse_accept_rate": sa_worse_accept_rate,
     }
 
-    return MicroserviceSAReturn(best_sol, best_cost, sa_stats)
+
+def microservice_simulated_annealing(
+    taxi_id, dag_info, current_assignments, candidates,
+    user_location, servers_info,
+    previous_assignments=None,
+    temp=SA_DEFAULT_TEMP, cooling_rate=SA_DEFAULT_COOLING, max_iter=SA_DEFAULT_MAX_ITER,
+    predicted_locations=None,
+    trigger_type=TRIGGER_REACTIVE,
+    num_restarts=SA_NUM_RESTARTS,
+):
+    """
+    Simulated Annealing over deployable microservice node placements for one DAG.
+
+    Minimizes ``details['total_cost_ms']`` so the search objective matches experiment
+    reporting (SLA + linear migration + tearing + comm + future + access).
+
+    Neighbourhood: single-node server change or colocate-all-deployable to one candidate.
+    Optional random restarts from a colocated seed improve DAG-wide coordination.
+    """
+    if previous_assignments is None:
+        previous_assignments = current_assignments
+
+    candidate_server_ids = [c[0] for c in candidates]
+    deployable_nodes = get_deployable_nodes(dag_info)
+
+    start_points = [dict(current_assignments)]
+    restarts = max(1, int(num_restarts))
+    while len(start_points) < restarts:
+        start_points.append(
+            _sa_colocate_start(deployable_nodes, current_assignments, candidate_server_ids)
+        )
+
+    best_sol = dict(current_assignments)
+    best_cost = _sa_total_cost_ms(
+        taxi_id,
+        dag_info,
+        best_sol,
+        previous_assignments,
+        user_location,
+        servers_info,
+        predicted_locations=predicted_locations,
+        trigger_type=trigger_type,
+    )
+
+    agg_stats = {
+        "sa_accept_count": 0,
+        "sa_worse_accept_count": 0,
+        "sa_neighbor_count": 0,
+        "sa_restart_count": len(start_points),
+    }
+
+    for start_sol in start_points:
+        run_temp = max(float(temp), best_cost * 0.15, 1000.0)
+        sol, cost, stats = _sa_single_run(
+            taxi_id,
+            dag_info,
+            start_sol,
+            candidate_server_ids,
+            user_location,
+            servers_info,
+            previous_assignments,
+            predicted_locations=predicted_locations,
+            trigger_type=trigger_type,
+            temp=run_temp,
+            cooling_rate=cooling_rate,
+            max_iter=max_iter,
+        )
+        for key in ("sa_accept_count", "sa_worse_accept_count", "sa_neighbor_count"):
+            agg_stats[key] += stats[key]
+        if cost < best_cost:
+            best_sol = sol
+            best_cost = cost
+
+    neighbor_count = agg_stats["sa_neighbor_count"]
+    agg_stats["sa_accept_rate"] = (
+        agg_stats["sa_accept_count"] / neighbor_count if neighbor_count > 0 else 0.0
+    )
+    agg_stats["sa_worse_accept_rate"] = (
+        agg_stats["sa_worse_accept_count"] / neighbor_count if neighbor_count > 0 else 0.0
+    )
+
+    return MicroserviceSAReturn(best_sol, best_cost, agg_stats)
 
 
 def run_sa_microservice_fair(
@@ -200,16 +320,16 @@ def run_sa_microservice_fair(
     total_reward_sum = 0.0
     reward_history = []
 
-    # Cost breakdown tracking
     total_access_latency = 0.0
     total_communication_cost = 0.0
+    total_internal_path_ms = 0.0
     total_migration_cost = 0.0
+    migration_decision_count = 0
     total_cost_ms_sum = 0.0
     total_sla_penalty_ms = 0.0
     total_tearing_penalty_ms = 0.0
     total_future_penalty_ms = 0.0
-    
-    # 时延探针初始化
+
     total_decision_time = 0.0
     decision_count_for_latency = 0
 
@@ -262,7 +382,6 @@ def run_sa_microservice_fair(
                 current_lat, current_lon, gw_lat, gw_lon
             )
 
-            # --- SCORING: max-entry SLA count, with primary-entry retained for diagnostics ---
             sla_metrics = calculate_entry_sla_metrics(
                 entry_nodes, taxi_dag_assignments[taxi_id], current_lat, current_lon, servers_info
             )
@@ -275,7 +394,6 @@ def run_sa_microservice_fair(
             total_sla_excess_distance_km += sla_metrics["sla_excess_distance_km"]
             sla_excess_distance_history.append(sla_metrics["sla_excess_distance_km"])
 
-            # --- Trajectory prediction ---
             predicted_locations = None
             if use_proactive:
                 raw = predictor.predict_future(
@@ -283,7 +401,6 @@ def run_sa_microservice_fair(
                 )
                 predicted_locations = [(lat, lon) for lon, lat in raw]
 
-            # --- Get trigger type (REACTIVE / PROACTIVE / None) ---
             trigger_type = get_trigger_type(
                 current_lat, current_lon, gw_lat, gw_lon,
                 predicted_locations=predicted_locations,
@@ -307,7 +424,6 @@ def run_sa_microservice_fair(
             )
             old_assignments = copy.copy(taxi_dag_assignments[taxi_id])
 
-            # 时延探针：计时 SA 决策过程
             t_start = time.perf_counter()
             best_assignments, best_cost = microservice_simulated_annealing(
                 taxi_id, dag_info,
@@ -320,13 +436,12 @@ def run_sa_microservice_fair(
                 trigger_type=trigger_type,
             )
             t_end = time.perf_counter()
-            
+
             total_decision_time += (t_end - t_start)
             decision_count_for_latency += 1
 
             taxi_dag_assignments[taxi_id] = best_assignments
 
-            # Recalculate to get cost breakdown details
             reward, details = calculate_microservice_reward(
                 taxi_id, dag_info, best_assignments, old_assignments,
                 (current_lat, current_lon), servers_info,
@@ -336,16 +451,17 @@ def run_sa_microservice_fair(
             total_reward_sum += reward
             reward_history.append(reward)
 
-            # Accumulate cost breakdown
             total_access_latency += details['access_latency']
             total_communication_cost += details['communication_cost']
+            total_internal_path_ms += float(details.get('internal_critical_path_ms', 0.0))
             total_migration_cost += details['migration_cost']
+            if float(details.get('migration_cost') or 0.0) > 0.0:
+                migration_decision_count += 1
             total_cost_ms_sum += details['total_cost_ms']
             total_sla_penalty_ms += details.get('sla_penalty_ms', 0.0)
             total_tearing_penalty_ms += details.get('tearing_penalty_ms', details.get('tearing_penalty', 0.0))
             total_future_penalty_ms += details.get('future_penalty_ms', details.get('future_penalty', 0.0))
 
-            # 统一口径：只统计可部署微服务节点迁移数。
             sorted_nodes = get_deployable_nodes(dag_info)
             nodes_migrated = sum(
                 1 for n in sorted_nodes
@@ -386,13 +502,14 @@ def run_sa_microservice_fair(
         'total_reward': total_reward_sum,
         'total_access_latency': total_access_latency,
         'total_communication_cost': total_communication_cost,
+        'total_internal_path_ms': total_internal_path_ms,
         'total_migration_cost': total_migration_cost,
+        'migration_decision_count': migration_decision_count,
         'total_cost_ms_sum': total_cost_ms_sum,
         'total_sla_penalty_ms': total_sla_penalty_ms,
         'total_tearing_penalty_ms': total_tearing_penalty_ms,
         'total_future_penalty_ms': total_future_penalty_ms,
         'reward_history': reward_history,
-        # 时延信息
         'total_decision_time': total_decision_time,
         'decision_count_for_latency': decision_count_for_latency,
         'avg_decision_time_ms': (total_decision_time / decision_count_for_latency * 1000) if decision_count_for_latency > 0 else 0,

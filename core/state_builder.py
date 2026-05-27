@@ -24,6 +24,7 @@ Graph-based layout (TriggerAwareGraphDQN):
 import numpy as np
 
 from core.geo import haversine_distance
+from core.reward import dag_max_traffic_log_rpc, traffic_log_rpc_feature
 from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
 from core.dag_utils import get_entry_nodes
 
@@ -70,14 +71,15 @@ def build_node_state(
     feat_state_mb = node_info['state_mb'] / 256.0
     feat_stateful = float(node_info['is_stateful'])
 
-    node_traffic = 0.0
-    max_traffic = 0.0
+    node_log_rpc = 0.0
+    max_log_rpc = 0.0
     for (src, dst), traffic in dag_info['edges'].items():
+        log_rpc = traffic_log_rpc_feature(traffic)
         if src == ms_node or dst == ms_node:
-            node_traffic += traffic
-        if traffic > max_traffic:
-            max_traffic = traffic
-    feat_traffic = node_traffic / max_traffic if max_traffic > 0 else 0.0
+            node_log_rpc += log_rpc
+        max_log_rpc = max(max_log_rpc, log_rpc)
+    max_log_rpc = max(max_log_rpc, float(dag_max_traffic_log_rpc(dag_info)), 1e-6)
+    feat_traffic = min(node_log_rpc / max_log_rpc, 1.0)
 
     # Topology context (4)
     current_server = current_assignments[ms_node]
@@ -177,7 +179,7 @@ def build_graph_state(
         node_features : np.ndarray, shape (N, 3)
             Per-node features: [image_mb/200, state_mb/256, is_stateful]
         adj_matrix : np.ndarray, shape (N, N)
-            Normalized adjacency matrix with traffic weights.
+            Adjacency matrix with log1p(RPC) traffic weights (aligned with reward D0/D2).
         trigger_context : np.ndarray, shape (3,)
             v3.7: [proactive_flag, reactive_flag, risk_ratio]
             - PROACTIVE: [1.0, 0.0, risk_ratio] where risk_ratio ∈ [0,1]
@@ -205,18 +207,16 @@ def build_graph_state(
         node_features[i, 2] = float(node_props['is_stateful'])
 
     # === Adjacency Matrix (N, N) ===
-    # Traffic-weighted edges: higher traffic = stronger dependency.
-    # Normalized to [0, 1] for stable training.
+    # Traffic-weighted edges: log1p(actual_rpc_calls), same scale as reward/counterfactual.
     adj_matrix = np.zeros((n_nodes, n_nodes), dtype=np.float32)
-    max_traffic = max(dag_info['edges'].values()) if dag_info['edges'] else 1.0
-    max_traffic = max(max_traffic, 1e-6)  # Avoid division by zero
+    max_log_rpc = max(float(dag_max_traffic_log_rpc(dag_info)), 1e-6)
 
     for (src, dst), traffic in dag_info['edges'].items():
         if src in node_to_idx and dst in node_to_idx:
             i, j = node_to_idx[src], node_to_idx[dst]
-            norm_traffic = traffic / max_traffic
-            adj_matrix[i, j] = norm_traffic
-            adj_matrix[j, i] = norm_traffic  # Undirected for message passing
+            weight = traffic_log_rpc_feature(traffic) / max_log_rpc
+            adj_matrix[i, j] = weight
+            adj_matrix[j, i] = weight  # Undirected for message passing
 
     # Add self-loops for graph convolution stability
     np.fill_diagonal(adj_matrix, 1.0)

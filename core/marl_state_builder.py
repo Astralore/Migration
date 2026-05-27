@@ -10,6 +10,7 @@ import numpy as np
 from core.context import TRIGGER_PROACTIVE
 from core.dag_utils import get_service_entry_nodes, is_external_node, topological_sort
 from core.geo import haversine_distance
+from core.reward import dag_max_traffic_log_rpc, traffic_log_rpc_feature
 from core.state_builder import MOBILITY_NORM, SLA_DISTANCE_THRESHOLD_KM
 
 
@@ -93,8 +94,7 @@ def build_marl_graph_state(
     node_to_idx = {name: i for i, name in enumerate(node_names)}
     entry_nodes = set(get_service_entry_nodes(dag_info))
 
-    max_traffic = max(dag_info["edges"].values()) if dag_info["edges"] else 1.0
-    max_traffic = max(float(max_traffic), 1e-6)
+    max_log_rpc = max(float(dag_max_traffic_log_rpc(dag_info)), 1e-6)
 
     topo_order = topological_sort(dag_info)
     topo_idx = {name: idx for idx, name in enumerate(topo_order)}
@@ -108,6 +108,24 @@ def build_marl_graph_state(
     max_degree = max(1, n_nodes - 1)
     topo_denom = max(1, n_nodes - 1)
 
+    node_log_rpc_load = []
+    node_neighbor_sets = []
+    for node_name in node_names:
+        load = 0.0
+        neighbors = set()
+        for (src, dst), traffic in dag_info["edges"].items():
+            if src == node_name:
+                load += traffic_log_rpc_feature(traffic)
+                neighbors.add(dst)
+            elif dst == node_name:
+                load += traffic_log_rpc_feature(traffic)
+                neighbors.add(src)
+        node_log_rpc_load.append(load)
+        node_neighbor_sets.append(neighbors)
+
+    max_node_log_rpc = max(node_log_rpc_load) if node_log_rpc_load else 1.0
+    max_node_log_rpc = max(float(max_node_log_rpc), 1e-6)
+
     node_features = np.zeros((n_nodes, 14), dtype=np.float32)
     for i, node_name in enumerate(node_names):
         props = dag_info["nodes"][node_name]
@@ -115,16 +133,7 @@ def build_marl_graph_state(
         srv_lat, srv_lon = servers_info[current_server]
         node_dist = float(haversine_distance(current_lat, current_lon, srv_lat, srv_lon))
 
-        node_traffic = 0.0
-        neighbors = set()
-        for (src, dst), traffic in dag_info["edges"].items():
-            if src == node_name:
-                node_traffic += float(traffic)
-                neighbors.add(dst)
-            elif dst == node_name:
-                node_traffic += float(traffic)
-                neighbors.add(src)
-
+        neighbors = node_neighbor_sets[i]
         same_neighbors = sum(
             1 for nb in neighbors
             if current_assignments.get(nb) == current_server
@@ -136,7 +145,7 @@ def build_marl_graph_state(
                 float(props["image_mb"]) / 200.0,
                 float(props["state_mb"]) / 512.0,
                 float(props["is_stateful"]),
-                min(node_traffic / max_traffic, 1.0),
+                min(node_log_rpc_load[i] / max_node_log_rpc, 1.0),
                 min(node_dist / 50.0, 1.0),
                 1.0 if node_name in entry_nodes else 0.0,
                 same_ratio,
@@ -155,7 +164,7 @@ def build_marl_graph_state(
     for (src, dst), traffic in dag_info["edges"].items():
         if src in node_to_idx and dst in node_to_idx:
             i, j = node_to_idx[src], node_to_idx[dst]
-            weight = float(traffic) / max_traffic
+            weight = traffic_log_rpc_feature(traffic) / max_log_rpc
             adj_matrix[i, j] = weight
             adj_matrix[j, i] = weight
     np.fill_diagonal(adj_matrix, 1.0)

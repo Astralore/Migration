@@ -13,10 +13,13 @@ from core.reward import (
     MB_TO_MBIT,
     MIN_BW_MBPS,
     REACTIVE_MIGRATION_MULT,
+    REWARD_V2_OBJECTIVE_SCALE_MS,
     RPC_SIZE_MB,
     SLA_DISTANCE_THRESHOLD,
     calculate_nonlinear_migration_cost_ms,
     calculate_microservice_reward,
+    edge_effective_latency_ms,
+    is_reward_v2,
 )
 from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
 
@@ -35,14 +38,13 @@ def lambda_schedule_by_epoch(epoch, num_epochs, *, max_migration=0.15, max_split
     """
     Epoch-level warmup schedule for local penalties.
 
-    Epoch 0 uses free migration/splitting to avoid early STAY collapse.  The last
-    training epoch reaches the configured max values.  Evaluation/inference can
-    pass the final epoch index if the metric should report final weights.
+    Epoch 0 starts at 10% of max penalties to avoid free-migration habits while
+    still allowing early exploration.  The last training epoch reaches max values.
     """
     epoch = max(0, int(epoch))
     train_epochs = max(1, int(num_epochs) - 1)
     if epoch <= 0:
-        return 0.0, 0.0
+        return 0.1 * max_migration, 0.1 * max_split
     progress = min(1.0, epoch / float(max(1, train_epochs - 1)))
     return max_migration * progress, max_split * progress
 
@@ -101,16 +103,15 @@ def _local_migration_costs(dag_info, current_assignments, previous_assignments,
     return costs
 
 
-def _edge_split_cost(src, dst, traffic, assignments, servers_info, max_traffic):
+def _edge_split_cost(src, dst, traffic, assignments, servers_info):
     if assignments[src] == assignments[dst]:
         return 0.0
     src_lat, src_lon = servers_info[assignments[src]]
     dst_lat, dst_lon = servers_info[assignments[dst]]
     edge_dist_km = float(haversine_distance(src_lat, src_lon, dst_lat, dst_lon))
-    norm_traffic = float(traffic) / float(max_traffic)
     cross_mb = min(float(traffic) * RPC_SIZE_MB, MAX_TEARING_MB)
     tearing_ms = (cross_mb / EDGE_BACKHAUL_MBPS) * 1000.0
-    comm_ms = norm_traffic * ((max(0.0, edge_dist_km) / FIBER_SPEED_KM_MS) + BASE_ROUTER_DELAY_MS)
+    comm_ms = edge_effective_latency_ms(edge_dist_km, traffic, True)
     return float(tearing_ms + comm_ms)
 
 
@@ -118,8 +119,7 @@ def _local_edge_split_costs(dag_info, current_assignments, previous_assignments,
     """Incremental incident-edge split cost caused by the current joint migration."""
     costs = {node: 0.0 for node in dag_info["nodes"]}
     deployable = set(get_deployable_nodes(dag_info))
-    max_traffic = max(dag_info["edges"].values()) if dag_info["edges"] else 0.0
-    if max_traffic <= 0:
+    if not dag_info.get("edges"):
         return costs
 
     for (src, dst), traffic in dag_info["edges"].items():
@@ -128,8 +128,8 @@ def _local_edge_split_costs(dag_info, current_assignments, previous_assignments,
             and current_assignments[dst] == previous_assignments[dst]
         ):
             continue
-        previous_cost = _edge_split_cost(src, dst, traffic, previous_assignments, servers_info, max_traffic)
-        current_cost = _edge_split_cost(src, dst, traffic, current_assignments, servers_info, max_traffic)
+        previous_cost = _edge_split_cost(src, dst, traffic, previous_assignments, servers_info)
+        current_cost = _edge_split_cost(src, dst, traffic, current_assignments, servers_info)
         incremental_cost = max(0.0, current_cost - previous_cost)
         if incremental_cost <= 0.0:
             continue
@@ -314,6 +314,9 @@ def calculate_marl_rewards(
         predicted_locations=predicted_locations,
         trigger_type=trigger_type,
     )
+    effective_local_cost_scale_ms = (
+        REWARD_V2_OBJECTIVE_SCALE_MS if is_reward_v2() else local_cost_scale_ms
+    )
     migration_costs = _local_migration_costs(
         dag_info,
         current_assignments,
@@ -348,7 +351,7 @@ def calculate_marl_rewards(
             agent_rewards[node] = float(shared_reward)
             continue
         local_penalty = (
-            lambda_migration * (migration_costs[node] / local_cost_scale_ms)
+            lambda_migration * (migration_costs[node] / effective_local_cost_scale_ms)
         )
         agent_rewards[node] = float(
             shared_reward

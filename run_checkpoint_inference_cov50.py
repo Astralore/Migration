@@ -15,7 +15,12 @@ from algorithms.sa import run_sa_microservice_fair
 from core.data_loader import DEFAULT_SERVER_PATH, DEFAULT_TAXI_PATH, load_data
 from prediction.simple_predictor import SimpleTrajectoryPredictor
 from run_comparison import _avg_total_cost_ms
-from run_medium_validation_cov50 import _filter_top_active, _summarize_result, _to_jsonable
+from run_medium_validation_cov50 import (
+    _filter_top_active,
+    _migration_efficiency_table,
+    _summarize_result,
+    _to_jsonable,
+)
 
 
 SOURCE_EXPERIMENT = Path(
@@ -127,6 +132,10 @@ def _write_report(payload):
 ## 成本分解均值
 
 {cost_table()}
+
+## 迁移效率指标
+
+{_migration_efficiency_table(pro, rea)}
 
 ## 说明
 
