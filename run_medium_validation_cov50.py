@@ -28,10 +28,17 @@ from prediction.simple_predictor import SimpleTrajectoryPredictor
 from run_comparison import _avg_total_cost_ms
 
 
-STAMP = os.environ.get(
-    "MEDIUM_VALIDATION_STAMP",
-    datetime.now().strftime("%Y%m%d_%H%M%S_cov50_stage8"),
-)
+def _resolve_experiment_stamp() -> str:
+    """Stamp format: YYYYMMDD_HHMMSS_<tag>. Override with MEDIUM_VALIDATION_STAMP."""
+    explicit = os.environ.get("MEDIUM_VALIDATION_STAMP")
+    if explicit:
+        return explicit
+    tag = os.environ.get("MEDIUM_VALIDATION_STAMP_TAG", "cov50").strip().strip("_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{ts}_{tag}" if tag else ts
+
+
+STAMP = _resolve_experiment_stamp()
 OUT_DIR = os.path.join("experiments", f"medium_validation_{STAMP}")
 CHECKPOINT_DIR = os.path.join(OUT_DIR, "checkpoints")
 PROCESSED_TAXI_PATH = os.path.join(
@@ -47,6 +54,38 @@ FORECAST_HORIZON = 15
 INFERENCE_ONLY = os.environ.get("MEDIUM_VALIDATION_INFERENCE_ONLY", "0") == "1"
 INFERENCE_FORCE = os.environ.get("MEDIUM_VALIDATION_INFERENCE_FORCE", "0") == "1"
 REACTIVE_ONLY = os.environ.get("MEDIUM_VALIDATION_REACTIVE_ONLY", "0") == "1"
+PHASEC_BASELINE_JSON = os.environ.get(
+    "PHASEC_BASELINE_RESULTS_JSON",
+    os.path.join(
+        "experiments",
+        "medium_validation_20260526_phaseC_softguard_v1",
+        "results.json",
+    ),
+)
+
+
+def _load_phasec_baseline():
+    """P2: Phase C v1 GAT 对照（历史 checkpoint 实验，只读指标）。"""
+    path = PHASEC_BASELINE_JSON
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    out = {"source": path}
+    for stage in ("train", "inference"):
+        for mode in ("proactive", "reactive"):
+            gat = (data.get(stage) or {}).get(mode, {}).get("GAT-MARL")
+            if gat:
+                out[f"{stage}_{mode}"] = {
+                    "total_migrations": gat.get("total_migrations"),
+                    "avg_total_cost_ms": gat.get("avg_total_cost_ms"),
+                    "p95_sla_excess_distance_km": gat.get("p95_sla_excess_distance_km"),
+                    "stay_action_ratio": gat.get("stay_action_ratio"),
+                }
+    return out if len(out) > 1 else None
 
 
 def _progress(msg: str) -> None:
@@ -167,6 +206,15 @@ def _summarize_result(res):
         "action_mask_fallback_count",
         "lambda_migration",
         "lambda_split",
+        "epoch_stats",
+        "mask_only_stay_agent_count",
+        "mask_only_stay_agent_ratio",
+        "agents_with_migrate_option_count",
+        "decisions_with_migrate_option_count",
+        "decisions_with_migrate_option_ratio",
+        "avg_legal_migrate_actions_per_decision",
+        "epsilon_greedy_samples",
+        "argmax_samples",
     ]
     out = {k: _to_jsonable(res.get(k)) for k in keys if k in res}
     out["avg_total_cost_ms"] = _avg_total_cost_ms(res)
@@ -432,6 +480,49 @@ def _write_report(payload):
             lines.append(f"| {k} | {mig.get(k, 0)} | {dc} | {avg:.2f} |\n")
         return "".join(lines) + "\n"
 
+    def gat_epoch_section(stage, mode):
+        res = payload.get(stage, {}).get(mode, {}).get("GAT-MARL", {})
+        epochs = res.get("epoch_stats") or []
+        if not epochs:
+            return ""
+        lines = [
+            f"### {stage} {mode} — GAT-MARL per-epoch exploration\n",
+            "| Epoch | Phase | ε | Migrations | stay_ratio | act_1 | act_2 | act_3 | "
+            "eps_greedy | migrate_opt_dec | mask_only_stay |\n",
+            "|-------|-------|---|------------|------------|-------|-------|-------|"
+            "------------|-----------------|----------------|\n",
+        ]
+        for ep in epochs:
+            counts = ep.get("candidate_action_counts") or {}
+            lines.append(
+                f"| {ep.get('epoch', '—')} | {ep.get('phase', '—')} | "
+                f"{float(ep.get('epsilon_end', 0)):.3f} | {ep.get('total_migrations', '—')} | "
+                f"{float(ep.get('stay_action_ratio', 0)):.4f} | "
+                f"{counts.get('1', 0)} | {counts.get('2', 0)} | {counts.get('3', 0)} | "
+                f"{ep.get('epsilon_greedy_samples', '—')} | "
+                f"{ep.get('decisions_with_migrate_option_count', '—')}/"
+                f"{ep.get('decision_count', '—')} | "
+                f"{float(ep.get('mask_only_stay_agent_ratio', 0)):.4f} |\n"
+            )
+        return "".join(lines) + "\n"
+
+    def _phasec_baseline_section(pl):
+        baseline = pl.get("phasec_baseline") or {}
+        infer = baseline.get("inference_reactive") or baseline.get("inference_proactive")
+        if not infer:
+            return ""
+        src = baseline.get("source", "—")
+        return (
+            f"\n### Phase C 历史对照（迁移学习基线）\n"
+            f"来源：`{src}`\n\n"
+            "| 指标 | Phase C GAT | 说明 |\n"
+            "|------|-------------|------|\n"
+            f"| 推理迁移 | {infer.get('total_migrations', '—')} | v1 + softguard |\n"
+            f"| Avg Total Cost (ms) | {infer.get('avg_total_cost_ms', '—')} | |\n"
+            f"| P95 Excess (km) | {infer.get('p95_sla_excess_distance_km', '—')} | |\n"
+            f"| stay_ratio | {infer.get('stay_action_ratio', '—')} | |\n\n"
+        )
+
     def table(pro, rea):
         s = "| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Proactive Decisions | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |\n"
         s += "|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|---------------------|------------------------|-------------------------|----------------------------|\n"
@@ -480,8 +571,11 @@ def _write_report(payload):
 
 {reactive_table(infer_rea)}
 
+{gat_epoch_section("train", "reactive")}
+{gat_epoch_section("inference", "reactive")}
 {dag_type_section("inference", "reactive", "GAT-MARL")}
 {dag_type_section("inference", "reactive", "SA")}
+{_phasec_baseline_section(payload)}
 """
     else:
         body = f"""# 中等规模 cov50 数据验证报告
@@ -587,6 +681,14 @@ def main():
                 "processed_taxi_path": PROCESSED_TAXI_PATH,
                 "started_at": datetime.now().isoformat(),
                 "reactive_only": REACTIVE_ONLY,
+                "reward_v2_curriculum": os.environ.get("REWARD_V2_CURRICULUM", "0"),
+                "reward_v2_internal_gamma": os.environ.get("REWARD_V2_INTERNAL_GAMMA", "0"),
+                "reward_v2_gamma_warmup_epochs": os.environ.get("REWARD_V2_GAMMA_WARMUP_EPOCHS", "2"),
+                "marl_soft_cf_bias": os.environ.get("MARL_SOFT_CF_BIAS", "0"),
+                "marl_cf_sla_gain_gate": os.environ.get("MARL_CF_SLA_GAIN_GATE", "0"),
+                "marl_cf_gate_mode": os.environ.get("MARL_CF_GATE_MODE", "score"),
+                "marl_sla_violation_gate": os.environ.get("MARL_SLA_VIOLATION_GATE", "1" if os.environ.get("REWARD_SCHEME") == "v2" else "0"),
+                "marl_warmstart_checkpoint": os.environ.get("MARL_WARMSTART_CHECKPOINT"),
             },
             "data": {
                 "rows": int(len(df)),
@@ -602,6 +704,11 @@ def main():
             "train": {"proactive": {}, "reactive": {}},
             "inference": {"proactive": {}, "reactive": {}},
         }
+
+    if not payload.get("phasec_baseline"):
+        phasec = _load_phasec_baseline()
+        if phasec:
+            payload["phasec_baseline"] = phasec
 
     phases = [
         ("train", "proactive", train_df, True, False),

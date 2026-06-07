@@ -1,13 +1,13 @@
 """
 State builders and action masks for CTDE-GAT-MARL microservice migration.
 
-This module intentionally has no SA prior.  It only uses physical mobility,
-candidate edge servers, trigger context, and the microservice DAG itself.
+P1 (v2.1): DAG-type family encoding, entry counterfactual candidate features,
+entry-first action masks, coordinated with max-one migration in marl_gat.py.
 """
 
 import numpy as np
 
-from core.context import TRIGGER_PROACTIVE
+from core.context import TRIGGER_PROACTIVE, DISTANCE_THRESHOLD_KM
 from core.dag_utils import get_service_entry_nodes, is_external_node, topological_sort
 from core.geo import haversine_distance
 from core.reward import dag_max_traffic_log_rpc, traffic_log_rpc_feature
@@ -20,6 +20,35 @@ ACTION_CANDIDATE_2 = 2
 ACTION_CANDIDATE_3 = 3
 MARL_ACTION_DIM = 4
 MAX_CANDIDATES = 3
+
+# Feature dimensions (P1 expanded)
+MARL_NODE_FEAT_DIM = 17
+MARL_TRIGGER_BASE_DIM = 3
+MARL_DAG_TYPE_FAMILY_DIM = 6
+MARL_TRIGGER_CONTEXT_DIM = MARL_TRIGGER_BASE_DIM + MARL_DAG_TYPE_FAMILY_DIM
+MARL_CANDIDATE_FEAT_PER_SERVER = 4
+MARL_CANDIDATE_FEATURE_DIM = MAX_CANDIDATES * MARL_CANDIDATE_FEAT_PER_SERVER
+
+DAG_TYPE_FAMILIES = (
+    "FanIn",
+    "FanOut",
+    "Diamond",
+    "Pipeline",
+    "Data_Heavy",
+    "Compute_Heavy",
+)
+
+
+def encode_dag_type_family(dag_type_name):
+    """One-hot over coarse DAG family (6 dims)."""
+    vec = np.zeros(MARL_DAG_TYPE_FAMILY_DIM, dtype=np.float32)
+    if not dag_type_name:
+        return vec
+    for i, family in enumerate(DAG_TYPE_FAMILIES):
+        if dag_type_name.startswith(family):
+            vec[i] = 1.0
+            return vec
+    return vec
 
 
 def _mobility_context(user_lat, user_lon, predicted_locations):
@@ -39,16 +68,87 @@ def _mobility_context(user_lat, user_lon, predicted_locations):
     )
 
 
-def build_marl_action_mask(candidates, current_server, *, node_movable=True):
+def _entry_counterfactual_features(
+    dag_info,
+    current_assignments,
+    candidates,
+    current_lat,
+    current_lon,
+    servers_info,
+):
+    """
+    Per-candidate entry SLA counterfactual (primary entry hypothetically on candidate k).
+
+    Returns flat candidate vector (12,) and per-node entry CF gains for primary (3,).
+    """
+    candidate_features = np.zeros((MAX_CANDIDATES, MARL_CANDIDATE_FEAT_PER_SERVER), dtype=np.float32)
+    node_entry_cf = np.zeros((len(dag_info["nodes"]), 3), dtype=np.float32)
+    entry_nodes = get_service_entry_nodes(dag_info)
+    if not entry_nodes:
+        return candidate_features.reshape(-1), node_entry_cf
+
+    primary_entry = entry_nodes[0]
+    node_names = sorted(dag_info["nodes"].keys())
+    primary_idx = node_names.index(primary_entry) if primary_entry in node_names else None
+
+    def _dist_to_user(server_id):
+        lat, lon = servers_info[server_id]
+        return float(haversine_distance(current_lat, current_lon, lat, lon))
+
+    entry_dists = [
+        _dist_to_user(current_assignments[node])
+        for node in entry_nodes
+    ]
+    current_max_entry_dist = max(entry_dists) if entry_dists else 0.0
+    thresh = max(float(DISTANCE_THRESHOLD_KM), 1e-6)
+
+    cf_gains = []
+    for idx in range(MAX_CANDIDATES):
+        if idx >= len(candidates or []):
+            cf_gains.append(0.0)
+            continue
+        server_id = candidates[idx][0]
+        cand_dist = candidates[idx][1] if len(candidates[idx]) > 1 else _dist_to_user(server_id)
+        candidate_features[idx, 0] = min(float(cand_dist) / 50.0, 1.0)
+        candidate_features[idx, 1] = 1.0 if server_id in current_assignments.values() else 0.0
+
+        new_entry_dists = []
+        for node in entry_nodes:
+            if node == primary_entry:
+                new_entry_dists.append(_dist_to_user(server_id))
+            else:
+                new_entry_dists.append(_dist_to_user(current_assignments[node]))
+        new_max = max(new_entry_dists) if new_entry_dists else cand_dist
+        gain_km = max(0.0, current_max_entry_dist - new_max)
+        gain_norm = min(gain_km / thresh, 1.0)
+        cf_gains.append(gain_norm)
+        candidate_features[idx, 2] = gain_norm
+        candidate_features[idx, 3] = min(_dist_to_user(server_id) / 50.0, 1.0)
+
+    if primary_idx is not None:
+        for j in range(min(3, len(cf_gains))):
+            node_entry_cf[primary_idx, j] = cf_gains[j]
+
+    return candidate_features.reshape(-1), node_entry_cf
+
+
+def build_marl_action_mask(
+    candidates,
+    current_server,
+    *,
+    node_movable=True,
+    entry_first=False,
+    is_entry_node=False,
+):
     """
     Return a bool mask for [STAY, CANDIDATE_1, CANDIDATE_2, CANDIDATE_3].
 
-    Invalid candidate actions are masked before softmax/sampling.  If a node is
-    not movable, only STAY remains legal.  If every action is masked by an
-    unexpected input, STAY is restored as a safe physical fallback.
+    P1 entry-first: non-entry nodes only allow STAY.
     """
     mask = np.zeros(MARL_ACTION_DIM, dtype=bool)
     mask[ACTION_STAY] = True
+    if entry_first and not is_entry_node:
+        return mask
     if node_movable:
         for idx in range(min(len(candidates or []), MAX_CANDIDATES)):
             server_id = candidates[idx][0]
@@ -81,6 +181,8 @@ def build_marl_graph_state(
     current_lon,
     predicted_locations=None,
     node_movable=None,
+    dag_type=None,
+    p1_entry_first=False,
 ):
     """
     Build graph state for CTDE-GAT-MARL.
@@ -126,7 +228,16 @@ def build_marl_graph_state(
     max_node_log_rpc = max(node_log_rpc_load) if node_log_rpc_load else 1.0
     max_node_log_rpc = max(float(max_node_log_rpc), 1e-6)
 
-    node_features = np.zeros((n_nodes, 14), dtype=np.float32)
+    cf_flat, node_entry_cf_by_idx = _entry_counterfactual_features(
+        dag_info,
+        current_assignments,
+        candidates,
+        current_lat,
+        current_lon,
+        servers_info,
+    )
+
+    node_features = np.zeros((n_nodes, MARL_NODE_FEAT_DIM), dtype=np.float32)
     for i, node_name in enumerate(node_names):
         props = dag_info["nodes"][node_name]
         current_server = current_assignments[node_name]
@@ -156,6 +267,9 @@ def build_marl_graph_state(
                 1.0 if out_degrees[node_name] == 0 else 0.0,
                 1.0 if float(props["state_mb"]) >= 256.0 else 0.0,
                 1.0 if is_external_node(node_name) else 0.0,
+                float(node_entry_cf_by_idx[i, 0]),
+                float(node_entry_cf_by_idx[i, 1]),
+                float(node_entry_cf_by_idx[i, 2]),
             ],
             dtype=np.float32,
         )
@@ -183,17 +297,12 @@ def build_marl_graph_state(
     else:
         risk_ratio = 0.0
 
-    trigger_context = np.array(
+    trigger_base = np.array(
         [1.0, 0.0, risk_ratio] if trigger_type == TRIGGER_PROACTIVE else [0.0, 1.0, 1.0],
         dtype=np.float32,
     )
-
-    candidate_features = np.zeros((MAX_CANDIDATES, 2), dtype=np.float32)
-    for idx in range(min(len(candidates or []), MAX_CANDIDATES)):
-        server_id = candidates[idx][0]
-        dist_km = candidates[idx][1] if len(candidates[idx]) > 1 else 0.0
-        candidate_features[idx, 0] = min(float(dist_km) / 50.0, 1.0)
-        candidate_features[idx, 1] = 1.0 if server_id in current_assignments.values() else 0.0
+    dag_type_vec = encode_dag_type_family(dag_type)
+    trigger_context = np.concatenate([trigger_base, dag_type_vec]).astype(np.float32)
 
     movable = node_movable or {}
     action_masks = np.zeros((n_nodes, MARL_ACTION_DIM), dtype=bool)
@@ -202,6 +311,8 @@ def build_marl_graph_state(
             candidates,
             current_assignments[node_name],
             node_movable=(not is_external_node(node_name)) and bool(movable.get(node_name, True)),
+            entry_first=p1_entry_first,
+            is_entry_node=node_name in entry_nodes,
         )
 
     return {
@@ -210,7 +321,8 @@ def build_marl_graph_state(
         "adj_matrix": adj_matrix,
         "trigger_context": trigger_context,
         "mobility_context": _mobility_context(current_lat, current_lon, predicted_locations),
-        "candidate_features": candidate_features.reshape(-1),
+        "candidate_features": cf_flat,
         "action_masks": action_masks,
         "risk_ratio": risk_ratio,
+        "dag_type": dag_type,
     }

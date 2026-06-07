@@ -14,6 +14,7 @@ from core.reward import (
     MIN_BW_MBPS,
     REACTIVE_MIGRATION_MULT,
     REWARD_V2_OBJECTIVE_SCALE_MS,
+    effective_reward_v2_objective_scale_ms,
     RPC_SIZE_MB,
     SLA_DISTANCE_THRESHOLD,
     calculate_nonlinear_migration_cost_ms,
@@ -315,7 +316,7 @@ def calculate_marl_rewards(
         trigger_type=trigger_type,
     )
     effective_local_cost_scale_ms = (
-        REWARD_V2_OBJECTIVE_SCALE_MS if is_reward_v2() else local_cost_scale_ms
+        effective_reward_v2_objective_scale_ms() if is_reward_v2() else local_cost_scale_ms
     )
     migration_costs = _local_migration_costs(
         dag_info,

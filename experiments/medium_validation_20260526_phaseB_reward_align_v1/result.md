@@ -1,79 +1,61 @@
-# 中等规模 cov50 数据验证报告
+# 中等规模 cov50 数据验证报告（仅 Reactive）
 
-**生成时间**：2026-05-26 14:09:28  
+**生成时间**：2026-06-05 15:22:32  
 **输出目录**：`experiments\medium_validation_20260526_phaseB_reward_align_v1`  
-**数据文件**：`data\processed\taxi_cleaned_active100_min100_eps2h_cov50.csv`  
-**数据规模**：Top-12 active taxis；train=37832 rows/9 taxis；test=11548 rows/3 taxis  
-**切分方式**：balanced_by_nearest_server_exposure；test row ratio=0.234；test risk ratio=0.134  
-**GAT-MARL epochs**：Proactive=2，Reactive=2
+**模式**：仅 Reactive（无轨迹预测 / 无 Proactive TTV）  
+**GAT-MARL epochs**：2（reactive）
 
-## 训练段
+## 训练段（Reactive）
 
-| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Proactive Decisions | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |
-|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|---------------------|------------------------|-------------------------|----------------------------|
-| SA | 156 | 22608 | 7281 | 2.11 | 12.96 | 24107.36 | 244 | 6.60 | 2.08 | 24180.95 |
-| Nearest | 2434 | 5312 | 4986 | 1.22 | 11.51 | 50311.08 | 288 | 0.05 | 2.11 | 124857.06 |
-| DQN | 3591 | 6566 | 5212 | 1.37 | 11.79 | 53604.96 | 284 | 0.78 | 2.11 | 82489.15 |
-| GAT-MARL | 198 | 20610 | 6822 | 1.98 | 11.57 | 22131.42 | 250 | 0.80 | 2.08 | 22441.48 |
-
-| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |
-|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|------------------------|-------------------------|----------------------------|
-| SA | 9 | 24923 | 10078 | 3.70 | 18.62 | 46400.66 | 5.05 | 2.10 | 46515.21 |
-| Nearest | 1934 | 5525 | 4987 | 1.22 | 11.51 | 50994.03 | 0.05 | 2.11 | 146543.64 |
-| DQN | 4581 | 10087 | 5557 | 1.46 | 11.80 | 44773.93 | 0.47 | 2.11 | 64944.30 |
-| GAT-MARL | 239 | 19635 | 5215 | 1.43 | 11.56 | 20270.66 | 0.67 | 2.08 | 20862.03 |
+| Algorithm | Migrations | SLA Risk | Severe | P95 Excess (km) | Avg SLA Penalty (ms) | Avg Total Cost (ms) | stay_ratio |
+|-----------|------------|----------|--------|-----------------|----------------------|---------------------|------------|
+| SA | 113 | 23608 | 7019 | 12.28079281497639 | 8090.84 | 8340.481837316167 | — |
+| Nearest | 1998 | 5525 | 4987 | 11.51333567241429 | 20054.39 | 102367.40022683913 | — |
+| DQN | 2485 | 7238 | 5096 | 11.793861941039431 | 19776.50 | 50442.194114641854 | — |
+| GAT-MARL | 5545 | 11639 | 7284 | 31.10785841521524 | 137333.31 | 144136.00871949422 | 0.8637 |
 
 
-## 推理段
+## 推理段（Reactive）
 
-| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Proactive Decisions | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |
-|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|---------------------|------------------------|-------------------------|----------------------------|
-| SA | 78 | 5984 | 961 | 1.18 | 6.72 | 14553.22 | 144 | 53.37 | 2.08 | 14839.34 |
-| Nearest | 1078 | 864 | 443 | 0.50 | 4.91 | 32956.28 | 124 | 0.07 | 2.09 | 213085.19 |
-| DQN | 1027 | 3197 | 997 | 0.98 | 7.35 | 32192.73 | 159 | 0.65 | 2.09 | 59347.54 |
-| GAT-MARL | 147 | 5691 | 943 | 1.31 | 8.37 | 14708.04 | 124 | 1.17 | 2.08 | 15177.41 |
-
-| Algorithm | Migrations | SLA Risk Count | Severe SLA Violations | Avg SLA Excess (km) | P95 SLA Excess (km) | Avg SLA Penalty (ms) | Avg Decision Time (ms) | Avg Access Latency (ms) | Avg Total System Cost (ms) |
-|-----------|------------|----------------|-----------------------|---------------------|---------------------|----------------------|------------------------|-------------------------|----------------------------|
-| SA | 93 | 5103 | 1143 | 1.09 | 9.27 | 17490.92 | 40.79 | 2.08 | 17812.12 |
-| Nearest | 988 | 956 | 443 | 0.50 | 4.91 | 34059.42 | 0.07 | 2.09 | 326779.85 |
-| DQN | 1219 | 2430 | 462 | 0.54 | 4.91 | 16489.54 | 0.50 | 2.08 | 24724.20 |
-| GAT-MARL | 127 | 3056 | 609 | 0.65 | 5.37 | 20767.47 | 0.97 | 2.08 | 22248.60 |
+| Algorithm | Migrations | SLA Risk | Severe | P95 Excess (km) | Avg SLA Penalty (ms) | Avg Total Cost (ms) | stay_ratio |
+|-----------|------------|----------|--------|-----------------|----------------------|---------------------|------------|
+| SA | 7 | 3394 | 613 | 5.407628130286781 | 5427.18 | 5686.195904823701 | — |
+| Nearest | 817 | 956 | 443 | 4.9088367564877515 | 12901.84 | 188219.46655715958 | — |
+| DQN | 380 | 954 | 742 | 6.718531438767986 | 17069.75 | 54929.25069787511 | — |
+| GAT-MARL | 1288 | 3499 | 1223 | 30.961036060217523 | 58859.18 | 63377.018485304754 | 0.9170 |
 
 
-## 成本分解堆叠图
+### train reactive — GAT-MARL per-epoch exploration
+| Epoch | Phase | ε | Migrations | stay_ratio | act_1 | act_2 | act_3 | eps_greedy | migrate_opt_dec | mask_only_stay |
+|-------|-------|---|------------|------------|-------|-------|-------|------------|-----------------|----------------|
+| 0 | train | 0.020 | 7325 | 0.8096 | 3903 | 301 | 3121 | 1041 | 8139/8139 | 0.5663 |
+| 1 | eval | 0.020 | 5545 | 0.8637 | 2948 | 0 | 2597 | 0 | 5938/5938 | 0.1926 |
+
+
+### inference reactive — GAT-MARL per-epoch exploration
+| Epoch | Phase | ε | Migrations | stay_ratio | act_1 | act_2 | act_3 | eps_greedy | migrate_opt_dec | mask_only_stay |
+|-------|-------|---|------------|------------|-------|-------|-------|------------|-----------------|----------------|
+| 0 | eval | 0.000 | 1288 | 0.9170 | 704 | 0 | 584 | 0 | 2677/2677 | 0.4737 |
+
+
+### inference reactive — GAT-MARL by DAG type
+| DAG type | migrations | decisions | avg_total_cost_ms |
+|----------|------------|-----------|-------------------|
+| Compute_Heavy_DAG_1 | 132 | 1521 | 8539.16 |
+| Diamond_DAG_3 | 57 | 57 | 41388.57 |
+| FanIn_Aggregator_1 | 1099 | 1099 | 140412.26 |
+
+
+
+
+## 成本分解堆叠图（Reactive）
 
 ![Inference Cost Decomposition](cost_decomposition_inference.png)
 
-## 推理阶段成本分解均值
-
-| Algorithm | Proactive SLA Penalty (ms) | Proactive Migration (ms) | Reactive SLA Penalty (ms) | Reactive Migration (ms) |
-|-----------|----------------------------|--------------------------|---------------------------|-------------------------|
-| SA | 14553.22 | 163.91 | 17490.92 | 259.00 |
-| Nearest | 32956.28 | 180126.79 | 34059.42 | 292718.34 |
-| DQN | 32192.73 | 27032.67 | 16489.54 | 8174.13 |
-| GAT-MARL | 14708.04 | 420.64 | 20767.47 | 1301.52 |
-
-
-## 推理阶段迁移效率指标
-
-> **Cost/Node** = `total_migration_cost / total_migrations`（每次迁移节点的平均线性物理时延）  
-> **Cost/Mig Decision** = `total_migration_cost / migration_decision_count`（仅 `migration_cost > 0` 的决策）  
-> **Migration Share** = `total_migration_cost / total_cost_ms_sum`（迁移在总系统成本中的占比）
-
-| Algorithm | Pro: Cost/Node (ms) | Pro: Cost/Mig Decision (ms) | Pro: Migration Share | Rea: Cost/Node (ms) | Rea: Cost/Mig Decision (ms) | Rea: Migration Share |
-|-----------|---------------------|-----------------------------|----------------------|---------------------|-----------------------------|----------------------|
-| SA | 11961.42 | 23324.77 | 1.10% | 10145.72 | 34946.39 | 1.45% |
-| Nearest | 165088.38 | 983233.53 | 84.53% | 283237.58 | 1841044.30 | 89.58% |
-| DQN | 43826.09 | 95561.35 | 45.55% | 16294.61 | 26697.76 | 33.06% |
-| GAT-MARL | 11672.09 | 16988.09 | 2.77% | 17790.86 | 21936.30 | 5.85% |
-
-
 ## 本轮验证关注点
 
-- 验证脚本显式使用 cov50 覆盖过滤数据，不再读取旧 cleaned CSV。
-- train/test 按最近服务器距离风险暴露平衡切分，减少 proactive opportunity 偏斜。
-- Avg Decision Time 是算法计算耗时；Avg Access Latency 是真实接入延迟；Avg Total System Cost 使用 `total_cost_ms_sum / decision_count`，包含 SLA penalty 和迁移等系统代价。
-- 迁移对比优先看「迁移效率指标」表（按节点 / 按有迁解决策 / 占比），而非 `total_migration_cost / decision_count`（会被大量无迁解决策稀释）。
-- SLA Risk Count 是 max-entry 风险次数；Severe SLA Violations 和 SLA Excess 用于区分轻微风险与严重服务质量退化。
+- 仅 Reactive：无轨迹预测器、无 Proactive TTV。
+- `stay_action_ratio` 接近 1.0 表示策略几乎不迁移；`candidate_action_counts` 中迁移动作计数应逐步上升。
+- `migrations_by_dag_type` / `cost_by_dag_type` 用于观察反撕裂（Data_Heavy / FanOut 少迁、Simple 可拆）。
+- SA 为 GAT-MARL 锚点（D0 后 L_internal 计入总成本，SA 应倾向少拆图）。
 

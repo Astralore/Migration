@@ -69,6 +69,68 @@ REWARD_RECOVERY_BONUS_MAX = 0.0
 REWARD_DISTANCE_BONUS_WEIGHT = 0.0
 # Backward-compatible export; reward no longer hard-clips to this value.
 REWARD_CLIP_MIN = -float("inf")
+
+# P2: per-epoch curriculum overrides (see core/reward_curriculum.py)
+_reward_v2_runtime = {}
+
+
+def set_reward_v2_runtime(
+    *,
+    objective_scale_ms=None,
+    sla_alpha_mult=None,
+    sla_beta_mult=None,
+    migration_lambda_mult=None,
+    internal_path_gamma=None,
+):
+    """Set ephemeral v2 reward knobs for the current MARL epoch."""
+    global _reward_v2_runtime
+    updates = {}
+    if objective_scale_ms is not None:
+        updates["objective_scale_ms"] = float(objective_scale_ms)
+    if sla_alpha_mult is not None:
+        updates["sla_alpha_mult"] = float(sla_alpha_mult)
+    if sla_beta_mult is not None:
+        updates["sla_beta_mult"] = float(sla_beta_mult)
+    if migration_lambda_mult is not None:
+        updates["migration_lambda_mult"] = float(migration_lambda_mult)
+    if internal_path_gamma is not None:
+        updates["internal_path_gamma"] = float(internal_path_gamma)
+    _reward_v2_runtime.update(updates)
+
+
+def clear_reward_v2_runtime():
+    global _reward_v2_runtime
+    _reward_v2_runtime = {}
+
+
+def effective_reward_v2_objective_scale_ms():
+    if "objective_scale_ms" in _reward_v2_runtime:
+        return float(_reward_v2_runtime["objective_scale_ms"])
+    return REWARD_V2_OBJECTIVE_SCALE_MS
+
+
+def effective_reward_v2_sla_alpha_ms_per_km2():
+    mult = float(_reward_v2_runtime.get("sla_alpha_mult", 1.0))
+    return REWARD_V2_SLA_ALPHA_MS_PER_KM2 * mult
+
+
+def effective_reward_v2_qos_beta_ms_per_km2():
+    mult = float(_reward_v2_runtime.get("sla_beta_mult", 1.0))
+    return REWARD_V2_QOS_BETA_MS_PER_KM2 * mult
+
+
+def effective_reward_v2_migration_lambda():
+    mult = float(_reward_v2_runtime.get("migration_lambda_mult", 1.0))
+    return REWARD_V2_MIGRATION_LAMBDA * mult
+
+
+def effective_internal_path_gamma():
+    """P3: mask L_internal in training objective (1.0 = full topology pain)."""
+    if "internal_path_gamma" in _reward_v2_runtime:
+        return float(_reward_v2_runtime["internal_path_gamma"])
+    return 1.0
+
+
 MB_TO_MBIT = 8.0
 BASE_MIGRATION_OVERHEAD_MS = 200.0
 # Reactive 下迁移段额外系数（原 gamma 不对称语义的简化承接）
@@ -271,9 +333,9 @@ def calculate_sla_penalty_ms(
     if distance_excess_km <= 0.0 and qos_excess_km <= 0.0:
         return 0.0
     if is_reward_v2():
-        penalty = (distance_excess_km ** 2) * REWARD_V2_SLA_ALPHA_MS_PER_KM2
+        penalty = (distance_excess_km ** 2) * effective_reward_v2_sla_alpha_ms_per_km2()
         if qos_excess_km > 0.0:
-            penalty += (qos_excess_km ** 2) * REWARD_V2_QOS_BETA_MS_PER_KM2
+            penalty += (qos_excess_km ** 2) * effective_reward_v2_qos_beta_ms_per_km2()
     else:
         equivalent_excess_km = distance_excess_km + qos_excess_km
         penalty = (
@@ -318,7 +380,7 @@ def future_mean_excess_penalty_ms(mean_excess_km):
     if excess <= 0.0:
         return 0.0
     if is_reward_v2():
-        return (excess ** 2) * REWARD_V2_SLA_ALPHA_MS_PER_KM2
+        return (excess ** 2) * effective_reward_v2_sla_alpha_ms_per_km2()
     return excess * SLA_PENALTY_PER_KM_MS
 
 
@@ -358,7 +420,7 @@ def calculate_nonlinear_migration_cost_ms(raw_migration_ms, image_mb, state_mb):
     base_ms = max(0.0, float(raw_migration_ms))
     if is_reward_v2():
         nonlinear_cost = (
-            REWARD_V2_MIGRATION_LAMBDA
+            effective_reward_v2_migration_lambda()
             * base_ms
             * _exp_migration_size_multiplier(image_mb, state_mb)
         )
@@ -398,6 +460,38 @@ def calculate_entry_sla_metrics(entry_nodes, assignments, user_lat, user_lon, se
         "max_entry_distance_km": float(max_dist),
         "sla_excess_distance_km": float(excess),
         "severe_sla_violation": int(excess > SEVERE_SLA_EXCESS_KM),
+    }
+
+
+def dag_current_sla_violation(dag_info, assignments, user_lat, user_lon, servers_info):
+    """
+    Current DAG SLA violation flags (aligned with ``calculate_microservice_reward``).
+
+    Used by GAT-MARL B1 action gate: migrate actions are allowed only when
+    ``spatial_violation or qos_violation`` is True.
+    """
+    max_entry_dist_km, access_latency_ms = _entry_access_profile(
+        assignments, dag_info, user_lat, user_lon, servers_info
+    )
+    internal_critical_path_ms = 0.0
+    if use_reward_v2_internal_path():
+        internal_critical_path_ms = compute_internal_critical_path_ms(
+            dag_info, assignments, servers_info
+        )
+    l_e2e_ms = access_latency_ms + internal_critical_path_ms
+    spatial_violation = max_entry_dist_km > SLA_DISTANCE_THRESHOLD
+    if use_reward_v2_internal_path():
+        qos_violation = l_e2e_ms > USER_SLA_TOLERANCE_MS
+    else:
+        qos_violation = access_latency_ms > USER_SLA_TOLERANCE_MS
+    return {
+        "spatial_violation": bool(spatial_violation),
+        "qos_violation": bool(qos_violation),
+        "violated": bool(spatial_violation or qos_violation),
+        "max_entry_dist_km": float(max_entry_dist_km),
+        "access_latency_ms": float(access_latency_ms),
+        "l_e2e_ms": float(l_e2e_ms),
+        "internal_critical_path_ms": float(internal_critical_path_ms),
     }
 
 
@@ -520,10 +614,12 @@ def calculate_microservice_reward(
         internal_path_ms=0.0,
         use_e2e_qos=False,
     )
+    _gamma = effective_internal_path_gamma()
+    _internal_objective_ms = internal_critical_path_ms * _gamma
     sla_penalty_objective_ms = calculate_sla_penalty_ms(
         max_entry_dist_km,
         access_latency_ms,
-        internal_path_ms=internal_critical_path_ms,
+        internal_path_ms=_internal_objective_ms,
         use_e2e_qos=use_reward_v2_internal_path(),
     )
 
@@ -564,7 +660,7 @@ def calculate_microservice_reward(
     reward_bonus = min(distance_bonus + recovery_bonus, REWARD_RECOVERY_BONUS_MAX)
 
     if is_reward_v2():
-        scale = max(REWARD_V2_OBJECTIVE_SCALE_MS, 1e-6)
+        scale = max(effective_reward_v2_objective_scale_ms(), 1e-6)
         reward = -float(max(reward_objective_ms, 0.0) / scale) + reward_bonus
     else:
         reward = (
@@ -616,6 +712,8 @@ def calculate_microservice_reward(
         "trigger_type": trigger_type,
         "sla_penalty_ms": sla_penalty_ms,
         "sla_penalty_objective_ms": sla_penalty_objective_ms,
+        "internal_path_gamma": _gamma,
+        "internal_path_objective_ms": _internal_objective_ms,
         "l_e2e_ms": l_e2e_ms,
         "access_latency_ms": access_latency_ms,
         "max_entry_distance_km": max_entry_dist_km,

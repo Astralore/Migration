@@ -141,7 +141,7 @@ J = P_SLA + C_mig^nl；P_SLA 不含 comm / L_internal
 |------|------|------|
 | D1.1–D1.3 | `core/reward.py` | ✅ `use_reward_v2_internal_path()`；`L_e2e` 进入 **训练** `E_q`；`reward_objective_ms` 用 `sla_penalty_objective_ms` |
 | D1.4 | `algorithms/marl_gat.py` | ✅ CF 重算动作前后 `L_internal`；`_edge_split_delta_ms` 对齐 D0 |
-| D1.5 | 脚本 | ✅ `run_reward_v21_medium_test_cov50.py`、`run_reward_v21_softguard_train_cov50.py` |
+| D1.5 | 脚本 | ✅ `run_reward_v21_cov50.py` |
 | D1.6 | 冒烟 | `python scripts/verify_d1_internal_sla.py` |
 
 **环境变量**：
@@ -241,10 +241,8 @@ total_cost_ms = L_acc + migration + tearing + L_internal + future + P_SLA
 | 阶段 | 脚本（新建或沿用） | Stamp 建议 |
 |------|-------------------|------------|
 | D0 验证 | `run_medium_validation_cov50.py` + env 仅物理层 | `20260527_comm_critical_path_d0_v1` |
-| v2.0 基线（已完成/进行中） | `run_reward_v2_medium_test_cov50.py` | `reward_v2_scale10000_v1` |
-| v2.0 全量 | `run_reward_v2_softguard_train_cov50.py` | `reward_v2_softguard_scale10000_v1` |
-| v2.1 | `run_reward_v21_medium_test_cov50.py`（待建） | `reward_v21_internal_cp_v1` |
-| 公平公式 | `run_reward_v2_phaseB_aligned_cov50.py` | 在 **v2.1 稳定后** 再跑 |
+| v2.1 | **`run_reward_v21_cov50.py`** | 默认 8ep reactive；`MARL_EPOCHS=2` 快筛 |
+| v2.0 归档 | `scripts/archive/run_reward_v2_*.py` | 历史对照，日常不用 |
 
 **读表规则**（《全面总结》§10）：同时看 `avg_total_cost_ms`、`p95_sla_excess`、`severe_sla_violations`、`migration_share`、**新增** `avg_internal_path_ms`。
 
@@ -284,22 +282,41 @@ total_cost_ms = L_acc + migration + tearing + L_internal + future + P_SLA
 
 ---
 
-## 8. 近期实验索引（v2 线，供对照）
+## 8. 近期实验索引
+
+完整整理见 [`docs/experiment_results_summary.md`](docs/experiment_results_summary.md)。
 
 | 目录 | 要点 |
 |------|------|
-| `experiments/medium_validation_20260526_reward_v2_scale5000_v1` | S=5000；Re 推理 0 迁移；P95≈31 km |
-| `experiments/medium_validation_20260526_reward_v2_scale10000_v1` | S=10000 + future_gain 修复；Pro P95≈5.9 km；Re P95≈31 km |
-| `experiments/medium_validation_20260526_phaseC_softguard_v1` | v1 标杆：GAT Pro 总成本≈18.6k，P95≈4.9 km |
-| `experiments/medium_validation_20260526_phaseB2_reward_align_v1` | v1 + MAX=1：GAT Pro 总成本≈15.4k |
+| `medium_validation_20260605_170422_reward_v21_p3_8ep` | **P3 8ep**：1736 迁 / ~46k ms / P95≈6.7 km（成本与 P95 改善，迁移仍过频） |
+| `medium_validation_20260605_162655_reward_v21_p2_2ep` | **P2 验证**：课程+soft CF+P1 热启动；推理与 P1 相近（1758 迁 / ~89k ms） |
+| `medium_validation_20260605_145403_reward_v21_p1_v1` | **P1 验证**：2ep reactive、P1 on；推理 1758 迁 stay=0.85 |
+| `medium_validation_20260605_reward_v21_softguard_reactive_8ep_v1` | **v2.1 主线**：8ep reactive、bypass、Epoch0 stay=0.89；eval/推理仍 0 迁 |
+| `medium_validation_20260526_phaseC_softguard_v1` | v1 标杆：GAT Pro ~18.6k ms，P95≈4.9 km |
+| `medium_validation_20260526_phaseB2_reward_align_v1` | v1 公平对照 |
+| `medium_validation_20260526_reward_v2_scale10000_v1` | v2 S=10000 快筛 |
+
+**实验目录命名**（后续默认）：`YYYYMMDD_HHMMSS_<tag>`，启动脚本设 `MEDIUM_VALIDATION_STAMP_TAG` 即可。
 
 ---
 
-## 9. 下一步（待你确认后动代码）
+## 9. 路线图
 
-1. **实现阶段 D0**（仅 `core/reward.py` + `marl_reward` 边代价对齐 + 冒烟实验）  
-2. 评审 D0 的 `avg_internal_path_ms` 与 SA 成本分布  
-3. **实现阶段 D1**（`REWARD_V2_USE_INTERNAL_PATH` + counterfactual + 文档）  
-4. 2 epoch 快筛 → 8 epoch；再与 Phase C / B2 对比  
+| 优先级 | 状态 | 内容 |
+|--------|------|------|
+| P0 | ✅ 完成 | 分 epoch 指标（`epoch_stats`）+ 8 epoch reactive 全量 |
+| **P1** | ✅ 完成 | **动作空间向 SA 邻域靠拢**（entry-first / 每步最多 1 迁） |
+| **P1** | ✅ 完成 | **DAG type 条件化 + entry counterfactual 特征** |
+| P2 | ✅ 完成 | reward 课程（S / αβ 退火）+ 软 logit bias |
+| P2 | ✅ 完成 | Phase C checkpoint 迁移学习对照 |
+| **P3** | ✅ 完成 | **L_internal γ 课程**（训练目标蒙眼，eval γ=1） |
+| **P3 结果** | ⚠️ 部分 | 8ep：成本 ~46k（↓49%）、P95 ~6.7 km（↓78%）；迁移仍 ~1736 |
+| **P4 / B1** | ✅ 已实施 | SLA 违规物理 mask（无违规强制 STAY） |
 
-如同意，可从 **D0.1–D0.3** 开始提交代码变更。
+**详细总结与 P4 计划**：[docs/Reward_v21_P3总结与P4修改计划.md](docs/Reward_v21_P3总结与P4修改计划.md)
+
+**P3 入口**：`python -u run_reward_v21_p3_cov50.py`（默认 8 epoch，tag `reward_v21_p3_8ep`）
+
+γ 日程（8 ep，warmup=2）：ep0–1 → 0；ep2→0；ep3→0.25；…；ep6+ → 1.0；eval 固定 1.0。
+
+> **P1 即 test.md 原 310–311 行两项**，需改 `algorithms/marl_gat.py` / 状态特征，不是再加实验脚本。

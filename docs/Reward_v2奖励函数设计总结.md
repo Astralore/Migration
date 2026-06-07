@@ -30,10 +30,8 @@ export REWARD_SCHEME=v2    # 亦支持 2 / reward_v2
 | 实现 | `core/reward.py` → `is_reward_v2()` 分支 |
 | MARL 分解 | `core/marl_reward.py` → `_local_migration_costs()` 复用同一非线性函数 |
 | v1/v2 场景对比 | `scripts/compare_reward_v1_v2.py` |
-| 冒烟训练 | `run_reward_v2_medium_test_cov50.py` |
-| 完整训练 + soft guard | `run_reward_v2_softguard_train_cov50.py` |
-| 公平对照 Phase B2 | `run_reward_v2_phaseB_aligned_cov50.py` |
-| v2.1 冒烟 / 全量 | `run_reward_v21_medium_test_cov50.py`、`run_reward_v21_softguard_train_cov50.py` |
+| 冒烟 / 全量 | **`run_reward_v21_cov50.py`**（`MARL_EPOCHS=2` 快筛，默认 8 epoch） |
+| v2.0 归档 | `scripts/archive/run_reward_v2_*.py` |
 
 ---
 
