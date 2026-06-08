@@ -1,5 +1,7 @@
 """Reward decomposition for CTDE-GAT-MARL microservice migration."""
 
+import os
+
 import numpy as np
 
 from core.dag_utils import get_deployable_nodes, get_service_entry_nodes, is_external_node
@@ -23,6 +25,25 @@ from core.reward import (
     is_reward_v2,
 )
 from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
+
+# Fixed divisor for RL value/advantage scale (~7–8k ms total_cost → ~−0.7..−0.8).
+# Linear in total_cost_ms; not a tunable curriculum knob.
+TOTAL_COST_TRAIN_SCALE_MS = 10000.0
+
+
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+
+
+def train_total_cost_enabled():
+    """Direction A: critic/actor optimize −total_cost_ms (report KPI), not v2 scaled reward."""
+    return _env_flag("MARL_TRAIN_TOTAL_COST", "0")
+
+
+def total_cost_training_signal(total_cost_ms):
+    """RL return aligned with SA search objective (minimize total_cost_ms)."""
+    scale = max(float(TOTAL_COST_TRAIN_SCALE_MS), 1e-6)
+    return -float(total_cost_ms) / scale
 
 
 def lambda_schedule(step, *, warmup_steps=1000, ramp_steps=4000,
@@ -301,9 +322,10 @@ def calculate_marl_rewards(
     The shared reward is exactly the existing reward function's scalar reward.
     Local penalties are normalized by ``local_cost_scale_ms`` so their weights
     are comparable to the log-scaled shared reward.
-    
-    Distance bonus is reward-scale; proactive exploration is handled by actor
-    logit bias before action selection.
+
+    When ``MARL_TRAIN_TOTAL_COST=1`` (Direction A), ``training_reward`` and
+    per-agent returns are ``−total_cost_ms / TOTAL_COST_TRAIN_SCALE_MS`` with
+    no extra λ penalties — same physical cost as SA reports.
     """
     shared_reward, details = calculate_microservice_reward(
         taxi_id,
@@ -332,6 +354,8 @@ def calculate_marl_rewards(
         previous_assignments,
         servers_info,
     )
+    total_cost_ms = float(details["total_cost_ms"])
+    use_total_cost_train = train_total_cost_enabled()
     distance_bonuses = {node: 0.0 for node in dag_info["nodes"]}
     if dense_distance_bonus:
         distance_bonuses = _dense_distance_bonuses(
@@ -346,19 +370,27 @@ def calculate_marl_rewards(
     # than a hand-written local bonus.
     entry_sla_bonuses = {node: 0.0 for node in dag_info["nodes"]}
 
-    agent_rewards = {}
-    for node in dag_info["nodes"]:
-        if is_external_node(node):
-            agent_rewards[node] = float(shared_reward)
-            continue
-        local_penalty = (
-            lambda_migration * (migration_costs[node] / effective_local_cost_scale_ms)
-        )
-        agent_rewards[node] = float(
-            shared_reward
-            + distance_bonuses[node]
-            + entry_sla_bonuses[node]
-            - local_penalty
+    if use_total_cost_train:
+        train_signal = total_cost_training_signal(total_cost_ms)
+        agent_rewards = {node: float(train_signal) for node in dag_info["nodes"]}
+        training_reward = float(train_signal)
+    else:
+        agent_rewards = {}
+        for node in dag_info["nodes"]:
+            if is_external_node(node):
+                agent_rewards[node] = float(shared_reward)
+                continue
+            local_penalty = (
+                lambda_migration * (migration_costs[node] / effective_local_cost_scale_ms)
+            )
+            agent_rewards[node] = float(
+                shared_reward
+                + distance_bonuses[node]
+                + entry_sla_bonuses[node]
+                - local_penalty
+            )
+        training_reward = (
+            float(np.mean(list(agent_rewards.values()))) if agent_rewards else float(shared_reward)
         )
 
     details = dict(details)
@@ -376,7 +408,9 @@ def calculate_marl_rewards(
             "entry_sla_bonus_sum": float(np.sum(list(entry_sla_bonuses.values()))),
             "lambda_migration": float(lambda_migration),
             "lambda_split": float(lambda_split),
-            "training_reward": float(np.mean(list(agent_rewards.values()))) if agent_rewards else float(shared_reward),
+            "training_reward": training_reward,
+            "train_total_cost_mode": bool(use_total_cost_train),
+            "train_total_cost_scale_ms": float(TOTAL_COST_TRAIN_SCALE_MS),
         }
     )
     return float(shared_reward), agent_rewards, details

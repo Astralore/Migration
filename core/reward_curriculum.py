@@ -2,12 +2,13 @@
 Reward v2.1 P2/P3: epoch-level curriculum for objective scale, SLA weights, and
 internal-path gamma (L_internal masking in training objective only).
 
-P3 gamma: first ``REWARD_V2_GAMMA_WARMUP_EPOCHS`` (default 2) epochs use γ=0 so
-agents learn entry migration without topology tearing pain; then γ→1 before eval.
+Direction A (``MARL_TRAIN_TOTAL_COST=1``): skip P2/P3 curriculum; always γ=1 so
+``calculate_microservice_reward`` objective matches report ``total_cost_ms``.
 """
 
 import os
 
+from core.marl_reward import train_total_cost_enabled
 from core.reward import clear_reward_v2_runtime, set_reward_v2_runtime
 
 
@@ -93,6 +94,10 @@ def curriculum_params(epoch, num_epochs, *, is_eval_epoch=False):
 
 def apply_curriculum_for_epoch(epoch, num_epochs, *, is_eval_epoch=False):
     """Apply runtime reward overrides for the current MARL epoch."""
+    if train_total_cost_enabled():
+        set_reward_v2_runtime(internal_path_gamma=1.0)
+        return {"internal_path_gamma": 1.0, "train_total_cost_mode": True}
+
     if not curriculum_enabled() and not internal_gamma_curriculum_enabled():
         clear_reward_v2_runtime()
         return None

@@ -36,7 +36,7 @@ from core.dag_utils import (
     topological_sort,
 )
 from core.geo import find_k_nearest_servers, haversine_distance
-from core.marl_reward import calculate_marl_rewards, lambda_schedule_by_epoch
+from core.marl_reward import calculate_marl_rewards, lambda_schedule_by_epoch, train_total_cost_enabled
 from core.reward_curriculum import (
     apply_curriculum_for_epoch,
     curriculum_enabled,
@@ -1735,12 +1735,14 @@ def run_marl_gat_microservice(
     cf_sla_gain_gate_mode = _use_cf_sla_gain_gate()
     curriculum_on = curriculum_enabled()
     gamma_on = internal_gamma_curriculum_enabled()
+    total_cost_train = train_total_cost_enabled()
     print(
         f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  "
-        f"Lambda: migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}  |  "
+        f"Lambda(CF): migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}  |  "
         f"Guards: {guard_mode}  |  P1: {'entry-first + max-1' if p1_mode else 'off'}  |  "
         f"P2: curriculum={'on' if curriculum_on else 'off'} soft_cf={'on' if soft_cf_mode else 'off'}  |  "
-        f"P3: L_internal γ={'on' if gamma_on else 'off'}  |  "
+        f"P3: L_internal gamma={'on' if gamma_on else 'off'}  |  "
+        f"A: train_total_cost={'on' if total_cost_train else 'off'}  |  "
         f"B1: SLA gate={'on' if sla_gate_mode else 'off'}  |  "
         f"B1.1: CF gate={'on' if cf_sla_gain_gate_mode else 'off'}"
         + (f" mode={_cf_gate_mode()}" if cf_sla_gain_gate_mode else "")
@@ -1884,14 +1886,20 @@ def run_marl_gat_microservice(
         epoch_curriculum = apply_curriculum_for_epoch(
             epoch, num_epochs, is_eval_epoch=is_eval_epoch
         )
-        if epoch_curriculum:
+        if epoch_curriculum and epoch_curriculum.get("train_total_cost_mode"):
+            print(
+                f"  [GAT-MARL ep {epoch + 1}] Direction A: "
+                f"train=-total_cost_ms, gamma=1.0 fixed, lambda_train=0",
+                flush=True,
+            )
+        elif epoch_curriculum:
             print(
                 f"  [GAT-MARL curriculum ep {epoch + 1}] "
                 f"S={epoch_curriculum['objective_scale_ms']:.0f} "
-                f"α×={epoch_curriculum['sla_alpha_mult']:.2f} "
-                f"β×={epoch_curriculum['sla_beta_mult']:.2f} "
-                f"λ×={epoch_curriculum['migration_lambda_mult']:.2f} "
-                f"γ={epoch_curriculum.get('internal_path_gamma', 1.0):.2f}",
+                f"alpha_x={epoch_curriculum['sla_alpha_mult']:.2f} "
+                f"beta_x={epoch_curriculum['sla_beta_mult']:.2f} "
+                f"lambda_x={epoch_curriculum['migration_lambda_mult']:.2f} "
+                f"gamma={epoch_curriculum.get('internal_path_gamma', 1.0):.2f}",
                 flush=True,
             )
 
@@ -1912,6 +1920,10 @@ def run_marl_gat_microservice(
                 max_migration=max_lambda_migration,
                 max_split=max_lambda_split,
             )
+        if total_cost_train:
+            train_lm, train_ls = 0.0, 0.0
+        else:
+            train_lm, train_ls = epoch_lm, epoch_ls
 
         pbar = tqdm(total=len(timestamps), desc=f"GAT-MARL Epoch {epoch + 1}/{num_epochs}{' [EVAL]' if is_eval_epoch else ''}")
         for timestamp in timestamps:
@@ -2227,8 +2239,8 @@ def run_marl_gat_microservice(
                     servers_info,
                     predicted_locations=predicted_locations,
                     trigger_type=trigger_type,
-                    lambda_migration=lm,
-                    lambda_split=ls,
+                    lambda_migration=train_lm,
+                    lambda_split=train_ls,
                     # dense_distance_bonus_max 参数已废弃，新逻辑基于真实物理距离计算
                 )
                 del agent_rewards

@@ -1,16 +1,14 @@
 """
-Reward v2.1 P3 cov50：P1 + P2 + L_internal γ 课程 + B1.1b CF gate。
+Reward v2.1 P3 cov50：P1 + B1.1b CF gate + Direction A（训练目标对齐 total_cost_ms）。
 
-P3 核心：训练目标 L_e2e = L_acc + γ·L_internal，前 2 epoch γ=0，随后渐增至 1.0。
-B1.1b：CF gate mode=score（与 _clip_reactive_actions 对齐）+ entry rescue；CF gate 开启时恢复 rule clip。
+Direction A（默认开启）：
+  - Critic/Actor 优化 −total_cost_ms / 10000（与 SA 报表 KPI 同量纲）
+  - γ=1 固定，关闭 P2/P3 课程与 agent-level λ penalty
+  - B11b gate/clip 不变
+
+关闭 A（legacy P3）：MARL_TRAIN_TOTAL_COST=0
 
 默认 8 MARL epoch（reactive-only）。快筛：MEDIUM_VALIDATION_MARL_EPOCHS=2
-
-C1 快验（P3 checkpoint + B1.1b 推理）：
-  set MEDIUM_VALIDATION_STAMP=20260605_170422_reward_v21_p3_8ep
-  set MEDIUM_VALIDATION_INFERENCE_ONLY=1
-  set MEDIUM_VALIDATION_INFERENCE_FORCE=1
-  python -u run_reward_v21_p3_cov50.py
 
 示例：
   python -u run_reward_v21_p3_cov50.py
@@ -22,9 +20,22 @@ import os
 os.environ["REWARD_SCHEME"] = "v2"
 os.environ["REWARD_V2_USE_INTERNAL_PATH"] = os.environ.get("REWARD_V2_USE_INTERNAL_PATH", "1")
 os.environ["REWARD_V2_OBJECTIVE_SCALE_MS"] = os.environ.get("REWARD_V2_OBJECTIVE_SCALE_MS", "100000")
-os.environ["REWARD_V2_CURRICULUM"] = os.environ.get("REWARD_V2_CURRICULUM", "1")
-os.environ["REWARD_V2_INTERNAL_GAMMA"] = os.environ.get("REWARD_V2_INTERNAL_GAMMA", "1")
-os.environ["REWARD_V2_GAMMA_WARMUP_EPOCHS"] = os.environ.get("REWARD_V2_GAMMA_WARMUP_EPOCHS", "2")
+
+_train_total_cost = os.environ.get("MARL_TRAIN_TOTAL_COST", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+if "MARL_TRAIN_TOTAL_COST" not in os.environ:
+    os.environ["MARL_TRAIN_TOTAL_COST"] = "1" if _train_total_cost else "0"
+
+if _train_total_cost:
+    os.environ["REWARD_V2_CURRICULUM"] = os.environ.get("REWARD_V2_CURRICULUM", "0")
+    os.environ["REWARD_V2_INTERNAL_GAMMA"] = os.environ.get("REWARD_V2_INTERNAL_GAMMA", "0")
+else:
+    os.environ["REWARD_V2_CURRICULUM"] = os.environ.get("REWARD_V2_CURRICULUM", "1")
+    os.environ["REWARD_V2_INTERNAL_GAMMA"] = os.environ.get("REWARD_V2_INTERNAL_GAMMA", "1")
+    os.environ["REWARD_V2_GAMMA_WARMUP_EPOCHS"] = os.environ.get("REWARD_V2_GAMMA_WARMUP_EPOCHS", "2")
 os.environ["MEDIUM_VALIDATION_REACTIVE_ONLY"] = "1"
 os.environ["MARL_P1"] = os.environ.get("MARL_P1", "1")
 os.environ["MARL_CF_SLA_GAIN_GATE"] = os.environ.get("MARL_CF_SLA_GAIN_GATE", "1")
@@ -46,8 +57,11 @@ elif _cf_gate:
     _guard_suffix = "_b11a"
 else:
     _guard_suffix = ""
+_a_suffix = "_a" if _train_total_cost else ""
 _default_tag = (
-    f"reward_v21_p3{_guard_suffix}_2ep" if _marl_epochs == "2" else f"reward_v21_p3{_guard_suffix}_8ep"
+    f"reward_v21_p3{_guard_suffix}{_a_suffix}_2ep"
+    if _marl_epochs == "2"
+    else f"reward_v21_p3{_guard_suffix}{_a_suffix}_8ep"
 )
 if "MEDIUM_VALIDATION_STAMP" not in os.environ:
     os.environ["MEDIUM_VALIDATION_STAMP_TAG"] = _default_tag

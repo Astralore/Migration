@@ -1,30 +1,22 @@
 # 实验结果整理（cov50 中等规模）
 
-**最后更新**：2026-06-05（P3 8ep 全量完成）
-**命名规范**：`experiments/medium_validation_YYYYMMDD_HHMMSS_<tag>/`（由 `MEDIUM_VALIDATION_STAMP_TAG` 或完整 `MEDIUM_VALIDATION_STAMP` 控制）
+**最后更新**：2026-06-07（清理无用实验目录与日志）
+**入口脚本**：`run_reward_v21_p3_cov50.py`（B1.1b 定版，reactive-only）
+**命名规范**：`experiments/medium_validation_YYYYMMDD_HHMMSS_<tag>/`
 
 ---
 
 ## 1. 保留目录一览
 
-| 目录 | 阶段 | 配置要点 | 状态 |
-|------|------|----------|------|
-| `medium_validation_20260607_001742_reward_v21_p3_b11a_8ep` | **P3+B1.1a 8ep** | CF gate、8 epoch | ✅ 完整 |
-| `medium_validation_20260605_170422_reward_v21_p3_8ep` | **P3 全量** | P1+P2+γ 课程、8 epoch、无 warmstart | ✅ 完整 |
-| `medium_validation_20260605_162655_reward_v21_p2_2ep` | **P2 验证** | 课程+soft CF、P1 warmstart、2 epoch | ✅ 完整 |
-| `medium_validation_20260605_145403_reward_v21_p1_v1` | **P1 验证** | entry-first+max-1、DAG/CF 特征、2 epoch | ✅ 完整 |
-| `medium_validation_20260605_reward_v21_softguard_reactive_8ep_v1` | **v2.1 主线（当前）** | Reactive-only、S=100k、硬护栏 bypass、8 epoch、`epoch_stats` | ✅ 完整 |
-| `medium_validation_20260526_phaseC_softguard_v1` | v1 标杆 | Pro+Re、Phase C soft guard | ✅ 对照 |
-| `medium_validation_20260526_phaseB2_reward_align_v1` | v1 公平对照 | Pro+Re、MAX=1 | ✅ 对照 |
-| `medium_validation_20260526_reward_v2_scale10000_v1` | v2 尺度试验 | S=10000、2 epoch | ✅ 对照 |
-| `checkpoint_inference_20260526_phaseA_guard_top16` | 推理抽查 | Phase A checkpoint | ✅ 参考 |
-| `phaseC0_inference_20260526_phaseC0_max2_infer` | 推理抽查 | Phase C0 MAX=2 | ✅ 参考 |
+| 目录 | 阶段 | 配置要点 | 推理 GAT（Reactive） |
+|------|------|----------|----------------------|
+| `medium_validation_20260607_175355_reward_v21_p3_b11b_8ep` | **B1.1b 定版** | P3 + CF gate + hard clip | **150 迁 / 8.1k ms / P95 4.9 km** |
+| `medium_validation_20260605_170422_reward_v21_p3_8ep` | P3 全量 | γ 课程、无 gate | 1736 迁 / 45.8k ms |
+| `medium_validation_20260605_145403_reward_v21_p1_v1` | P1 验证 | entry-first + max-1 | 1758 迁 |
+| `medium_validation_20260605_reward_v21_softguard_reactive_8ep_v1` | v2.1 主线 | bypass 硬护栏 | 0 迁 |
+| `medium_validation_20260526_phaseC_softguard_v1` | v1 标杆 | Phase C soft guard | 72 迁 / 17.7k ms |
 
-**已删除（被上表替代或重复）**：`scale5000_v1`、两次 `s100k` 2-epoch 快筛、`20260527` 版 8-epoch 重复跑、`phaseB_reward_align_v1`（保留 B2）。
-
----
-
-**待后续**：B1.1a 全量导致 0 迁死锁，需 B1.1b 放宽 CF 门槛，详见 [Reward_v21_P3总结与P4修改计划.md](Reward_v21_P3总结与P4修改计划.md) §12b。
+**已删除**：P4 实验、B1.1a 死锁、P2 重复、Phase B/B2、scale10000、checkpoint/phaseC0 推理抽查、重复 P1、全部 `experiments/*.log`。
 
 ---
 
@@ -173,10 +165,15 @@ SA 锚点在 D0 后始终健康（本轮推理 **9814 ms**，~13 迁）。
 ## 5. 启动新实验
 
 ```bash
-# P2（推荐）：课程 + soft CF + 可选 P1 热启动
-python -u run_reward_v21_p2_cov50.py
-set MEDIUM_VALIDATION_MARL_EPOCHS=2 && python -u run_reward_v21_p2_cov50.py
+# B1.1b 定版（默认 8ep reactive-only）
+python -u run_reward_v21_p3_cov50.py
 
-# P1 / v2.1 基线
-python -u run_reward_v21_cov50.py
+# 快筛 2ep
+set MEDIUM_VALIDATION_MARL_EPOCHS=2 && python -u run_reward_v21_p3_cov50.py
+
+# C1 推理快验（已有 checkpoint）
+set MEDIUM_VALIDATION_STAMP=20260607_175355_reward_v21_p3_b11b_8ep
+set MEDIUM_VALIDATION_INFERENCE_ONLY=1
+set MEDIUM_VALIDATION_INFERENCE_FORCE=1
+python -u run_reward_v21_p3_cov50.py
 ```

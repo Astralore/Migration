@@ -465,6 +465,36 @@ def _write_report(payload):
             )
         return s
 
+    def topology_decomposition_table(rea):
+        """Per-decision SLA / migration / tearing / internal-path breakdown (all algorithms)."""
+        s = (
+            "| Algorithm | Migrations | Avg SLA (ms) | Avg Migration (ms) | "
+            "Avg Tearing (ms) | Avg L_internal (ms) | Avg Total (ms) |\n"
+        )
+        s += (
+            "|-----------|------------|--------------|--------------------|"
+            "------------------|---------------------|---------------|\n"
+        )
+        for name in ["SA", "Nearest", "DQN", "GAT-MARL"]:
+            res = rea.get(name, {})
+            if not res:
+                s += f"| {name} | — | — | — | — | — | — |\n"
+                continue
+            dc = int(res.get("decision_count") or 0)
+            if dc <= 0:
+                s += f"| {name} | — | — | — | — | — | — |\n"
+                continue
+            avg_sla = float(res.get("total_sla_penalty_ms") or 0.0) / dc
+            avg_mig = float(res.get("total_migration_cost") or 0.0) / dc
+            avg_tear = float(res.get("total_tearing_penalty_ms") or 0.0) / dc
+            avg_int = float(res.get("total_internal_path_ms") or 0.0) / dc
+            avg_total = float(res.get("avg_total_cost_ms") or 0.0)
+            s += (
+                f"| {name} | {res.get('total_migrations', '—')} | {avg_sla:.2f} | {avg_mig:.2f} | "
+                f"{avg_tear:.2f} | {avg_int:.2f} | {avg_total:.2f} |\n"
+            )
+        return s
+
     def dag_type_section(stage, mode, name):
         res = payload.get(stage, {}).get(mode, {}).get(name, {})
         mig = res.get("migrations_by_dag_type") or {}
@@ -570,6 +600,10 @@ def _write_report(payload):
 ## 推理段（Reactive）
 
 {reactive_table(infer_rea)}
+
+### 推理段 — 成本分解（单次决策均值）
+
+{topology_decomposition_table(infer_rea)}
 
 {gat_epoch_section("train", "reactive")}
 {gat_epoch_section("inference", "reactive")}
@@ -687,6 +721,7 @@ def main():
                 "marl_soft_cf_bias": os.environ.get("MARL_SOFT_CF_BIAS", "0"),
                 "marl_cf_sla_gain_gate": os.environ.get("MARL_CF_SLA_GAIN_GATE", "0"),
                 "marl_cf_gate_mode": os.environ.get("MARL_CF_GATE_MODE", "score"),
+                "marl_train_total_cost": os.environ.get("MARL_TRAIN_TOTAL_COST", "0"),
                 "marl_sla_violation_gate": os.environ.get("MARL_SLA_VIOLATION_GATE", "1" if os.environ.get("REWARD_SCHEME") == "v2" else "0"),
                 "marl_warmstart_checkpoint": os.environ.get("MARL_WARMSTART_CHECKPOINT"),
             },

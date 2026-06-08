@@ -2,7 +2,7 @@
 
 根目录仅保留：
 - `run_medium_validation_cov50.py` — 主流水线
-- `run_reward_v21_cov50.py` — **当前 v2.1 唯一推荐入口**
+- `run_reward_v21_p3_cov50.py` — **当前 B1.1b 推荐入口（reactive-only）**
 
 本目录脚本用于**复现旧实验**，日常开发不必使用。
 
