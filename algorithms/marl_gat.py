@@ -36,7 +36,12 @@ from core.dag_utils import (
     topological_sort,
 )
 from core.geo import find_k_nearest_servers, haversine_distance
-from core.marl_reward import calculate_marl_rewards, lambda_schedule_by_epoch, train_total_cost_enabled
+from core.marl_reward import (
+    calculate_marl_rewards,
+    lambda_schedule_by_epoch,
+    reactive_dense_bonus_enabled,
+    train_total_cost_enabled,
+)
 from core.reward_curriculum import (
     apply_curriculum_for_epoch,
     curriculum_enabled,
@@ -89,6 +94,12 @@ CF_SLA_WEIGHT = 0.002
 CF_FUTURE_WEIGHT = 0.0015
 CF_TOPOLOGY_WEIGHT = 0.001
 CF_COST_SCALE_MS = 1000.0
+# When True, CF gate uses train-only score floor (MARL_CF_TRAIN_SCORE_FLOOR).
+_cf_gate_use_train_score_floor = False
+
+
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
 
 
 def _cf_cost_scale_ms():
@@ -436,8 +447,25 @@ def _cf_gate_mode():
     return mode if mode in ("score", "sla_gain") else "score"
 
 
+def _cf_physical_migration_cost_enabled():
+    """E: CF/gate scores migration at 1.0x; reported total_cost_ms keeps REACTIVE_MIGRATION_MULT."""
+    return _env_flag("MARL_CF_PHYSICAL_MIGRATION_COST", "1")
+
+
+def _cf_migration_mult_for_scoring(trigger_type):
+    if trigger_type == TRIGGER_PROACTIVE:
+        return 1.0
+    if _cf_physical_migration_cost_enabled():
+        return 1.0
+    return REACTIVE_MIGRATION_MULT
+
+
 def _cf_score_floor():
     """Minimum counterfactual score for non-rescue migrate slots (B1.1b)."""
+    if _cf_gate_use_train_score_floor:
+        train_floor = os.environ.get("MARL_CF_TRAIN_SCORE_FLOOR", "").strip()
+        if train_floor:
+            return float(train_floor)
     return _env_float("MARL_CF_SCORE_FLOOR", CF_SCORE_EPS)
 
 
@@ -1134,7 +1162,7 @@ def _build_counterfactual_context(
             )
 
     migration_costs = {}
-    migration_mult = REACTIVE_MIGRATION_MULT if trigger_type != TRIGGER_PROACTIVE else 1.0
+    migration_mult = _cf_migration_mult_for_scoring(trigger_type)
     for node in deployable:
         props = dag_info["nodes"][node]
         mb = float(props["image_mb"]) + float(props["state_mb"])
@@ -1736,6 +1764,7 @@ def run_marl_gat_microservice(
     curriculum_on = curriculum_enabled()
     gamma_on = internal_gamma_curriculum_enabled()
     total_cost_train = train_total_cost_enabled()
+    cf_train_floor = os.environ.get("MARL_CF_TRAIN_SCORE_FLOOR", "").strip()
     print(
         f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  "
         f"Lambda(CF): migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}  |  "
@@ -1743,6 +1772,9 @@ def run_marl_gat_microservice(
         f"P2: curriculum={'on' if curriculum_on else 'off'} soft_cf={'on' if soft_cf_mode else 'off'}  |  "
         f"P3: L_internal gamma={'on' if gamma_on else 'off'}  |  "
         f"A: train_total_cost={'on' if total_cost_train else 'off'}  |  "
+        f"E: cf_physical_mig={'on' if _cf_physical_migration_cost_enabled() else 'off'}  |  "
+        f"A': reactive_dense_bonus={'on' if reactive_dense_bonus_enabled() else 'off'}  |  "
+        f"C': cf_train_floor={cf_train_floor or 'off'}  |  "
         f"B1: SLA gate={'on' if sla_gate_mode else 'off'}  |  "
         f"B1.1: CF gate={'on' if cf_sla_gain_gate_mode else 'off'}"
         + (f" mode={_cf_gate_mode()}" if cf_sla_gain_gate_mode else "")
@@ -1902,6 +1934,11 @@ def run_marl_gat_microservice(
                 f"gamma={epoch_curriculum.get('internal_path_gamma', 1.0):.2f}",
                 flush=True,
             )
+
+        global _cf_gate_use_train_score_floor
+        _cf_gate_use_train_score_floor = (
+            not inference_mode and not is_eval_epoch and bool(cf_train_floor)
+        )
 
         if is_eval_epoch:
             encoder.eval()
@@ -2230,6 +2267,7 @@ def run_marl_gat_microservice(
 
                 lambda_migration_history.append(lm)
                 lambda_split_history.append(ls)
+                use_dense_bonus = reactive_dense_bonus_enabled()
                 shared_reward, agent_rewards, details = calculate_marl_rewards(
                     taxi_id,
                     dag_info,
@@ -2241,7 +2279,7 @@ def run_marl_gat_microservice(
                     trigger_type=trigger_type,
                     lambda_migration=train_lm,
                     lambda_split=train_ls,
-                    # dense_distance_bonus_max 参数已废弃，新逻辑基于真实物理距离计算
+                    dense_distance_bonus=use_dense_bonus,
                 )
                 del agent_rewards
                 total_reward_sum += shared_reward

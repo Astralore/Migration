@@ -1,18 +1,18 @@
 """
-Reward v2.1 P3 cov50：P1 + B1.1b CF gate + Direction A（训练目标对齐 total_cost_ms）。
+Reward v2.1 P3 cov50：B11b + Direction A + Reactive 结构改进 (E/B/A').
 
-Direction A（默认开启）：
-  - Critic/Actor 优化 −total_cost_ms / 10000（与 SA 报表 KPI 同量纲）
-  - γ=1 固定，关闭 P2/P3 课程与 agent-level λ penalty
-  - B11b gate/clip 不变
+E: CF gate 用 1.0x 迁移成本评分（MARL_CF_PHYSICAL_MIGRATION_COST=1），报表 total_cost 仍 1.5x
+B: Reactive trigger context 第三维 = 1 + min(excess/SLA, 2)
+A': Direction A 下 per-agent urgency-weighted distance bonus（MARL_REACTIVE_DENSE_BONUS=1）
+C': 可选 MARL_CF_TRAIN_SCORE_FLOOR（训练期，默认不设置）
 
-关闭 A（legacy P3）：MARL_TRAIN_TOTAL_COST=0
-
-默认 8 MARL epoch（reactive-only）。快筛：MEDIUM_VALIDATION_MARL_EPOCHS=2
-
-示例：
+默认 8 MARL epoch。2 epoch 快验：
+  set MEDIUM_VALIDATION_MARL_EPOCHS=2
   python -u run_reward_v21_p3_cov50.py
-  set MEDIUM_VALIDATION_MARL_EPOCHS=2 && python -u run_reward_v21_p3_cov50.py
+
+Legacy Direction A only（无 E/B/A'）：
+  set MARL_CF_PHYSICAL_MIGRATION_COST=0
+  set MARL_REACTIVE_DENSE_BONUS=0
 """
 
 import os
@@ -36,11 +36,19 @@ else:
     os.environ["REWARD_V2_CURRICULUM"] = os.environ.get("REWARD_V2_CURRICULUM", "1")
     os.environ["REWARD_V2_INTERNAL_GAMMA"] = os.environ.get("REWARD_V2_INTERNAL_GAMMA", "1")
     os.environ["REWARD_V2_GAMMA_WARMUP_EPOCHS"] = os.environ.get("REWARD_V2_GAMMA_WARMUP_EPOCHS", "2")
+
+# E: CF physical migration cost for gate (default on)
+if "MARL_CF_PHYSICAL_MIGRATION_COST" not in os.environ:
+    os.environ["MARL_CF_PHYSICAL_MIGRATION_COST"] = "1"
+
+# A': Reactive dense bonus with Direction A (default on when train_total_cost)
+if "MARL_REACTIVE_DENSE_BONUS" not in os.environ:
+    os.environ["MARL_REACTIVE_DENSE_BONUS"] = "1" if _train_total_cost else "0"
+
 os.environ["MEDIUM_VALIDATION_REACTIVE_ONLY"] = "1"
 os.environ["MARL_P1"] = os.environ.get("MARL_P1", "1")
 os.environ["MARL_CF_SLA_GAIN_GATE"] = os.environ.get("MARL_CF_SLA_GAIN_GATE", "1")
 os.environ["MARL_CF_GATE_MODE"] = os.environ.get("MARL_CF_GATE_MODE", "score")
-# B1.1b: hard gate replaces soft CF bias by default
 if "MARL_SOFT_CF_BIAS" not in os.environ:
     os.environ["MARL_SOFT_CF_BIAS"] = "0"
 os.environ["PROACTIVE_MAX_MIGRATIONS_PER_DECISION"] = "0"
@@ -57,11 +65,32 @@ elif _cf_gate:
     _guard_suffix = "_b11a"
 else:
     _guard_suffix = ""
-_a_suffix = "_a" if _train_total_cost else ""
+
+_cf_e = os.environ.get("MARL_CF_PHYSICAL_MIGRATION_COST", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+_reactive_bonus = os.environ.get("MARL_REACTIVE_DENSE_BONUS", "0").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+_reactive_suffix = ""
+if _cf_e and _reactive_bonus and _train_total_cost:
+    _reactive_suffix = "_eba"
+elif _train_total_cost:
+    _reactive_suffix = "_a"
+elif _cf_e:
+    _reactive_suffix = "_e"
+_cp_floor = os.environ.get("MARL_CF_TRAIN_SCORE_FLOOR", "").strip()
+if _cp_floor:
+    _reactive_suffix += f"_cp{_cp_floor.replace('.', 'p').replace('-', 'm')}"
+
 _default_tag = (
-    f"reward_v21_p3{_guard_suffix}{_a_suffix}_2ep"
+    f"reward_v21_p3{_guard_suffix}{_reactive_suffix}_2ep"
     if _marl_epochs == "2"
-    else f"reward_v21_p3{_guard_suffix}{_a_suffix}_8ep"
+    else f"reward_v21_p3{_guard_suffix}{_reactive_suffix}_8ep"
 )
 if "MEDIUM_VALIDATION_STAMP" not in os.environ:
     os.environ["MEDIUM_VALIDATION_STAMP_TAG"] = _default_tag

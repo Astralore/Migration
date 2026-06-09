@@ -7,7 +7,7 @@ entry-first action masks, coordinated with max-one migration in marl_gat.py.
 
 import numpy as np
 
-from core.context import TRIGGER_PROACTIVE, DISTANCE_THRESHOLD_KM
+from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE, DISTANCE_THRESHOLD_KM
 from core.dag_utils import get_service_entry_nodes, is_external_node, topological_sort
 from core.geo import haversine_distance
 from core.reward import dag_max_traffic_log_rpc, traffic_log_rpc_feature
@@ -293,14 +293,22 @@ def build_marl_graph_state(
             )
             for node in entry_nodes
         ]
-        risk_ratio = min(float(max(entry_dists)) / SLA_DISTANCE_THRESHOLD_KM, 1.0)
+        max_entry_dist_km = float(max(entry_dists))
+        risk_ratio = min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD_KM, 1.0)
     else:
+        max_entry_dist_km = 0.0
         risk_ratio = 0.0
 
-    trigger_base = np.array(
-        [1.0, 0.0, risk_ratio] if trigger_type == TRIGGER_PROACTIVE else [0.0, 1.0, 1.0],
-        dtype=np.float32,
-    )
+    if trigger_type == TRIGGER_PROACTIVE:
+        trigger_third = float(risk_ratio)
+        trigger_base = np.array([1.0, 0.0, trigger_third], dtype=np.float32)
+    else:
+        excess_km = max(0.0, max_entry_dist_km - SLA_DISTANCE_THRESHOLD_KM)
+        trigger_third = 1.0 + min(
+            excess_km / max(SLA_DISTANCE_THRESHOLD_KM, 1e-6),
+            2.0,
+        )
+        trigger_base = np.array([0.0, 1.0, trigger_third], dtype=np.float32)
     dag_type_vec = encode_dag_type_family(dag_type)
     trigger_context = np.concatenate([trigger_base, dag_type_vec]).astype(np.float32)
 

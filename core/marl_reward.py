@@ -27,8 +27,10 @@ from core.reward import (
 from core.context import TRIGGER_PROACTIVE, TRIGGER_REACTIVE
 
 # Fixed divisor for RL value/advantage scale (~7–8k ms total_cost → ~−0.7..−0.8).
-# Linear in total_cost_ms; not a tunable curriculum knob.
 TOTAL_COST_TRAIN_SCALE_MS = 10000.0
+# A': urgency-weighted distance bonus for Reactive (ms-equivalent before /scale).
+REACTIVE_DENSE_BONUS_PER_KM_MS = 3000.0
+REACTIVE_DENSE_BONUS_MAX_MS = 5000.0
 
 
 def _env_flag(name, default="0"):
@@ -38,6 +40,11 @@ def _env_flag(name, default="0"):
 def train_total_cost_enabled():
     """Direction A: critic/actor optimize −total_cost_ms (report KPI), not v2 scaled reward."""
     return _env_flag("MARL_TRAIN_TOTAL_COST", "0")
+
+
+def reactive_dense_bonus_enabled():
+    """A': per-agent distance bonus on Reactive (works with Direction A training branch)."""
+    return _env_flag("MARL_REACTIVE_DENSE_BONUS", "0")
 
 
 def total_cost_training_signal(total_cost_ms):
@@ -174,58 +181,62 @@ def _dense_distance_bonuses(
     *,
     proactive_bonus_per_km=0.4,
     proactive_bonus_max=6.0,
+    reactive_bonus_per_km_ms=None,
+    reactive_bonus_max_ms=None,
 ):
     """
     Reward-scale dense bonus for moving closer to the user.
 
-    The shared reward is log-scaled, so this bonus must stay in single-digit
-    reward units.  Action-time logit bias handles exploration; this post-action
-    bonus reinforces successful proactive moves without dominating training.
+    Proactive: legacy reward-unit bonus. Reactive (A'): ms-equivalent bonus scaled by
+    violation urgency; merged into Direction A train_signal via /TOTAL_COST_TRAIN_SCALE_MS.
     """
+    if reactive_bonus_per_km_ms is None:
+        reactive_bonus_per_km_ms = REACTIVE_DENSE_BONUS_PER_KM_MS
+    if reactive_bonus_max_ms is None:
+        reactive_bonus_max_ms = REACTIVE_DENSE_BONUS_MAX_MS
+
     user_lat, user_lon = user_location
     bonuses = {}
-    
+    entry_nodes = get_service_entry_nodes(dag_info)
+    max_entry_dist_km = 0.0
+    if entry_nodes:
+        entry_dists = [
+            haversine_distance(
+                user_lat, user_lon,
+                servers_info[current_assignments[n]][0],
+                servers_info[current_assignments[n]][1],
+            )
+            for n in entry_nodes
+        ]
+        max_entry_dist_km = float(max(entry_dists)) if entry_dists else 0.0
+
     for node in dag_info["nodes"]:
         if is_external_node(node):
             bonuses[node] = 0.0
             continue
-        
+
         old_server = previous_assignments[node]
         new_server = current_assignments[node]
-        
-        # No migration = no bonus
+
         if old_server == new_server:
             bonuses[node] = 0.0
             continue
-        
-        # Calculate distance to user before and after migration
+
         old_lat, old_lon = servers_info[old_server]
         new_lat, new_lon = servers_info[new_server]
         old_dist_km = float(haversine_distance(user_lat, user_lon, old_lat, old_lon))
         new_dist_km = float(haversine_distance(user_lat, user_lon, new_lat, new_lon))
-        
-        # Only reward if actually getting closer
+
         distance_reduction_km = max(0.0, old_dist_km - new_dist_km)
         if distance_reduction_km <= 1e-6:
             bonuses[node] = 0.0
             continue
-        
-        # Get risk_ratio from effective bandwidth calculation
-        # This reflects how close the entry nodes are to SLA violation threshold
-        risk_ratio = 0.0
-        entry_nodes = get_service_entry_nodes(dag_info)
-        if entry_nodes:
-            entry_dists = [
-                haversine_distance(
-                    user_lat, user_lon,
-                    servers_info[current_assignments[n]][0],
-                    servers_info[current_assignments[n]][1],
-                )
-                for n in entry_nodes
-            ]
-            max_entry_dist_km = float(max(entry_dists)) if entry_dists else 0.0
-            risk_ratio = min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD, 1.0) if SLA_DISTANCE_THRESHOLD > 0 else 0.0
-        
+
+        risk_ratio = (
+            min(max_entry_dist_km / SLA_DISTANCE_THRESHOLD, 1.0)
+            if SLA_DISTANCE_THRESHOLD > 0 else 0.0
+        )
+
         if trigger_type == TRIGGER_PROACTIVE:
             risk_factor = 1.0 + risk_ratio
             bonus_value = min(
@@ -233,10 +244,16 @@ def _dense_distance_bonuses(
                 distance_reduction_km * proactive_bonus_per_km * risk_factor,
             )
         else:
-            bonus_value = 0.0
-            
+            excess_km = max(0.0, max_entry_dist_km - SLA_DISTANCE_THRESHOLD)
+            urgency = min(2.0, 1.0 + excess_km / max(SLA_DISTANCE_THRESHOLD, 1e-6))
+            bonus_ms = min(
+                reactive_bonus_max_ms,
+                distance_reduction_km * reactive_bonus_per_km_ms * urgency,
+            )
+            bonus_value = bonus_ms / max(TOTAL_COST_TRAIN_SCALE_MS, 1e-6)
+
         bonuses[node] = float(bonus_value)
-    
+
     return bonuses
 
 
@@ -323,9 +340,9 @@ def calculate_marl_rewards(
     Local penalties are normalized by ``local_cost_scale_ms`` so their weights
     are comparable to the log-scaled shared reward.
 
-    When ``MARL_TRAIN_TOTAL_COST=1`` (Direction A), ``training_reward`` and
-    per-agent returns are ``−total_cost_ms / TOTAL_COST_TRAIN_SCALE_MS`` with
-    no extra λ penalties — same physical cost as SA reports.
+    When ``MARL_TRAIN_TOTAL_COST=1`` (Direction A), base return is
+    ``−total_cost_ms / TOTAL_COST_TRAIN_SCALE_MS``. With ``MARL_REACTIVE_DENSE_BONUS=1``,
+    migrating agents also receive urgency-weighted distance bonus in the same units.
     """
     shared_reward, details = calculate_microservice_reward(
         taxi_id,
@@ -356,8 +373,11 @@ def calculate_marl_rewards(
     )
     total_cost_ms = float(details["total_cost_ms"])
     use_total_cost_train = train_total_cost_enabled()
+    use_dense_bonus = dense_distance_bonus or (
+        use_total_cost_train and reactive_dense_bonus_enabled()
+    )
     distance_bonuses = {node: 0.0 for node in dag_info["nodes"]}
-    if dense_distance_bonus:
+    if use_dense_bonus:
         distance_bonuses = _dense_distance_bonuses(
             dag_info,
             current_assignments,
@@ -372,8 +392,21 @@ def calculate_marl_rewards(
 
     if use_total_cost_train:
         train_signal = total_cost_training_signal(total_cost_ms)
-        agent_rewards = {node: float(train_signal) for node in dag_info["nodes"]}
-        training_reward = float(train_signal)
+        agent_rewards = {}
+        for node in dag_info["nodes"]:
+            bonus = float(distance_bonuses.get(node, 0.0))
+            if is_external_node(node):
+                agent_rewards[node] = float(train_signal)
+            else:
+                agent_rewards[node] = float(train_signal + bonus)
+        deployable_rewards = [
+            agent_rewards[node]
+            for node in dag_info["nodes"]
+            if not is_external_node(node)
+        ]
+        training_reward = (
+            float(np.mean(deployable_rewards)) if deployable_rewards else float(train_signal)
+        )
     else:
         agent_rewards = {}
         for node in dag_info["nodes"]:
@@ -411,6 +444,7 @@ def calculate_marl_rewards(
             "training_reward": training_reward,
             "train_total_cost_mode": bool(use_total_cost_train),
             "train_total_cost_scale_ms": float(TOTAL_COST_TRAIN_SCALE_MS),
+            "reactive_dense_bonus_enabled": bool(reactive_dense_bonus_enabled()),
         }
     )
     return float(shared_reward), agent_rewards, details
