@@ -47,9 +47,26 @@ def reactive_dense_bonus_enabled():
     return _env_flag("MARL_REACTIVE_DENSE_BONUS", "0")
 
 
-def total_cost_training_signal(total_cost_ms):
-    """RL return aligned with SA search objective (minimize total_cost_ms)."""
+def migration_amort_horizon():
+    """Amortize one-time migration cost over H steps in training reward (0 = disabled)."""
+    return int(os.environ.get("MARL_MIGRATION_AMORT_H", "0"))
+
+
+def total_cost_training_signal(total_cost_ms, migration_delay_ms=0.0):
+    """
+    RL return aligned with SA search objective (minimize total_cost_ms).
+
+    When MARL_MIGRATION_AMORT_H > 0, the one-time migration cost is amortized
+    over H steps instead of charged entirely in the trigger step:
+        amortized_total = total_cost - migration_delay + migration_delay / H
+    This prevents COLOCATE's large one-time cost from producing a single-step
+    reward so negative that RL stops exploring immediately.
+    """
     scale = max(float(TOTAL_COST_TRAIN_SCALE_MS), 1e-6)
+    H = migration_amort_horizon()
+    if H > 0 and migration_delay_ms > 0:
+        amortized_total = total_cost_ms - migration_delay_ms + migration_delay_ms / float(H)
+        return -float(amortized_total) / scale
     return -float(total_cost_ms) / scale
 
 
@@ -391,7 +408,8 @@ def calculate_marl_rewards(
     entry_sla_bonuses = {node: 0.0 for node in dag_info["nodes"]}
 
     if use_total_cost_train:
-        train_signal = total_cost_training_signal(total_cost_ms)
+        migration_delay_ms = float(details.get("migration_cost", 0.0))
+        train_signal = total_cost_training_signal(total_cost_ms, migration_delay_ms)
         agent_rewards = {}
         for node in dag_info["nodes"]:
             bonus = float(distance_bonuses.get(node, 0.0))
@@ -445,6 +463,7 @@ def calculate_marl_rewards(
             "train_total_cost_mode": bool(use_total_cost_train),
             "train_total_cost_scale_ms": float(TOTAL_COST_TRAIN_SCALE_MS),
             "reactive_dense_bonus_enabled": bool(reactive_dense_bonus_enabled()),
+            "migration_amort_h": migration_amort_horizon(),
         }
     )
     return float(shared_reward), agent_rewards, details

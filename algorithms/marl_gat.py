@@ -20,6 +20,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
+from core.colocate_pattern import (
+    build_colocate_pattern_mode_a,
+    count_high_traffic_colocated_edges,
+)
 from core.context import (
     DISTANCE_THRESHOLD_KM,
     TRIGGER_PROACTIVE,
@@ -159,6 +163,75 @@ def _passthrough_guard_stats():
     }
 
 
+def _use_colocate_reactive():
+    """
+    P4: traffic-aware COLOCATE action space for Reactive MARL.
+
+    When on: entry chooses STAY vs COLOCATE(candidate_k, mode-A pattern);
+    CF gate / reactive clip are bypassed (§11.3).
+    """
+    raw = os.environ.get("MARL_COLOCATE_REACTIVE")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip().lower() not in ("0", "false", "no")
+    return False
+
+
+def _n_step_return_enabled():
+    """COLOCATE: aggregate per-taxi reactive rewards over N decision steps (§11.7)."""
+    if not _use_colocate_reactive():
+        return False
+    raw = os.environ.get("MARL_NSTEP_RETURN")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip().lower() not in ("0", "false", "no")
+    return True
+
+
+def _n_step_n():
+    return max(1, int(os.environ.get("MARL_NSTEP_N", "16")))
+
+
+def _n_step_gamma():
+    return float(os.environ.get("MARL_NSTEP_GAMMA", "1.0"))
+
+
+def _sum_discounted_rewards(rewards, gamma):
+    total = 0.0
+    for idx, reward in enumerate(rewards):
+        total += float(reward) * (gamma ** idx)
+    return total
+
+
+def _commit_nstep_from_buffer(buf, memory, n, gamma):
+    """Slide n-step window by one decision; append to replay memory."""
+    while len(buf) >= n:
+        window = buf[:n]
+        trans = dict(window[0])
+        trans["training_reward"] = _sum_discounted_rewards(
+            [item["training_reward"] for item in window],
+            gamma,
+        )
+        trans["n_step_k"] = n
+        memory.append(trans)
+        del buf[0]
+
+
+def _flush_nstep_remaining(buffers, memory, n, gamma):
+    """End-of-epoch flush for trailing per-taxi decision windows."""
+    for _taxi_id, buf in list(buffers.items()):
+        if not buf:
+            continue
+        k = min(len(buf), n)
+        window = buf[:k]
+        trans = dict(window[0])
+        trans["training_reward"] = _sum_discounted_rewards(
+            [item["training_reward"] for item in window],
+            gamma,
+        )
+        trans["n_step_k"] = k
+        memory.append(trans)
+        buf.clear()
+
+
 def _bypass_rule_based_guards():
     """Reward v2/v2.1: bypass rule guards unless B1.1 CF gate is active."""
     if _use_cf_sla_gain_gate():
@@ -179,7 +252,13 @@ def _use_p1_coordination():
 
 
 def _apply_p1_max_one_migration(actions, sorted_nodes, node_to_idx, probs, entry_nodes):
-    """Keep a single migration per joint decision; entry nodes win ties."""
+    """Keep a single migration per joint decision; entry nodes win ties.
+
+    COLOCATE mode (MARL_COLOCATE_REACTIVE=1): only violating entries have migrate
+    slots in the mask, so at most one entry can pick action>0. This function then
+    enforces the §11.2.5 budget of **one active COLOCATE decision** per step
+    (passive pattern followers are applied later in ``_apply_colocate_assignments``).
+    """
     migrate_slots = []
     for i, (node, action) in enumerate(zip(sorted_nodes, actions)):
         if int(action) > 0 and not is_external_node(node):
@@ -205,6 +284,101 @@ def _apply_p1_max_one_migration(actions, sorted_nodes, node_to_idx, probs, entry
             new_actions[i] = 0
             suppressed += 1
     return new_actions, suppressed
+
+
+def _apply_colocate_violating_entry_mask(
+    action_masks,
+    sorted_nodes,
+    node_to_idx,
+    violating_entries,
+):
+    """COLOCATE: only violating entry nodes may choose COLOCATE (non-entry always STAY)."""
+    mask = action_masks.clone()
+    violating_set = set(violating_entries or [])
+    blocked_slots = 0
+    for node in sorted_nodes:
+        if is_external_node(node):
+            continue
+        node_idx = node_to_idx.get(node)
+        if node_idx is None:
+            continue
+        if node in violating_set:
+            continue
+        for action in range(1, MARL_ACTION_DIM):
+            if bool(mask[node_idx, action].item()):
+                mask[node_idx, action] = False
+                blocked_slots += 1
+    return mask, {"colocate_blocked_slots": blocked_slots}
+
+
+def _apply_colocate_assignments(
+    actions,
+    sorted_nodes,
+    assignments,
+    candidates,
+    dag_info,
+    entry_nodes,
+):
+    """
+    Execute COLOCATE: one active entry COLOCATE moves a traffic-aware pattern.
+    Returns (new_assignments, stats).
+    """
+    entry_set = set(entry_nodes or [])
+    active_entry = None
+    active_action = 0
+    for node, action in zip(sorted_nodes, actions):
+        if int(action) > 0 and node in entry_set and not is_external_node(node):
+            active_entry = node
+            active_action = int(action)
+            break
+
+    new_assignments = dict(assignments)
+    if active_entry is None:
+        return new_assignments, {
+            "colocate_active": False,
+            "colocate_passive_nodes": 0,
+            "colocate_pattern_size": 0,
+        }
+
+    target_server = action_to_server(
+        active_action, candidates, assignments[active_entry]
+    )
+    pattern = build_colocate_pattern_mode_a(
+        active_entry, target_server, assignments, dag_info
+    )
+    passive_nodes = 0
+    for node in pattern:
+        if node != active_entry and new_assignments.get(node) != target_server:
+            passive_nodes += 1
+        new_assignments[node] = target_server
+    return new_assignments, {
+        "colocate_active": True,
+        "colocate_passive_nodes": passive_nodes,
+        "colocate_pattern_size": len(pattern),
+        "colocate_active_entry": active_entry,
+    }
+
+
+def _actions_dict_to_node_order(actions, sorted_nodes, node_names):
+    """Align per-node actions with ``state['node_names']`` (training tensor row order)."""
+    by_node = dict(zip(sorted_nodes, actions))
+    return [int(by_node[name]) for name in node_names]
+
+
+def _build_colocate_policy_agent_mask(node_names, colocate_info):
+    """
+    Per-agent policy-loss mask for COLOCATE.
+
+    When a COLOCATE fires, only the active entry chose the migrate action; followers
+    were mask-forced to STAY but moved passively — exclude them from policy gradient.
+    """
+    if not colocate_info.get("colocate_active"):
+        return [0.0 if is_external_node(n) else 1.0 for n in node_names]
+    active_entry = colocate_info.get("colocate_active_entry")
+    return [
+        0.0 if is_external_node(n) else (1.0 if n == active_entry else 0.0)
+        for n in node_names
+    ]
 
 
 def _use_soft_cf_bias():
@@ -432,7 +606,10 @@ def _use_cf_sla_gain_gate():
     B1.1: hard CF action gate before actor sampling.
 
     Default on for Reward v2/v2.1; disable with ``MARL_CF_SLA_GAIN_GATE=0``.
+    Automatically off when ``MARL_COLOCATE_REACTIVE=1``.
     """
+    if _use_colocate_reactive():
+        return False
     raw = os.environ.get("MARL_CF_SLA_GAIN_GATE")
     if raw is not None and str(raw).strip() != "":
         return str(raw).strip().lower() not in ("0", "false", "no")
@@ -747,10 +924,23 @@ def _optimize_marl(memory, encoder, actor, critic, optimizer, device,
             device=device,
         )
         agent_rewards = torch.FloatTensor(transition.get("agent_reward_list", [])).to(device)
-        if agent_rewards.numel() != actions.numel():
-            agent_rewards = training_reward.expand_as(chosen_log_prob)
-        advantage = agent_rewards - value.detach()
-        policy_loss = -(chosen_log_prob * advantage).mean() - entropy_coef * entropy
+        policy_mask = transition.get("policy_agent_mask")
+        if policy_mask is not None:
+            mask = torch.FloatTensor(policy_mask).to(device)
+            denom = mask.sum().clamp(min=1.0)
+            avg_log_prob = (chosen_log_prob * mask).sum() / denom
+            entropy = (-(probs * log_probs).sum(dim=-1) * mask).sum() / denom
+            if agent_rewards.numel() == actions.numel():
+                avg_advantage = ((agent_rewards - value.detach()) * mask).sum() / denom
+            else:
+                avg_advantage = training_reward - value.detach()
+            policy_loss = -avg_log_prob * avg_advantage - entropy_coef * entropy
+        else:
+            if agent_rewards.numel() != actions.numel():
+                agent_rewards = training_reward.expand_as(chosen_log_prob)
+            advantage = agent_rewards - value.detach()
+            policy_loss = -(chosen_log_prob * advantage).mean() - entropy_coef * entropy
+            entropy = (-(probs * log_probs).sum(dim=-1)).mean()
         value_loss = F.smooth_l1_loss(value, training_reward)
         total_loss = total_loss + policy_loss + value_loss
         policy_losses.append(float(policy_loss.detach().item()))
@@ -856,6 +1046,10 @@ def _new_epoch_counters():
         "cf_gate_improving_slots": 0,
         "cf_gate_forced_stay_agents": 0,
         "decisions_with_cf_improve_option_count": 0,
+        "colocate_active_decisions": 0,
+        "colocate_passive_nodes_total": 0,
+        "high_traffic_colocated_edges": 0,
+        "high_traffic_critical_edges": 0,
     }
 
 
@@ -906,6 +1100,10 @@ def _snapshot_epoch_stats(epoch_index, is_eval_epoch, epsilon, counters, *, loss
         "decisions_with_cf_improve_option_count": int(
             counters.get("decisions_with_cf_improve_option_count", 0)
         ),
+        "colocate_active_decisions": int(counters.get("colocate_active_decisions", 0)),
+        "colocate_passive_nodes_total": int(counters.get("colocate_passive_nodes_total", 0)),
+        "high_traffic_colocated_edges": int(counters.get("high_traffic_colocated_edges", 0)),
+        "high_traffic_critical_edges": int(counters.get("high_traffic_critical_edges", 0)),
         "reward_curriculum": counters.get("reward_curriculum"),
     }
 
@@ -1076,6 +1274,14 @@ def _build_marl_return_dict(
         "lambda_split": lambda_split_history[-1] if lambda_split_history else 0.0,
         "dag_proactive_migration_stats": (
             dict(dag_proactive_stats) if collect_dag_proactive_stats else {}
+        ),
+        "colocate_active_decisions": int(counters.get("colocate_active_decisions", 0)),
+        "colocate_passive_nodes_total": int(counters.get("colocate_passive_nodes_total", 0)),
+        "high_traffic_colocated_edges": int(counters.get("high_traffic_colocated_edges", 0)),
+        "high_traffic_critical_edges": int(counters.get("high_traffic_critical_edges", 0)),
+        "high_traffic_colocated_ratio": (
+            counters["high_traffic_colocated_edges"] / counters["high_traffic_critical_edges"]
+            if counters.get("high_traffic_critical_edges", 0) > 0 else 0.0
         ),
     }
 
@@ -1758,6 +1964,10 @@ def run_marl_gat_microservice(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     guard_mode = "soft-reward (v2 bypass)" if _bypass_rule_based_guards() else "rule-based guards"
     p1_mode = _use_p1_coordination()
+    colocate_mode = _use_colocate_reactive()
+    nstep_mode = _n_step_return_enabled()
+    nstep_n = _n_step_n()
+    nstep_gamma = _n_step_gamma()
     soft_cf_mode = _use_soft_cf_bias()
     sla_gate_mode = _use_sla_violation_gate()
     cf_sla_gain_gate_mode = _use_cf_sla_gain_gate()
@@ -1769,6 +1979,10 @@ def run_marl_gat_microservice(
         f"  Device: {device}  |  Proactive: {use_proactive}  |  Model: CTDE-GAT-MARL  |  "
         f"Lambda(CF): migration={max_lambda_migration:.3f}, split={max_lambda_split:.3f}  |  "
         f"Guards: {guard_mode}  |  P1: {'entry-first + max-1' if p1_mode else 'off'}  |  "
+        f"P4: colocate={'on' if colocate_mode else 'off'}  |  "
+        f"nstep={'on' if nstep_mode else 'off'}"
+        + (f"(N={nstep_n},γ={nstep_gamma:.2f})" if nstep_mode else "")
+        + "  |  "
         f"P2: curriculum={'on' if curriculum_on else 'off'} soft_cf={'on' if soft_cf_mode else 'off'}  |  "
         f"P3: L_internal gamma={'on' if gamma_on else 'off'}  |  "
         f"A: train_total_cost={'on' if total_cost_train else 'off'}  |  "
@@ -1915,6 +2129,11 @@ def run_marl_gat_microservice(
         cf_gate_forced_stay_agents = 0
         cf_gate_entry_rescue_slots = 0
         decisions_with_cf_improve_option_count = 0
+        colocate_active_decisions = 0
+        colocate_passive_nodes_total = 0
+        high_traffic_colocated_edges = 0
+        high_traffic_critical_edges = 0
+        taxi_rollout_buffers = defaultdict(list)
         epoch_curriculum = apply_curriculum_for_epoch(
             epoch, num_epochs, is_eval_epoch=is_eval_epoch
         )
@@ -2097,6 +2316,25 @@ def run_marl_gat_microservice(
                         cf_gate_entry_rescue_slots += cf_gate_stats.get("cf_gate_entry_rescue_slots", 0)
                         if cf_gate_stats["cf_gate_improving_slots"] > 0:
                             decisions_with_cf_improve_option_count += 1
+                    elif colocate_mode and trigger_type == TRIGGER_REACTIVE:
+                        cf_ctx = _build_counterfactual_context(
+                            dag_info,
+                            taxi_dag_assignments[taxi_id],
+                            candidates,
+                            current_lat,
+                            current_lon,
+                            servers_info,
+                            predicted_locations=None,
+                            trigger_type=trigger_type,
+                        )
+                        tensors["action_masks"], _colocate_mask_stats = (
+                            _apply_colocate_violating_entry_mask(
+                                tensors["action_masks"],
+                                sorted_nodes,
+                                node_to_idx,
+                                cf_ctx["violating_entries"],
+                            )
+                        )
                     embeddings = encoder(
                         tensors["node_features"],
                         tensors["adj_matrix"],
@@ -2214,7 +2452,7 @@ def run_marl_gat_microservice(
                         sla_improving_action_count += cf_info["sla_improving_action_count"]
                         cost_guard_blocked_count += cf_info["cost_guard_blocked_count"]
                         non_entry_distance_only_blocked_count += cf_info["non_entry_distance_only_blocked_count"]
-                    elif trigger_type != TRIGGER_PROACTIVE:
+                    elif trigger_type != TRIGGER_PROACTIVE and not colocate_mode:
                         actions, clipped_count, cf_info = _clip_reactive_actions(
                             actions,
                             sorted_nodes,
@@ -2237,7 +2475,6 @@ def run_marl_gat_microservice(
                         non_entry_distance_only_blocked_count += cf_info["non_entry_distance_only_blocked_count"]
 
                     if p1_mode:
-                        entry_nodes = get_service_entry_nodes(dag_info)
                         actions, suppressed = _apply_p1_max_one_migration(
                             actions,
                             sorted_nodes,
@@ -2247,13 +2484,37 @@ def run_marl_gat_microservice(
                         )
                         p1_multi_migration_suppressed_count += suppressed
 
-                    for ms_node, action in zip(sorted_nodes, actions):
-                        current_server = taxi_dag_assignments[taxi_id][ms_node]
-                        if is_external_node(ms_node):
-                            target_server = current_server
-                        else:
-                            target_server = action_to_server(action, candidates, current_server)
-                        taxi_dag_assignments[taxi_id][ms_node] = target_server
+                    colocate_info = {"colocate_active": False}
+                    if colocate_mode and trigger_type == TRIGGER_REACTIVE:
+                        new_assignments, colocate_info = _apply_colocate_assignments(
+                            actions,
+                            sorted_nodes,
+                            taxi_dag_assignments[taxi_id],
+                            candidates,
+                            dag_info,
+                            entry_nodes,
+                        )
+                        for node, server_id in new_assignments.items():
+                            taxi_dag_assignments[taxi_id][node] = server_id
+                        if colocate_info.get("colocate_active"):
+                            colocate_active_decisions += 1
+                            colocate_passive_nodes_total += int(
+                                colocate_info.get("colocate_passive_nodes", 0)
+                            )
+                    else:
+                        for ms_node, action in zip(sorted_nodes, actions):
+                            current_server = taxi_dag_assignments[taxi_id][ms_node]
+                            if is_external_node(ms_node):
+                                target_server = current_server
+                            else:
+                                target_server = action_to_server(action, candidates, current_server)
+                            taxi_dag_assignments[taxi_id][ms_node] = target_server
+
+                    ht_colocated, ht_total = count_high_traffic_colocated_edges(
+                        dag_info, taxi_dag_assignments[taxi_id]
+                    )
+                    high_traffic_colocated_edges += ht_colocated
+                    high_traffic_critical_edges += ht_total
 
                 total_decision_time += time.perf_counter() - t0
                 agent_decision_count += len(actions)
@@ -2341,13 +2602,32 @@ def run_marl_gat_microservice(
                         details["agent_rewards"][node]
                         for node in state["node_names"]
                     ]
-                    memory.append({
+                    train_actions = _actions_dict_to_node_order(
+                        actions, sorted_nodes, state["node_names"]
+                    )
+                    policy_agent_mask = None
+                    if colocate_mode and trigger_type == TRIGGER_REACTIVE:
+                        policy_agent_mask = _build_colocate_policy_agent_mask(
+                            state["node_names"], colocate_info
+                        )
+                    pending = {
                         "state": state,
-                        "actions": actions,
+                        "actions": train_actions,
                         "shared_reward": shared_reward,
                         "training_reward": details.get("training_reward", shared_reward),
                         "agent_reward_list": agent_reward_list,
-                    })
+                        "policy_agent_mask": policy_agent_mask,
+                    }
+                    if nstep_mode and not is_eval_epoch:
+                        taxi_rollout_buffers[taxi_id].append(pending)
+                        _commit_nstep_from_buffer(
+                            taxi_rollout_buffers[taxi_id],
+                            memory,
+                            nstep_n,
+                            nstep_gamma,
+                        )
+                    else:
+                        memory.append(pending)
                     info = _optimize_marl(memory, encoder, actor, critic, optimizer, device, batch_size=batch_size)
                     if info:
                         loss_history.append(info["loss"])
@@ -2360,6 +2640,9 @@ def run_marl_gat_microservice(
                 touch_taxi_last(taxi_last, taxi_id, row, current_lon, current_lat, ts)
             pbar.update(1)
         pbar.close()
+
+        if nstep_mode and not is_eval_epoch:
+            _flush_nstep_remaining(taxi_rollout_buffers, memory, nstep_n, nstep_gamma)
 
         epoch_counters = {
             "decision_count": decision_count,
@@ -2388,6 +2671,10 @@ def run_marl_gat_microservice(
             "cf_gate_improving_slots": cf_gate_improving_slots,
             "cf_gate_forced_stay_agents": cf_gate_forced_stay_agents,
             "decisions_with_cf_improve_option_count": decisions_with_cf_improve_option_count,
+            "colocate_active_decisions": colocate_active_decisions,
+            "colocate_passive_nodes_total": colocate_passive_nodes_total,
+            "high_traffic_colocated_edges": high_traffic_colocated_edges,
+            "high_traffic_critical_edges": high_traffic_critical_edges,
             "reward_curriculum": epoch_curriculum,
         }
         epoch_stats_list.append(
@@ -2423,6 +2710,11 @@ def run_marl_gat_microservice(
             + (
                 f" cf_gate={cf_gate_blocked_slots}/{cf_gate_improving_slots}"
                 if cf_sla_gain_gate_mode else ""
+            )
+            + (
+                f" colocate_active={colocate_active_decisions}"
+                f" ht_colocated={high_traffic_colocated_edges}/{high_traffic_critical_edges}"
+                if colocate_mode else ""
             ),
             flush=True,
         )
@@ -2501,6 +2793,10 @@ def run_marl_gat_microservice(
         "cf_gate_improving_slots": cf_gate_improving_slots,
         "cf_gate_forced_stay_agents": cf_gate_forced_stay_agents,
         "decisions_with_cf_improve_option_count": decisions_with_cf_improve_option_count,
+        "colocate_active_decisions": colocate_active_decisions,
+        "colocate_passive_nodes_total": colocate_passive_nodes_total,
+        "high_traffic_colocated_edges": high_traffic_colocated_edges,
+        "high_traffic_critical_edges": high_traffic_critical_edges,
     })
     reset_curriculum()
     return _build_marl_return_dict(

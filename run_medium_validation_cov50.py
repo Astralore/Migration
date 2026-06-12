@@ -215,6 +215,12 @@ def _summarize_result(res):
         "avg_legal_migrate_actions_per_decision",
         "epsilon_greedy_samples",
         "argmax_samples",
+        "colocate_active_decisions",
+        "colocate_passive_nodes_total",
+        "high_traffic_colocated_edges",
+        "high_traffic_critical_edges",
+        "high_traffic_colocated_ratio",
+        "sa_colocate_mode_a",
     ]
     out = {k: _to_jsonable(res.get(k)) for k in keys if k in res}
     out["avg_total_cost_ms"] = _avg_total_cost_ms(res)
@@ -727,6 +733,11 @@ def main():
                 "marl_cf_train_score_floor": os.environ.get("MARL_CF_TRAIN_SCORE_FLOOR"),
                 "marl_sla_violation_gate": os.environ.get("MARL_SLA_VIOLATION_GATE", "1" if os.environ.get("REWARD_SCHEME") == "v2" else "0"),
                 "marl_warmstart_checkpoint": os.environ.get("MARL_WARMSTART_CHECKPOINT"),
+                "marl_colocate_reactive": os.environ.get("MARL_COLOCATE_REACTIVE", "0"),
+                "sa_colocate_mode_a": os.environ.get("SA_COLOCATE_MODE_A", "0"),
+                "marl_nstep_return": os.environ.get("MARL_NSTEP_RETURN", "0"),
+                "marl_nstep_n": os.environ.get("MARL_NSTEP_N"),
+                "marl_nstep_gamma": os.environ.get("MARL_NSTEP_GAMMA"),
             },
             "data": {
                 "rows": int(len(df)),

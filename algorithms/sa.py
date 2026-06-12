@@ -15,6 +15,10 @@ import pandas as pd
 from tqdm import tqdm
 
 from core.microservice_dags import MICROSERVICE_DAGS
+from core.colocate_pattern import (
+    build_colocate_pattern_mode_a,
+    count_high_traffic_colocated_edges,
+)
 from core.geo import haversine_distance, find_k_nearest_servers
 from core.context import get_trigger_type, TRIGGER_PROACTIVE, TRIGGER_REACTIVE, check_sla_violation
 from core.dag_utils import (
@@ -36,6 +40,57 @@ SA_DEFAULT_MAX_ITER = int(os.environ.get("SA_MAX_ITER", "150"))
 SA_DEFAULT_TEMP = float(os.environ.get("SA_INITIAL_TEMP", "50000.0"))
 SA_DEFAULT_COOLING = float(os.environ.get("SA_COOLING_RATE", "0.99"))
 SA_NUM_RESTARTS = int(os.environ.get("SA_NUM_RESTARTS", "2"))
+
+
+SA_NUM_RESTARTS = int(os.environ.get("SA_NUM_RESTARTS", "2"))
+
+
+def _sa_colocate_mode_a_enabled():
+    """Traffic-aware partial colocate neighbourhood (aligned with GAT COLOCATE mode A)."""
+    raw = os.environ.get("SA_COLOCATE_MODE_A")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip().lower() not in ("0", "false", "no")
+    return False
+
+
+def _violating_entry_nodes(entry_nodes, assignments, user_lat, user_lon, servers_info):
+    violating = []
+    for node in entry_nodes or []:
+        server_id = assignments.get(node)
+        if server_id is None:
+            continue
+        srv_lat, srv_lon = servers_info[server_id]
+        if check_sla_violation(user_lat, user_lon, srv_lat, srv_lon):
+            violating.append(node)
+    return violating
+
+
+def _sa_mode_a_colocate_neighbor(
+    current_sol,
+    dag_info,
+    entry_nodes,
+    candidate_server_ids,
+    user_location,
+    servers_info,
+):
+    user_lat, user_lon = user_location
+    violating = _violating_entry_nodes(
+        entry_nodes, current_sol, user_lat, user_lon, servers_info
+    )
+    pick_from = violating or list(entry_nodes or [])
+    if not pick_from or not candidate_server_ids:
+        return None
+    entry = random.choice(pick_from)
+    old_server = current_sol.get(entry)
+    targets = [s for s in candidate_server_ids if s != old_server]
+    if not targets:
+        return None
+    target = random.choice(targets)
+    pattern = build_colocate_pattern_mode_a(entry, target, current_sol, dag_info)
+    neighbor = dict(current_sol)
+    for node in pattern:
+        neighbor[node] = target
+    return neighbor
 
 
 def _entry_violation_counts(entry_nodes, assignments, user_lat, user_lon, servers_info):
@@ -78,26 +133,78 @@ def _sa_total_cost_ms(
     return float(details["total_cost_ms"])
 
 
-def _sa_colocate_start(deployable_nodes, current_assignments, candidate_server_ids):
+def _sa_colocate_start(
+    deployable_nodes,
+    current_assignments,
+    candidate_server_ids,
+    *,
+    dag_info=None,
+    entry_nodes=None,
+    user_location=None,
+    servers_info=None,
+):
     start = dict(current_assignments)
     if not deployable_nodes or not candidate_server_ids:
         return start
+    if (
+        _sa_colocate_mode_a_enabled()
+        and dag_info is not None
+        and entry_nodes
+        and user_location is not None
+        and servers_info is not None
+    ):
+        neighbor = _sa_mode_a_colocate_neighbor(
+            current_assignments,
+            dag_info,
+            entry_nodes,
+            candidate_server_ids,
+            user_location,
+            servers_info,
+        )
+        if neighbor is not None:
+            return neighbor
     target = random.choice(candidate_server_ids)
     for node in deployable_nodes:
         start[node] = target
     return start
 
 
-def _sa_propose_neighbor(current_sol, deployable_nodes, candidate_server_ids):
+def _sa_propose_neighbor(
+    current_sol,
+    deployable_nodes,
+    candidate_server_ids,
+    *,
+    dag_info=None,
+    entry_nodes=None,
+    user_location=None,
+    servers_info=None,
+):
     if not deployable_nodes or not candidate_server_ids:
         return None
 
     if random.random() < 0.5:
-        neighbor = dict(current_sol)
-        target = random.choice(candidate_server_ids)
-        for node in deployable_nodes:
-            neighbor[node] = target
-        return neighbor
+        if (
+            _sa_colocate_mode_a_enabled()
+            and dag_info is not None
+            and entry_nodes
+            and user_location is not None
+            and servers_info is not None
+        ):
+            neighbor = _sa_mode_a_colocate_neighbor(
+                current_sol,
+                dag_info,
+                entry_nodes,
+                candidate_server_ids,
+                user_location,
+                servers_info,
+            )
+        else:
+            neighbor = dict(current_sol)
+            target = random.choice(candidate_server_ids)
+            for node in deployable_nodes:
+                neighbor[node] = target
+        if neighbor is not None:
+            return neighbor
 
     node = random.choice(deployable_nodes)
     old_server = current_sol[node]
@@ -130,6 +237,7 @@ def _sa_single_run(
     servers_info,
     previous_assignments,
     *,
+    entry_nodes,
     predicted_locations,
     trigger_type,
     temp,
@@ -157,7 +265,15 @@ def _sa_single_run(
     sa_neighbor_count = 0
 
     for _iteration in range(max_iter):
-        neighbor_sol = _sa_propose_neighbor(current_sol, deployable_nodes, candidate_server_ids)
+        neighbor_sol = _sa_propose_neighbor(
+            current_sol,
+            deployable_nodes,
+            candidate_server_ids,
+            dag_info=dag_info,
+            entry_nodes=entry_nodes,
+            user_location=user_location,
+            servers_info=servers_info,
+        )
         if neighbor_sol is None:
             temp *= cooling_rate
             continue
@@ -222,12 +338,21 @@ def microservice_simulated_annealing(
 
     candidate_server_ids = [c[0] for c in candidates]
     deployable_nodes = get_deployable_nodes(dag_info)
+    entry_nodes = get_service_entry_nodes(dag_info)
 
     start_points = [dict(current_assignments)]
     restarts = max(1, int(num_restarts))
     while len(start_points) < restarts:
         start_points.append(
-            _sa_colocate_start(deployable_nodes, current_assignments, candidate_server_ids)
+            _sa_colocate_start(
+                deployable_nodes,
+                current_assignments,
+                candidate_server_ids,
+                dag_info=dag_info,
+                entry_nodes=entry_nodes,
+                user_location=user_location,
+                servers_info=servers_info,
+            )
         )
 
     best_sol = dict(current_assignments)
@@ -259,6 +384,7 @@ def microservice_simulated_annealing(
             user_location,
             servers_info,
             previous_assignments,
+            entry_nodes=entry_nodes,
             predicted_locations=predicted_locations,
             trigger_type=trigger_type,
             temp=run_temp,
@@ -332,6 +458,8 @@ def run_sa_microservice_fair(
 
     total_decision_time = 0.0
     decision_count_for_latency = 0
+    high_traffic_colocated_edges = 0
+    high_traffic_critical_edges = 0
 
     dag_migration_stats = (
         defaultdict(lambda: {"proactive_decisions": 0, "migrated_nodes": 0})
@@ -343,6 +471,8 @@ def run_sa_microservice_fair(
     taxi_last = {}
 
     decision_count = 0
+    if _sa_colocate_mode_a_enabled():
+        print("  SA neighbourhood: mode-A traffic-aware colocate + single-node", flush=True)
     pbar = tqdm(total=len(timestamps), desc="SA Microservice Migration")
 
     for timestamp in timestamps:
@@ -469,6 +599,12 @@ def run_sa_microservice_fair(
             )
             total_migrations += nodes_migrated
 
+            ht_colocated, ht_total = count_high_traffic_colocated_edges(
+                dag_info, best_assignments
+            )
+            high_traffic_colocated_edges += ht_colocated
+            high_traffic_critical_edges += ht_total
+
             if (
                 collect_dag_proactive_stats
                 and dag_migration_stats is not None
@@ -516,4 +652,11 @@ def run_sa_microservice_fair(
         'dag_proactive_migration_stats': (
             {k: dict(v) for k, v in dag_migration_stats.items()} if dag_migration_stats else {}
         ),
+        'high_traffic_colocated_edges': high_traffic_colocated_edges,
+        'high_traffic_critical_edges': high_traffic_critical_edges,
+        'high_traffic_colocated_ratio': (
+            high_traffic_colocated_edges / high_traffic_critical_edges
+            if high_traffic_critical_edges > 0 else 0.0
+        ),
+        'sa_colocate_mode_a': _sa_colocate_mode_a_enabled(),
     }

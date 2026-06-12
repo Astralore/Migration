@@ -466,7 +466,7 @@ SA 推理 ~42 迁 / 7180 ms 是 **联合搜索能力** 下的结果。要求 GAT
 
 - 每个候选服务器 `k` 对应一个 **colocate pattern**（要同迁的节点集合）
 - pattern 由 **边 traffic 排序** 驱动，**不是**机械「1-hop 邻居」或「全 deployable」
-- FanIn / FanOut / Compute_Heavy 的 pattern 生成规则应 **按 DAG family 区分**（aggregator vs broadcaster）
+- **mode A（默认）** 对所有 DAG family 通用；mode B/C 可按 family 做 ablation，非 Step 1 目标
 
 #### 11.2.2 Colocate 模式：默认 mode A
 
@@ -641,13 +641,14 @@ GAT 注意力、多候选特征、4 动作槽位 **方有意义**——每个候
 | E/B/A'/C' | 停止叠加 |
 | stateful 排序/过滤机制 | 不需要（§11.4：RL 通过 migration_delay_ms 自然感知成本） |
 | 表示 / DAG conditioning alone | 联合动作空间前非瓶颈 |
-| **n-step return / episode 级 reward** | **暂缓**；2ep 若 stay→1.0 或 again 过迁，**再启用**（不算 gate 超参） |
+| **n-step return / episode 级 reward** | **COLOCATE 默认开启**（2ep stay→1.0 后启用）；`MARL_NSTEP_N=16`，`MARL_NSTEP_GAMMA=1.0` |
 
 **信用分配风险（v4 最大训练不确定性）**：
 
 - COLOCATE 当步 `total_cost_ms` 可能 **+10⁴ ms 量级**（migration 主导），L_internal 节省要在 **后续多次 Reactive 触发** 才体现。
 - Direction A 当前为 **单步** `−total_cost_ms/10000`；Critic 若无多步 return，可能学到 **永远 STAY**（再现 B1.1a 式死锁）或 **随机过迁**（再现 P1 式过迁）。
-- **缓解路径**（按优先级）：① Step 2 先用 **SA mode-A** 验证 pattern 物理性（不依赖 RL）；② 2ep 监控 `active_decisions` / `nodes_migrated` / stay_ratio；③ 若 stay≈1.0，补 n-step TD 或 episode 累计 cost；④ **不回** L1 gate。
+- **COLOCATE 训练（已实现）**：被动 follower 被 mask 为 STAY 但实际同迁 → memory 存 `policy_agent_mask`，`_optimize_marl` 仅对 **active entry** 回传 policy 梯度；actions 按 `node_names` 对齐。
+- **缓解路径**（按优先级）：① Step 2 SA mode-A 验证 pattern ✅；② 2ep 监控 → stay→1.0 **已触发**；③ **n-step TD 已实现**（`MARL_NSTEP_RETURN=1`，N=16）；④ **不回** L1 gate。
 
 ### 11.8 成功标准与预期效果
 
@@ -813,7 +814,36 @@ $env:MARL_CF_TRAIN_SCORE_FLOOR="-0.2"
 python -u run_reward_v21_p3_cov50.py
 ```
 
-### 12.6 COLOCATE v4 训练 / 快验（现行推荐）
+### 12.7 COLOCATE + n-step 2ep 快验（Step 2b，现行）
+
+```text
+MARL_COLOCATE_REACTIVE=1
+MARL_NSTEP_RETURN=1
+MARL_NSTEP_N=16
+MARL_NSTEP_GAMMA=1.0
+MARL_CF_SLA_GAIN_GATE=0
+MARL_TRAIN_TOTAL_COST=1
+SA_COLOCATE_MODE_A=1
+```
+
+实验 tag：`reward_v21_p4_colocate_a_nstep_2ep`  
+目录：`experiments/medium_validation_20260609_163745_reward_v21_p4_colocate_a_nstep_2ep/`
+
+**Step 2b 结果摘要**（vs 无 n-step `154837`）：
+
+| 指标 | 无 n-step | n-step N=16 |
+|------|-----------|-------------|
+| 推理迁移 | 0 | **3** |
+| stay_ratio | 1.0000 | **0.9998** |
+| colocate_active（推理） | 0 | **3** |
+| Avg Total（推理） | 55212 ms | 60473 ms |
+| train ep0 迁移 | 354 | 305 |
+
+结论：n-step **打破完全死锁**，但未达 Step 2 验收（50–200 迁、stay 显著 <1）。下一步可试 **N=32~64** 或 **4ep** 后再判是否上 8ep。
+
+---
+
+### 12.6 COLOCATE v4 训练 / 快验（基础 env）
 
 > Step 1 代码落地后使用。**必须**关闭 B11b 单节点 CF gate；旧 B11b / Direction A ckpt **不可**直接加载。
 
@@ -851,9 +881,10 @@ python -u run_reward_v21_p3_cov50.py
 - [x] 四算法推理对比与成本分解
 - [x] 方向 A 8ep；E/B/A'/C' 快验（单节点 patch 无效）
 - [x] 根因 v2/v3/v4：gate=规则 rescue；traffic-aware 联合迁；去掉 L1 gate；精简超参
-- [ ] **Step 1【原子交付】**：COLOCATE 动作空间 + P1 主动决策 + 关闭 B11b gate（唯一新超参 T_critical，数据推导）
-- [ ] **Step 2** SA mode-A 对照 + Direction A 2ep 快验
-- [ ] **Step 3** Direction A 8ep 全量
+- [x] **Step 1【原子交付】**：COLOCATE 动作空间 + P1 主动决策 + 关闭 B11b gate（`core/colocate_pattern.py`、`marl_gat.py`、`run_reward_v21_p3_cov50.py`）
+- [x] **Step 2** SA mode-A 对照 + Direction A 2ep 快验（`154837`：GAT stay→1.0 / 0 迁；SA 7655 ms ✅）
+- [x] **Step 2b** n-step（N=16）+ 2ep 重验（`163745`：推理 3 迁 / stay 0.9998 / 60473 ms — **部分改善，未达 50–200**）
+- [ ] **Step 3** Direction A 8ep 全量（**暂缓**：stay≈1.0，需加大 N 或更多 ep 再试）
 - [ ] 架构对等后与 SA 比 Total；满意后 Proactive
 
 ---
@@ -900,11 +931,11 @@ python -u run_reward_v21_p3_cov50.py
 
 | 子步骤 | 模块 | 改动要点 |
 |--------|------|----------|
-| **1.1** | `core/colocate_pattern.py`（新建） | mode A pattern 生成；T_critical = median×2；连通扩展 |
-| **1.2** | `algorithms/marl_gat.py` | 动作 mask / 落地：`{ STAY, COLOCATE(cand_k, pattern_k) }`；执行 pattern 批量迁 |
-| **1.3** | `algorithms/marl_gat.py` | P1：`max-1` → **1 次主动 COLOCATE**；被动跟随不计 active_decisions |
-| **1.4** | `algorithms/marl_gat.py` | `MARL_COLOCATE_REACTIVE=1` 时 bypass `_apply_cf_sla_gain_action_gate` + `_clip_reactive_actions` |
-| **1.5** | `run_reward_v21_p3_cov50.py` + validation | env §12.6；报表 `active_decisions` / `nodes_migrated` / 高 traffic 同服率；**重训，禁旧 ckpt** |
+| **1.1** | `core/colocate_pattern.py`（新建） | mode A pattern 生成；T_critical = median×2；连通扩展 ✅ |
+| **1.2** | `algorithms/marl_gat.py` | 动作 mask / 落地：`{ STAY, COLOCATE(cand_k, pattern_k) }`；执行 pattern 批量迁 ✅ |
+| **1.3** | `algorithms/marl_gat.py` | P1：`max-1` → **1 次主动 COLOCATE**；被动跟随不计 active_decisions ✅ |
+| **1.4** | `algorithms/marl_gat.py` | `MARL_COLOCATE_REACTIVE=1` 时 bypass CF gate + reactive clip ✅ |
+| **1.5** | `run_reward_v21_p3_cov50.py` + validation | env §12.6；报表 `colocate_active_decisions` / `high_traffic_colocated_ratio` ✅ |
 
 **Step 2 附加（非 Step 1 代码，但同属 Step 2 实验）**：
 
